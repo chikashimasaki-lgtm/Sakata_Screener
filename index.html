@@ -28,6 +28,10 @@
   .sig { color:#c9d2f0; }
   td.exp { white-space:pre-line; min-width:280px; max-width:440px; color:#9aa3c7; font-size:12px; line-height:1.5; }
   .code { color:var(--mut); font-size:11px; }
+  a.tv { color:inherit; text-decoration:none; }
+  a.tv:hover { text-decoration:underline; color:#fff; }
+  a.tv .code { color:var(--mut); }
+  a.tv .ext { color:var(--mut); font-size:10px; margin-left:3px; opacity:.7; }
   .note { color:var(--mut); font-size:11px; margin-top:18px; line-height:1.6; }
 </style>
 </head>
@@ -59,6 +63,7 @@
   </table>
   <div class="note">
     赤三兵/上げ三法/三空叩き込み＝買い方向、三羽烏/下げ三法/三空踏み上げ＝売り方向。
+    銘柄名（↗）をクリックすると、その銘柄でTradingViewチャートを開きます。
     シグナルは補助情報でだましもあります。必ずご自身で確認してください。
   </div>
 </div>
@@ -70,6 +75,9 @@ const MOCK = { updated:new Date().toISOString(), items:[
   { date:'2026-07-03', code:'4689', name:'（サンプル）逆三尊テスト', close:520, dir:'買い', signals:'三川(逆三尊)', explain:'・三川(逆三尊)：3つの谷（中央が最安）でネックライン上抜け。大底の買いサイン。' },
 ]};
 let DATA = [], sortKey='_strength', sortAsc=false;
+// TradingView：保存済みチャートレイアウトを、銘柄コードに応じて動的に開く（東証=TSE）
+const TV_LAYOUT = 'vrWJ3cQi';
+function tvUrl(code){ return `https://jp.tradingview.com/chart/${TV_LAYOUT}/?symbol=${encodeURIComponent('TSE:'+String(code).trim())}&interval=D`; }
 function dirClass(d){ return d==='買い'?'d-buy':d==='売り'?'d-sell':'d-mix'; }
 function strength(r){ return String(r.signals||'').split('、').filter(Boolean).length; }
 function render(){
@@ -84,7 +92,9 @@ function render(){
   document.getElementById('rows').innerHTML = rows.map(r=>`
     <tr>
       <td>${r.date||''}</td>
-      <td>${r.name||''} <span class="code">${r.code||''}</span></td>
+      <td>${r.code
+          ? `<a class="tv" href="${tvUrl(r.code)}" target="_blank" rel="noopener" title="TradingViewでチャートを開く">${r.name||''} <span class="code">${r.code}</span><span class="ext">↗</span></a>`
+          : (r.name||'')}</td>
       <td class="r">${r.close==null||r.close===''?'':Number(r.close).toLocaleString()}</td>
       <td><span class="dir ${dirClass(r.dir)}">${r.dir||''}</span></td>
       <td class="sig">${r.signals||''}</td>

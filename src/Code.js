@@ -29,7 +29,6 @@ function onOpen() {
     .addSeparator()
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行',            'scanSignals')
-    .addItem('JSON出力（Pages用）',          'exportJson')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
     .addItem('走査の進捗リセット',           'resetScanQueue')
@@ -199,7 +198,53 @@ function finalizeSignals_(sig) {
   const dirs = sig.getRange(2, 5, n, 1).getValues();
   const bg = dirs.map(([d]) => [d === '買い' ? '#e7f6ec' : d === '売り' ? '#fdeaea' : '#fff5e6']);
   sig.getRange(2, 5, n, 1).setBackgrounds(bg);
+
+  // SBI証券（日本株／日本株信用）で保有中の銘柄は、行ごと半透明赤でハイライト
+  try {
+    const held = getSbiHeldCodes_();
+    for (let i = 0; i < n; i++) {
+      const code = String(data[i][1] || '').trim().toUpperCase();
+      if (held.has(code)) sig.getRange(2 + i, 1, 1, 7).setBackground('#f2a9a9');
+    }
+  } catch (e) { Logger.log('SBI保有ハイライト失敗: ' + e.message); }
+
   sig.setTabColor('#e0567a');
+}
+
+// SBI証券の保有銘柄コードを参照元スプレッドシート（Asset_Status）から収集する。
+// 「SBI証券（日本株）」「SBI証券（日本株信用）」の「銘柄コード」列から4桁の証券コードを抽出。
+function getSbiHeldCodes_() {
+  const SBI_SS_ID = '1VSSDMV5u8wNmGe9bh4wQI7wOULodzMq309cgWKljobg'; // Asset_Status のスプレッドシート
+  const SHEET_NAMES = ['SBI証券（日本株）', 'SBI証券（日本株信用）'];
+  const CODE_RE = /^[0-9][0-9A-Z]{3}$/;                            // 4桁の証券コード（例 7203 / 130A）
+  const set = new Set();
+  let ss;
+  try { ss = SpreadsheetApp.openById(SBI_SS_ID); }
+  catch (e) { Logger.log('SBIスプレッドシートを開けません: ' + e.message); return set; }
+  SHEET_NAMES.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (!sh || sh.getLastRow() < 1) return;
+    const data = sh.getDataRange().getValues();
+    // 「銘柄コード」ヘッダの列を特定（Asset_Status のCSV取込と同じ構造）
+    let hi = -1, ci = -1;
+    for (let r = 0; r < data.length && ci < 0; r++) {
+      const c = data[r].findIndex(v => String(v || '').trim() === '銘柄コード');
+      if (c >= 0) { hi = r; ci = c; }
+    }
+    if (ci < 0) {   // ヘッダが見つからなければ全セルから4桁コードを拾う保険
+      data.forEach(row => row.forEach(v => {
+        const s = String(v || '').trim().toUpperCase();
+        if (CODE_RE.test(s)) set.add(s);
+      }));
+      return;
+    }
+    for (let r = hi + 1; r < data.length; r++) {
+      const s = String(data[r][ci] || '').trim().toUpperCase();
+      if (CODE_RE.test(s)) set.add(s);
+    }
+  });
+  Logger.log('SBI保有銘柄コード: ' + set.size + '件');
+  return set;
 }
 
 // ============================================================================
@@ -360,22 +405,6 @@ function detectHeadShoulders_(bars, rsi) {
     }
   }
   return out;
-}
-
-// ============================================================================
-//  JSON出力（GitHub Pages 用）
-// ============================================================================
-function exportJson() {
-  const sig = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.SIGNALS);
-  if (!sig || sig.getLastRow() < 2) throw new Error('先に「シグナル走査」を実行してください');
-  const keys = ['date', 'code', 'name', 'close', 'dir', 'signals', 'explain'];
-  const data = sig.getRange(2, 1, sig.getLastRow() - 1, 7).getValues()
-    .map(r => Object.fromEntries(keys.map((k, i) => [k, r[i]])));
-  const json = JSON.stringify({ updated: new Date().toISOString(), items: data });
-  const file = DriveApp.createFile('sakata_signals.json', json, 'application/json');
-  Logger.log('JSON出力: ' + file.getUrl());
-  SpreadsheetApp.getActive().toast('JSONをDriveに出力しました', '酒田五法', 5);
-  return file.getUrl();
 }
 
 // ============================================================================

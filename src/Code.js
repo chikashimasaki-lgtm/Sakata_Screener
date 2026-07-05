@@ -222,9 +222,32 @@ const SIGNAL_DESC_ = {
   '下げ三法':       '下降中の小戻しのあと安値を更新。下落継続（売り）。',
   '三山(三尊天井)': '3つの山（中央が最高）でネックライン割れ。天井の売りサイン。',
   '三川(逆三尊)':   '3つの谷（中央が最安）でネックライン上抜け。大底の買いサイン。',
+  'RSI過熱(80超)':            'RSIが80超で買われ過ぎ。三空踏み上げの反落を補強（売り）。',
+  'RSI底値(20割れ)':          'RSIが20割れで売られ過ぎ。三空叩き込みの反発を補強（買い）。',
+  'RSIダイバージェンス(弱気)': '高値圏でRSIが切り下がり上昇の勢いが減衰。天井を補強（売り）。',
+  'RSIダイバージェンス(強気)': '安値圏でRSIが切り上がり下落の勢いが減衰。大底を補強（買い）。',
 };
 function signalExplain_(names) {
   return names.map(n => '・' + n + '：' + (SIGNAL_DESC_[n] || '')).join('\n');
+}
+
+// RSI(14) 系列（close値のみで計算）。HTML版スクリーナーの現代版フィルターを移植。
+function rsiSeries_(closes, p) {
+  const out = new Array(closes.length).fill(null);
+  let g = 0, l = 0;
+  for (let i = 1; i < closes.length; i++) {
+    const ch = closes[i] - closes[i - 1];
+    const up = Math.max(ch, 0), dn = Math.max(-ch, 0);
+    if (i <= p) {
+      g += up; l += dn;
+      if (i === p) out[i] = (l === 0) ? 100 : 100 - 100 / (1 + g / l);
+    } else {
+      g = (g * (p - 1) + up) / p;
+      l = (l * (p - 1) + dn) / p;
+      out[i] = (l === 0) ? 100 : 100 - 100 / (1 + g / l);
+    }
+  }
+  return out;
 }
 
 // ============================================================================
@@ -238,6 +261,8 @@ function detectSakata_(bars) {
   const A = bars[n - 1], B = bars[n - 2], C = bars[n - 3], D = bars[n - 4], E = bars[n - 5];
   const bull = b => b.c > b.o;
   const bear = b => b.c < b.o;
+  const rsi  = rsiSeries_(bars.map(b => b.c), 14);  // 現代版フィルター（RSI補強）
+  const rNow = rsi[n - 1];
 
   // 赤三兵: 直近3本が陽線・終値切り上げ・始値切り上げ（上昇転換/継続）
   if (bull(A) && bull(B) && bull(C) && A.c > B.c && B.c > C.c && A.o > B.o && B.o > C.o)
@@ -247,11 +272,17 @@ function detectSakata_(bars) {
   if (bear(A) && bear(B) && bear(C) && A.c < B.c && B.c < C.c && A.o < B.o && B.o < C.o)
     sig.push({ name: '三羽烏(黒三兵)', dir: '売り' });
 
-  // 三空踏み上げ: 直近3つの窓が上向き（買われ過ぎ→反落）
-  if (A.l > B.h && B.l > C.h && C.l > D.h) sig.push({ name: '三空踏み上げ', dir: '売り' });
+  // 三空踏み上げ: 直近3つの窓が上向き（買われ過ぎ→反落）＋ RSI80超で過熱を補強
+  if (A.l > B.h && B.l > C.h && C.l > D.h) {
+    sig.push({ name: '三空踏み上げ', dir: '売り' });
+    if (rNow != null && rNow >= 80) sig.push({ name: 'RSI過熱(80超)', dir: '売り' });
+  }
 
-  // 三空叩き込み: 直近3つの窓が下向き（売られ過ぎ→反発）
-  if (A.h < B.l && B.h < C.l && C.h < D.l) sig.push({ name: '三空叩き込み', dir: '買い' });
+  // 三空叩き込み: 直近3つの窓が下向き（売られ過ぎ→反発）＋ RSI20割れで底値を補強
+  if (A.h < B.l && B.h < C.l && C.h < D.l) {
+    sig.push({ name: '三空叩き込み', dir: '買い' });
+    if (rNow != null && rNow <= 20) sig.push({ name: 'RSI底値(20割れ)', dir: '買い' });
+  }
 
   // 上げ三法: E長陽 → D,C,B が E の値幅内で調整 → A が E 高値を上抜けの陽線（上昇継続）
   if (bull(E) && [D, C, B].every(x => x.h <= E.h && x.l >= E.l) && bull(A) && A.c > E.h)
@@ -261,8 +292,8 @@ function detectSakata_(bars) {
   if (bear(E) && [D, C, B].every(x => x.h <= E.h && x.l >= E.l) && bear(A) && A.c < E.l)
     sig.push({ name: '下げ三法', dir: '売り' });
 
-  // 三山(三尊天井) / 三川(逆三尊)
-  detectHeadShoulders_(bars).forEach(s => sig.push(s));
+  // 三山(三尊天井) / 三川(逆三尊)（RSIダイバージェンスで補強）
+  detectHeadShoulders_(bars, rsi).forEach(s => sig.push(s));
 
   return sig;
 }
@@ -282,7 +313,7 @@ function findExtrema_(vals, w, isPeak) {
 }
 
 // 三山(三尊天井=売り) / 三川(逆三尊=買い) を直近のピーク/トラフ3つで判定
-function detectHeadShoulders_(bars) {
+function detectHeadShoulders_(bars, rsi) {
   const n = bars.length;
   const out = [];
   if (n < 25) return out;
@@ -298,7 +329,11 @@ function detectHeadShoulders_(bars) {
     if (hb > ha && hb > hc && Math.abs(ha - hc) / hb < TOL) {
       const neck = Math.max(Math.min.apply(null, lows.slice(a, b + 1)),
                             Math.min.apply(null, lows.slice(b, c + 1)));
-      if (close < neck) out.push({ name: '三山(三尊天井)', dir: '売り' });
+      if (close < neck) {
+        out.push({ name: '三山(三尊天井)', dir: '売り' });
+        if (rsi && rsi[c] != null && rsi[b] != null && rsi[c] < rsi[b])
+          out.push({ name: 'RSIダイバージェンス(弱気)', dir: '売り' });
+      }
     }
   }
   // 三川(逆三尊): 直近トラフ3つ 左肩>頭<右肩、両肩が近い、ネックライン上抜け
@@ -309,7 +344,11 @@ function detectHeadShoulders_(bars) {
     if (lb < la && lb < lc && Math.abs(la - lc) / Math.abs(lb || 1) < TOL) {
       const neck = Math.min(Math.max.apply(null, highs.slice(a, b + 1)),
                             Math.max.apply(null, highs.slice(b, c + 1)));
-      if (close > neck) out.push({ name: '三川(逆三尊)', dir: '買い' });
+      if (close > neck) {
+        out.push({ name: '三川(逆三尊)', dir: '買い' });
+        if (rsi && rsi[c] != null && rsi[b] != null && rsi[c] > rsi[b])
+          out.push({ name: 'RSIダイバージェンス(強気)', dir: '買い' });
+      }
     }
   }
   return out;

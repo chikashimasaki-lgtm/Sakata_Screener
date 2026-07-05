@@ -216,7 +216,7 @@ function finalizeSignals_(sig) {
   // 並べ替え後に設定するので、後続の再書き込みで消えない。index.html のリンクと同一挙動。
   const TV = 'vrWJ3cQi';
   sig.getRange(2, 2, n, 1).setFormulas(data.map(row => {
-    const code = String(row[1] || '').trim();
+    const code = to4_(String(row[1] || '').trim()).toUpperCase();   // 5桁→4桁に正規化
     return [code ? `=HYPERLINK("https://jp.tradingview.com/chart/${TV}/?symbol=TSE:${code}&interval=D","${code}")` : ''];
   }));
 
@@ -235,7 +235,7 @@ function finalizeSignals_(sig) {
   try {
     const held = getSbiHeldCodes_();
     for (let i = 0; i < n; i++) {
-      const code = String(data[i][1] || '').trim().toUpperCase();
+      const code = to4_(String(data[i][1] || '').trim()).toUpperCase();   // 5桁→4桁に正規化
       if (held.has(code)) sig.getRange(2 + i, 1, 1, 7).setBackground('#f2a9a9');
     }
   } catch (e) { Logger.log('SBI保有ハイライト失敗: ' + e.message); }
@@ -265,13 +265,13 @@ function getSbiHeldCodes_() {
     }
     if (ci < 0) {   // ヘッダが見つからなければ全セルから4桁コードを拾う保険
       data.forEach(row => row.forEach(v => {
-        const s = String(v || '').trim().toUpperCase();
+        const s = to4_(String(v || '').trim()).toUpperCase();   // 5桁→4桁に正規化
         if (CODE_RE.test(s)) set.add(s);
       }));
       return;
     }
     for (let r = hi + 1; r < data.length; r++) {
-      const s = String(data[r][ci] || '').trim().toUpperCase();
+      const s = to4_(String(data[r][ci] || '').trim()).toUpperCase();   // 5桁→4桁に正規化
       if (CODE_RE.test(s)) set.add(s);
     }
   });

@@ -29,6 +29,7 @@ function onOpen() {
     .addSeparator()
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行',            'scanSignals')
+    .addItem('平日16時の自動走査を設定',      'installDailyScanTrigger')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
     .addItem('走査の進捗リセット',           'resetScanQueue')
@@ -169,6 +170,37 @@ function clearResumeTriggers_() {
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'scanSignals')
     .forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+// ---- 定期実行（平日16時・土日祝／年末年始はスキップ） ----
+function installDailyScanTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'scheduledScan')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(16).create();
+  SpreadsheetApp.getActive().toast('平日16時の自動走査を設定しました（土日祝・年末年始は自動スキップ）', '酒田五法', 6);
+  Logger.log('scheduledScan トリガーを設定（毎日16時台・営業日のみ実行）');
+}
+
+// 毎日16時台に発火。東証の営業日だけ scanSignals を実行する。
+function scheduledScan() {
+  const now = new Date();
+  if (!isJpMarketOpen_(now)) { Logger.log('休場日のため走査をスキップ: ' + now); return; }
+  scanSignals();
+}
+
+// 東証が開いている日か（土日・年末年始・日本の祝日を除外）
+function isJpMarketOpen_(d) {
+  const wd = d.getDay();
+  if (wd === 0 || wd === 6) return false;                  // 土日
+  const m = d.getMonth() + 1, day = d.getDate();
+  if (m === 1 && day <= 3) return false;                   // 年始（1/1-1/3 東証休場）
+  if (m === 12 && day === 31) return false;                // 大晦日（東証休場）
+  try {
+    const cal = CalendarApp.getCalendarById('ja.japanese#holiday@group.v.calendar.google.com');
+    if (cal && cal.getEventsForDay(d).length > 0) return false;  // 日本の祝日
+  } catch (e) { Logger.log('祝日判定をスキップ（カレンダー未参照）: ' + e.message); }
+  return true;
 }
 
 function finalizeSignals_(sig) {

@@ -49,7 +49,11 @@ function setup() {
   }
   if (!ss.getSheetByName(SK.SHEETS.SIGNALS)) ss.insertSheet(SK.SHEETS.SIGNALS);
   createUsageSheet();
-  ss.getSheetByName(SK.SHEETS.UNIVERSE).setTabColor('#5b6bd6');
+  const u = ss.getSheetByName(SK.SHEETS.UNIVERSE);
+  styleSheet_(u, 2, '#1a1e3a', '#eef3fc');   // 銘柄シートも配色
+  if (u.getLastRow() > 1) u.getRange(2, 1, u.getLastRow() - 1, 1).setHorizontalAlignment('right');  // コード右寄せ
+  autoFit_(u, 2);
+  u.setTabColor('#5b6bd6');
   ss.getSheetByName(SK.SHEETS.SIGNALS).setTabColor('#e0567a');
   ss.toast('シートを準備しました。「銘柄」にコードを入れて走査してください', '酒田五法', 6);
 }
@@ -77,6 +81,9 @@ function fetchPrimeUniverse() {
   uni.clear();
   uni.getRange(1, 1, 1, 2).setValues([['コード', '銘柄名']]);
   if (collect.length) uni.getRange(2, 1, collect.length, 2).setValues(collect);
+  styleSheet_(uni, 2, '#1a1e3a', '#eef3fc');   // 銘柄シートも配色
+  if (uni.getLastRow() > 1) uni.getRange(2, 1, uni.getLastRow() - 1, 1).setHorizontalAlignment('right');  // コード右寄せ
+  autoFit_(uni, 2);
   uni.setTabColor('#5b6bd6');
   Logger.log('プライム銘柄: ' + collect.length + '件');
   SpreadsheetApp.getActive().toast('プライム ' + collect.length + '件を取得', '酒田五法', 5);
@@ -103,7 +110,7 @@ function scanSignals() {
     const rows = uni.getRange(2, 1, uni.getLastRow() - 1, 2).getValues().filter(r => r[0]);
     queue = rows.map(r => [String(r[0]).trim(), r[1] || '']);
     sig.clear();
-    sig.getRange(1, 1, 1, 6).setValues([['日付', 'コード', '銘柄名', '方向', 'シグナル', '終値']]);
+    sig.getRange(1, 1, 1, 7).setValues([['日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説']]);
   }
 
   const start = Date.now();
@@ -128,15 +135,16 @@ function scanSignals() {
       const last = bars[bars.length - 1];
       const dirs = new Set(signals.map(s => s.dir));
       const dir  = dirs.size > 1 ? '混在' : [...dirs][0];
+      const names = signals.map(s => s.name);
       buffer.push([
         Utilities.formatDate(new Date(last.t * 1000), 'JST', 'yyyy/MM/dd'),
-        code, name, dir, signals.map(s => s.name).join('、'), last.c,
+        code, name, last.c, dir, names.join('、'), signalExplain_(names),
       ]);
     });
     Utilities.sleep(200);
   }
 
-  if (buffer.length) sig.getRange(sig.getLastRow() + 1, 1, buffer.length, 6).setValues(buffer);
+  if (buffer.length) sig.getRange(sig.getLastRow() + 1, 1, buffer.length, 7).setValues(buffer);
 
   clearResumeTriggers_();
   if (queue.length > 0) {
@@ -166,15 +174,23 @@ function clearResumeTriggers_() {
 
 function finalizeSignals_(sig) {
   if (sig.getLastRow() < 2) return;
-  // 方向で並べ替え（買い→売り→混在）はせず、コード順のまま。装飾のみ。
-  sig.getRange(2, 6, sig.getLastRow() - 1, 1).setNumberFormat('#,##0');   // 終値カンマ
-  sig.getRange(2, 2, sig.getLastRow() - 1, 1).setHorizontalAlignment('right'); // コード右寄せ
-  styleSheet_(sig, 6, '#3a1530', '#f7ecf3');
-  autoFit_(sig, 6);
-  // 方向の色分け（買い=緑 / 売り=赤）
-  const dirs = sig.getRange(2, 4, sig.getLastRow() - 1, 1).getValues();
+  const n = sig.getLastRow() - 1;
+  // 強く出ているもの（同時に点灯したパターン数が多い＝強いシグナル）を上に並べ替え
+  const data = sig.getRange(2, 1, n, 7).getValues();
+  const strength = row => String(row[5] || '').split('、').filter(Boolean).length;  // シグナル列
+  data.sort((a, b) => strength(b) - strength(a));
+  sig.getRange(2, 1, n, 7).setValues(data);
+
+  sig.getRange(2, 4, n, 1).setNumberFormat('#,##0');        // 終値カンマ（4列目）
+  sig.getRange(2, 2, n, 1).setHorizontalAlignment('right'); // コード右寄せ
+  styleSheet_(sig, 7, '#3a1530', '#f7ecf3');
+  autoFit_(sig, 6);                                         // 6列目まで内容にフィット
+  sig.setColumnWidth(7, 460);                               // シグナル解説は固定幅＋折返し
+  sig.getRange(2, 7, n, 1).setWrap(true);
+  // 方向（5列目）の色分け（買い=緑 / 売り=赤 / 混在=橙）
+  const dirs = sig.getRange(2, 5, n, 1).getValues();
   const bg = dirs.map(([d]) => [d === '買い' ? '#e7f6ec' : d === '売り' ? '#fdeaea' : '#fff5e6']);
-  sig.getRange(2, 4, dirs.length, 1).setBackgrounds(bg);
+  sig.getRange(2, 5, n, 1).setBackgrounds(bg);
   sig.setTabColor('#e0567a');
 }
 
@@ -194,6 +210,21 @@ function parseYahooBars_(res) {
     }
     return bars;
   } catch (e) { return []; }
+}
+
+// シグナルの意味（解説列に表示）
+const SIGNAL_DESC_ = {
+  '赤三兵':         '陽線3本が連続し上昇の勢い。買い転換・継続のサイン。',
+  '三羽烏(黒三兵)': '陰線3本が連続し下落の勢い。売り転換・継続のサイン。',
+  '三空踏み上げ':   '上放れの窓が3回続き買われ過ぎ。反落に注意（売り）。',
+  '三空叩き込み':   '下放れの窓が3回続き売られ過ぎ。反発期待（買い）。',
+  '上げ三法':       '上昇中の小休止のあと高値を更新。上昇継続（買い）。',
+  '下げ三法':       '下降中の小戻しのあと安値を更新。下落継続（売り）。',
+  '三山(三尊天井)': '3つの山（中央が最高）でネックライン割れ。天井の売りサイン。',
+  '三川(逆三尊)':   '3つの谷（中央が最安）でネックライン上抜け。大底の買いサイン。',
+};
+function signalExplain_(names) {
+  return names.map(n => '・' + n + '：' + (SIGNAL_DESC_[n] || '')).join('\n');
 }
 
 // ============================================================================
@@ -230,7 +261,58 @@ function detectSakata_(bars) {
   if (bear(E) && [D, C, B].every(x => x.h <= E.h && x.l >= E.l) && bear(A) && A.c < E.l)
     sig.push({ name: '下げ三法', dir: '売り' });
 
+  // 三山(三尊天井) / 三川(逆三尊)
+  detectHeadShoulders_(bars).forEach(s => sig.push(s));
+
   return sig;
+}
+
+// 極大（ピーク）/極小（トラフ）の位置を返す（前後 w 本より高い/低い）
+function findExtrema_(vals, w, isPeak) {
+  const idx = [];
+  for (let i = w; i < vals.length - w; i++) {
+    let ok = true;
+    for (let k = i - w; k <= i + w; k++) {
+      if (k === i) continue;
+      if (isPeak ? vals[k] > vals[i] : vals[k] < vals[i]) { ok = false; break; }
+    }
+    if (ok) idx.push(i);
+  }
+  return idx;
+}
+
+// 三山(三尊天井=売り) / 三川(逆三尊=買い) を直近のピーク/トラフ3つで判定
+function detectHeadShoulders_(bars) {
+  const n = bars.length;
+  const out = [];
+  if (n < 25) return out;
+  const highs = bars.map(b => b.h), lows = bars.map(b => b.l);
+  const close = bars[n - 1].c;
+  const W = 3, TOL = 0.05;  // 両肩の高さ許容差 5%
+
+  // 三山(三尊天井): 直近ピーク3つ 左肩<頭>右肩、両肩が近い、ネックライン割れ
+  const pk = findExtrema_(highs, W, true);
+  if (pk.length >= 3) {
+    const [a, b, c] = pk.slice(-3);
+    const ha = highs[a], hb = highs[b], hc = highs[c];
+    if (hb > ha && hb > hc && Math.abs(ha - hc) / hb < TOL) {
+      const neck = Math.max(Math.min.apply(null, lows.slice(a, b + 1)),
+                            Math.min.apply(null, lows.slice(b, c + 1)));
+      if (close < neck) out.push({ name: '三山(三尊天井)', dir: '売り' });
+    }
+  }
+  // 三川(逆三尊): 直近トラフ3つ 左肩>頭<右肩、両肩が近い、ネックライン上抜け
+  const tr = findExtrema_(lows, W, false);
+  if (tr.length >= 3) {
+    const [a, b, c] = tr.slice(-3);
+    const la = lows[a], lb = lows[b], lc = lows[c];
+    if (lb < la && lb < lc && Math.abs(la - lc) / Math.abs(lb || 1) < TOL) {
+      const neck = Math.min(Math.max.apply(null, highs.slice(a, b + 1)),
+                            Math.max.apply(null, highs.slice(b, c + 1)));
+      if (close > neck) out.push({ name: '三川(逆三尊)', dir: '買い' });
+    }
+  }
+  return out;
 }
 
 // ============================================================================
@@ -239,8 +321,8 @@ function detectSakata_(bars) {
 function exportJson() {
   const sig = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.SIGNALS);
   if (!sig || sig.getLastRow() < 2) throw new Error('先に「シグナル走査」を実行してください');
-  const keys = ['date', 'code', 'name', 'dir', 'signals', 'close'];
-  const data = sig.getRange(2, 1, sig.getLastRow() - 1, 6).getValues()
+  const keys = ['date', 'code', 'name', 'close', 'dir', 'signals', 'explain'];
+  const data = sig.getRange(2, 1, sig.getLastRow() - 1, 7).getValues()
     .map(r => Object.fromEntries(keys.map((k, i) => [k, r[i]])));
   const json = JSON.stringify({ updated: new Date().toISOString(), items: data });
   const file = DriveApp.createFile('sakata_signals.json', json, 'application/json');

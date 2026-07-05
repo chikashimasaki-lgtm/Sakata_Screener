@@ -181,6 +181,14 @@ function finalizeSignals_(sig) {
   data.sort((a, b) => strength(b) - strength(a));
   sig.getRange(2, 1, n, 7).setValues(data);
 
+  // B列（コード）を TradingView 日足チャート（保存レイアウト）へのハイパーリンクにする。
+  // 並べ替え後に設定するので、後続の再書き込みで消えない。index.html のリンクと同一挙動。
+  const TV = 'vrWJ3cQi';
+  sig.getRange(2, 2, n, 1).setFormulas(data.map(row => {
+    const code = String(row[1] || '').trim();
+    return [code ? `=HYPERLINK("https://jp.tradingview.com/chart/${TV}/?symbol=TSE:${code}&interval=D","${code}")` : ''];
+  }));
+
   sig.getRange(2, 4, n, 1).setNumberFormat('#,##0');        // 終値カンマ（4列目）
   sig.getRange(2, 2, n, 1).setHorizontalAlignment('right'); // コード右寄せ
   styleSheet_(sig, 7, '#3a1530', '#f7ecf3');

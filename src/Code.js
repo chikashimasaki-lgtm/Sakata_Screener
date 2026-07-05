@@ -98,6 +98,10 @@ function to4_(code) {
 //  シグナル走査（時間分割・自動再開）
 // ============================================================================
 function scanSignals() {
+  // 自動再開トリガーと手動実行が重なった場合の二重追記を防ぐ（多重実行排他）
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) { Logger.log('別の走査が進行中のためスキップ'); return; }
+
   const ss  = SpreadsheetApp.getActive();
   const uni = ss.getSheetByName(SK.SHEETS.UNIVERSE);
   const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);

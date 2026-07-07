@@ -225,12 +225,17 @@ function finalizeSignals_(sig) {
   // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き）。実績DB(過去6ヶ月バックテスト)があれば実績スコアで。
   const statsMap = readStatsSheet_();
   const data = sig.getRange(2, 1, n, 9).getValues();
-  data.sort((a, b) => signalStrength_(b[7], statsMap) - signalStrength_(a[7], statsMap));
+  const scoreOf = row => signalStrength_(row[7], statsMap);
+  data.sort((a, b) => scoreOf(b) - scoreOf(a));
 
-  // 強さ(2列目)を★で可視化、方向(7列目)を矢印付きバッジに整形。
-  data.forEach(row => {
-    const s = signalStrength_(row[7], statsMap);
-    row[1] = s >= 6 ? '★★★' : s >= 4 ? '★★' : '★';
+  // 強さ★は「相対順位」で付与（上位1/3=★★★, 中位=★★, 下位=★）。
+  // 実績スコア(平均騰落率%)と静的重み(1〜3)は尺度が違うため、絶対しきい値ではなく順位で分布させる。
+  const scores = data.map(scoreOf);
+  const asc = scores.slice().sort((a, b) => a - b);
+  const t1 = asc[Math.floor(n / 3)], t2 = asc[Math.floor(n * 2 / 3)];
+  data.forEach((row, i) => {
+    const s = scores[i];
+    row[1] = s >= t2 ? '★★★' : s >= t1 ? '★★' : '★';    // 方向(7列目)を矢印付きバッジに整形
     const d = String(row[6] || '');
     row[6] = d === '買い' ? '▲ 買い' : d === '売り' ? '▼ 売り' : d === '混在' ? '◆ 混在' : d;
   });

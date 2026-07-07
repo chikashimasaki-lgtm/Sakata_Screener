@@ -412,14 +412,20 @@ function parseSignalNames_(cellText) {
   return String(cellText || '').split('\n').map(s => s.replace(/^・/, '').trim()).filter(Boolean);
 }
 
-// パターン1つの点数：実績が十分あれば期待リターン%（方向調整）、不足なら静的重みで代替
-function patternPoints_(name, statsMap) {
-  const s = statsMap && statsMap[name];
-  if (s && s.n >= BT_MIN_SAMPLE) return s.retSum / s.n * 100;
-  return SIGNAL_WEIGHT_[name] || 1;
+// 推奨重み(成績シートH列)：実績が十分あれば勝率で3段階、不足なら静的重みで代替
+function suggestWeight_(name, n, wins) {
+  if (!n || n < BT_MIN_SAMPLE) return SIGNAL_WEIGHT_[name] || 1;
+  const win = wins / n * 100;
+  return win >= 60 ? 3 : win >= 50 ? 2 : 1;
 }
 
-// 傾向の強さ = 各シグナルの点数の合計（statsMap があれば実績ベース＝自動修正）
+// パターン1つの点数 = 推奨重み(H列)
+function patternPoints_(name, statsMap) {
+  const s = statsMap && statsMap[name];
+  return suggestWeight_(name, s ? s.n : 0, s ? s.wins : 0);
+}
+
+// 傾向の強さ = 各シグナルの推奨重み(H列)の合計
 function signalStrength_(cellText, statsMap) {
   return parseSignalNames_(cellText).reduce((sum, name) => sum + patternPoints_(name, statsMap), 0);
 }
@@ -808,7 +814,7 @@ function writeStatsSheet_(map) {
     const s = map[name], nn = s.n || 0;
     const win = nn ? s.wins / nn * 100 : 0;
     const exp = nn ? s.retSum / nn * 100 : 0;
-    const suggest = nn < BT_MIN_SAMPLE ? (SIGNAL_WEIGHT_[name] || 1) : (win >= 60 ? 3 : win >= 50 ? 2 : 1);
+    const suggest = suggestWeight_(name, nn, s.wins || 0);
     return [name, s.dir || SIGNAL_DIR_[name] || '', nn, s.wins || 0,
             Math.round((s.retSum || 0) * 10000) / 10000, Math.round(win * 10) / 10, Math.round(exp * 100) / 100, suggest, signalHorizon_(name)];
   });

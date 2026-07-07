@@ -142,7 +142,7 @@ function scanSignals() {
       const names = signals.map(s => s.name);
       buffer.push([
         Utilities.formatDate(new Date(last.t * 1000), 'JST', 'yyyy/MM/dd'),
-        code, name, last.c, dir, names.join('、'), signalExplain_(names),
+        code, name, last.c, dir, names.map(s => '・' + s).join('\n'), signalExplain_(names),
       ]);
     });
     Utilities.sleep(200);
@@ -226,9 +226,11 @@ function finalizeSignals_(sig) {
   sig.getRange(2, 4, n, 1).setNumberFormat('#,##0');        // 終値カンマ（4列目）
   sig.getRange(2, 2, n, 1).setHorizontalAlignment('right'); // コード右寄せ
   styleSheet_(sig, 7, '#3a1530', '#f7ecf3');
-  autoFit_(sig, 6);                                         // 6列目まで内容にフィット
+  autoFit_(sig, 5);                                         // 5列目まで内容にフィット
+  sig.setColumnWidth(6, 180);                               // シグナルは箇条書き（固定幅＋折返し）
+  sig.getRange(2, 6, n, 1).setWrap(true).setVerticalAlignment('top');
   sig.setColumnWidth(7, 460);                               // シグナル解説は固定幅＋折返し
-  sig.getRange(2, 7, n, 1).setWrap(true);
+  sig.getRange(2, 7, n, 1).setWrap(true).setVerticalAlignment('top');
   // 方向（5列目）の色分け（買い=緑 / 売り=赤 / 混在=橙）
   const dirs = sig.getRange(2, 5, n, 1).getValues();
   const bg = dirs.map(([d]) => [d === '買い' ? '#e7f6ec' : d === '売り' ? '#fdeaea' : '#fff5e6']);

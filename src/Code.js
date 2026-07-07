@@ -29,7 +29,7 @@ function onOpen() {
     .addSeparator()
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行',            'scanSignals')
-    .addItem('自動実行を設定（走査:平日16時/保有確認:毎時）', 'installDailyScanTrigger')
+    .addItem('自動実行を設定（走査:平日18時/保有確認:毎時）', 'installDailyScanTrigger')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
     .addItem('走査の進捗リセット',           'resetScanQueue')
@@ -176,22 +176,23 @@ function clearResumeTriggers_() {
     .forEach(t => ScriptApp.deleteTrigger(t));
 }
 
-// ---- 定期実行（平日16時・土日祝／年末年始はスキップ） ----
+// ---- 定期実行（平日18時・土日祝／年末年始はスキップ） ----
 function installDailyScanTrigger() {
   ScriptApp.getProjectTriggers()
     .filter(t => ['scheduledScan', 'scheduledHeldCheck'].includes(t.getHandlerFunction()))
     .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(16).create();  // 全銘柄 株価取得＋走査（1日1回）
+  ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();  // 全銘柄 株価取得＋走査（1日1回）
   ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();       // 購入ポートフォリオ確認（毎時）
-  SpreadsheetApp.getActive().toast('自動実行を設定しました（全銘柄走査:平日16時 / 保有確認:毎時・立会時間内）', '酒田五法', 6);
-  Logger.log('トリガー設定: scheduledScan(平日16時) / scheduledHeldCheck(毎時・立会時間内)');
+  SpreadsheetApp.getActive().toast('自動実行を設定しました（全銘柄走査:平日18時 / 保有確認:毎時・立会時間内）', '酒田五法', 6);
+  Logger.log('トリガー設定: scheduledScan(平日18時) / scheduledHeldCheck(毎時・立会時間内)');
 }
 
-// 平日16時に発火。全銘柄の株価取得＋シグナル走査（重い処理・1日1回）。
-// 立会対象（営業日 9:00-17:00）のみ実行。isMarketOpen_() は共通モジュール MarketCalendar.js で定義。
+// 平日18時に発火。全銘柄の株価取得＋シグナル走査（重い処理・1日1回）。
+// 引け後にYahoo日足の当日終値が確定するのを待つため18時。立会時間外なので営業日判定(isBusinessDay_)のみ。
+// isBusinessDay_() は共通モジュール MarketCalendar.js で定義。
 function scheduledScan() {
   const now = new Date();
-  if (!isMarketOpen_(now)) { Logger.log('立会時間外(土日祝・時間外)のため走査をスキップ: ' + now); return; }
+  if (!isBusinessDay_(now)) { Logger.log('休場日のため走査をスキップ: ' + now); return; }
   scanSignals();
 }
 
@@ -209,10 +210,9 @@ function scheduledHeldCheck() {
 function finalizeSignals_(sig) {
   if (sig.getLastRow() < 2) return;
   const n = sig.getLastRow() - 1;
-  // 強く出ているもの（同時に点灯したパターン数が多い＝強いシグナル）を上に並べ替え
+  // 「傾向が強い順」に並べ替え：各シグナルの強さ重みの合計が大きい銘柄を上に。
   const data = sig.getRange(2, 1, n, 7).getValues();
-  const strength = row => String(row[5] || '').split('、').filter(Boolean).length;  // シグナル列
-  data.sort((a, b) => strength(b) - strength(a));
+  data.sort((a, b) => signalStrength_(b[5]) - signalStrength_(a[5]));  // 6列目=シグナル(箇条書き)
   sig.getRange(2, 1, n, 7).setValues(data);
 
   // B列（コード）を TradingView 日足チャート（保存レイアウト）へのハイパーリンクにする。
@@ -332,6 +332,27 @@ const SIGNAL_DESC_ = {
   'RSIダイバージェンス(弱気)': '高値圏でRSIが切り下がり上昇の勢いが減衰。天井を補強（売り）。',
   'RSIダイバージェンス(強気)': '安値圏でRSIが切り上がり下落の勢いが減衰。大底を補強（買い）。',
 };
+// シグナルの強さ重み（「傾向が強い順」の並べ替えに使用）。大きいほど強いフォーメーション。
+const SIGNAL_WEIGHT_ = {
+  '三山(三尊天井)': 3, '三川(逆三尊)': 3, '三山(三点天井)': 3,
+  '三空踏み上げ': 3, '三空叩き込み': 3,
+  '明けの明星': 3, '宵の明星': 3, '捨て子線(明け)': 3, '捨て子線(宵)': 3, '上放れ二羽烏': 3,
+  '赤三兵': 2, '三羽烏(黒三兵)': 2, '上げ三法': 2, '下げ三法': 2,
+  '包み線(強気)': 2, '包み線(弱気)': 2, 'かぶせ線': 2, '切り込み線': 2,
+  'はらみ線(強気)': 1, 'はらみ線(弱気)': 1, '毛抜き天井': 1, '毛抜き底': 1, '先詰まり赤三兵(警戒)': 1,
+  'RSI過熱(80超)': 1, 'RSI底値(20割れ)': 1, 'RSIダイバージェンス(弱気)': 1, 'RSIダイバージェンス(強気)': 1,
+};
+
+// 箇条書きのシグナル列テキストからシグナル名配列を取り出す
+function parseSignalNames_(cellText) {
+  return String(cellText || '').split('\n').map(s => s.replace(/^・/, '').trim()).filter(Boolean);
+}
+
+// 傾向の強さ = 各シグナルの重みの合計
+function signalStrength_(cellText) {
+  return parseSignalNames_(cellText).reduce((sum, name) => sum + (SIGNAL_WEIGHT_[name] || 1), 0);
+}
+
 function signalExplain_(names) {
   return names.map(n => '・' + n + '：' + (SIGNAL_DESC_[n] || '')).join('\n');
 }
@@ -630,8 +651,8 @@ function createUsageSheet() {
     ['4. 「シグナル」シートに結果。SBI証券(日本株/信用)で保有中の銘柄は行を半透明赤でハイライト', 'p'],
     ['', 'p'],
     ['■ 自動実行（トリガー）', 'h'],
-    ['メニュー「自動実行を設定（走査:平日16時/保有確認:毎時）」で以下の2つを設定します。', 'p'],
-    ['① 全銘柄走査 … 平日16時に1回、全銘柄の株価を取得して酒田五法シグナルを走査（重い処理）', 'p'],
+    ['メニュー「自動実行を設定（走査:平日18時/保有確認:毎時）」で以下の2つを設定します。', 'p'],
+    ['① 全銘柄走査 … 平日18時に1回、全銘柄の株価を取得して酒田五法シグナルを走査（重い処理）', 'p'],
     ['② 購入ポートフォリオ確認 … 毎時、SBI保有銘柄をシグナルシート上で最新のハイライトに更新（株価取得はしない）', 'p'],
     ['   ※いずれも東証の立会対象（営業日9:00-17:00、土日祝・年末年始は除外）のときだけ実行', 'p'],
     ['', 'p'],

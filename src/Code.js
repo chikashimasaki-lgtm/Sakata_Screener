@@ -400,6 +400,13 @@ const SIGNAL_DIR_ = {
   '上放れ二羽烏': '売り', 'RSI過熱(80超)': '売り', 'RSIダイバージェンス(弱気)': '売り',
 };
 
+// パターン別の評価ホライズン（先読み営業日数）。
+// 形成に数週間かかる中期系（大底/天井・トレンド継続）は20日、それ以外の短期系は既定 BT_FORWARD(3日)。
+const SIGNAL_HORIZON_ = {
+  '三山(三尊天井)': 20, '三山(三点天井)': 20, '三川(逆三尊)': 20, '上げ三法': 20, '下げ三法': 20,
+};
+function signalHorizon_(name) { return SIGNAL_HORIZON_[name] || BT_FORWARD; }
+
 // 箇条書きのシグナル列テキストからシグナル名配列を取り出す
 function parseSignalNames_(cellText) {
   return String(cellText || '').split('\n').map(s => s.replace(/^・/, '').trim()).filter(Boolean);
@@ -720,7 +727,8 @@ function createUsageSheet() {
     ['', 'p'],
     ['■ 実績バックテスト（重みの自動学習・自動修正）', 'h'],
     ['メニュー「実績バックテスト（重みを自動学習）」で、過去6ヶ月の全銘柄を対象に', 'p'],
-    ['各パターンが「発生から3営業日後にどれだけ騰落したか」を集計します。', 'p'],
+    ['各パターンが「発生後にどれだけ騰落したか」を集計します（酒田五法は日足が最適）。', 'p'],
+    ['評価は時間軸別 … 短期系は3営業日後、中期系(三山/三川/三法)は20営業日後の騰落率で判定。', 'p'],
     ['結果は「パターン成績」シートに出力（件数/勝率%/平均騰落率%/推奨重み）。', 'p'],
     ['この成績を使い、シグナルの並び順・強さを実績ベースに自動補正します（毎月1日に自動再学習）。', 'p'],
     ['', 'p'],
@@ -795,14 +803,14 @@ function writeStatsSheet_(map) {
   if (!sh) sh = ss.insertSheet(SK.SHEETS.STATS);
   const old = sh.getFilter(); if (old) old.remove();
   sh.clear();
-  const header = ['パターン', '方向', '件数', '勝ち', '騰落率合計', '勝率%', '平均騰落率%', '推奨重み'];
+  const header = ['パターン', '方向', '件数', '勝ち', '騰落率合計', '勝率%', '平均騰落率%', '推奨重み', '先読み日'];
   const rows = Object.keys(map).map(name => {
     const s = map[name], nn = s.n || 0;
     const win = nn ? s.wins / nn * 100 : 0;
     const exp = nn ? s.retSum / nn * 100 : 0;
     const suggest = nn < BT_MIN_SAMPLE ? (SIGNAL_WEIGHT_[name] || 1) : (win >= 60 ? 3 : win >= 50 ? 2 : 1);
     return [name, s.dir || SIGNAL_DIR_[name] || '', nn, s.wins || 0,
-            Math.round((s.retSum || 0) * 10000) / 10000, Math.round(win * 10) / 10, Math.round(exp * 100) / 100, suggest];
+            Math.round((s.retSum || 0) * 10000) / 10000, Math.round(win * 10) / 10, Math.round(exp * 100) / 100, suggest, signalHorizon_(name)];
   });
   rows.sort((a, b) => b[6] - a[6]);
   sh.getRange(1, 1, 1, header.length).setValues([header]);
@@ -847,17 +855,19 @@ function backtestWeights() {
     try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { queue.unshift.apply(queue, slice); break; }
     resps.forEach(res => {
       const bars = parseYahooBars_(res);
+      const last = bars.length - 1;
       if (bars.length < BT_MIN_HISTORY + BT_FORWARD + 1) return;
-      for (let i = BT_MIN_HISTORY; i <= bars.length - 1 - BT_FORWARD; i++) {
+      for (let i = BT_MIN_HISTORY; i <= last - BT_FORWARD; i++) {
         const signals = detectSakata_(bars.slice(0, i + 1));
         if (!signals.length) continue;
         const base = bars[i].c;
         if (!base) continue;
-        const ret = (bars[i + BT_FORWARD].c - base) / base;   // 発生から3営業日後の騰落率
         signals.forEach(s => {
           const sign = s.dir === '買い' ? 1 : s.dir === '売り' ? -1 : 0;
           if (!sign) return;
-          const dr = ret * sign;                              // 方向調整リターン
+          const h = signalHorizon_(s.name);                   // パターン別ホライズン(短期3日/中期20日)
+          if (i + h > last) return;                            // 先読み分の足が足りなければ集計しない
+          const dr = (bars[i + h].c - base) / base * sign;     // 発生からh営業日後の騰落率(方向調整)
           const a = acc[s.name] || (acc[s.name] = [0, 0, 0]);
           a[0] += 1; a[1] += dr > 0 ? 1 : 0; a[2] += dr;
         });

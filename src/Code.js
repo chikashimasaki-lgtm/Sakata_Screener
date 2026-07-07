@@ -29,7 +29,7 @@ function onOpen() {
     .addSeparator()
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行',            'scanSignals')
-    .addItem('自動走査を設定（1時間ごと）',   'installDailyScanTrigger')
+    .addItem('自動実行を設定（走査:平日16時/保有確認:毎時）', 'installDailyScanTrigger')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
     .addItem('走査の進捗リセット',           'resetScanQueue')
@@ -179,19 +179,31 @@ function clearResumeTriggers_() {
 // ---- 定期実行（平日16時・土日祝／年末年始はスキップ） ----
 function installDailyScanTrigger() {
   ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'scheduledScan')
+    .filter(t => ['scheduledScan', 'scheduledHeldCheck'].includes(t.getHandlerFunction()))
     .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('scheduledScan').timeBased().everyHours(1).create();
-  SpreadsheetApp.getActive().toast('1時間ごとの自動走査を設定しました（立会時間 営業日9:00-17:00のみ実行）', '酒田五法', 6);
-  Logger.log('scheduledScan トリガーを設定（1時間ごと・立会時間内のみ実行）');
+  ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(16).create();  // 全銘柄 株価取得＋走査（1日1回）
+  ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();       // 購入ポートフォリオ確認（毎時）
+  SpreadsheetApp.getActive().toast('自動実行を設定しました（全銘柄走査:平日16時 / 保有確認:毎時・立会時間内）', '酒田五法', 6);
+  Logger.log('トリガー設定: scheduledScan(平日16時) / scheduledHeldCheck(毎時・立会時間内)');
 }
 
-// 1時間ごとに発火。東証の立会対象時間帯（営業日 9:00-17:00）だけ scanSignals を実行する。
-// isMarketOpen_() は共通モジュール MarketCalendar.js（src/にシンボリックリンク）で定義。
+// 平日16時に発火。全銘柄の株価取得＋シグナル走査（重い処理・1日1回）。
+// 立会対象（営業日 9:00-17:00）のみ実行。isMarketOpen_() は共通モジュール MarketCalendar.js で定義。
 function scheduledScan() {
   const now = new Date();
   if (!isMarketOpen_(now)) { Logger.log('立会時間外(土日祝・時間外)のため走査をスキップ: ' + now); return; }
   scanSignals();
+}
+
+// 毎時発火。購入ポートフォリオ(SBI保有銘柄)の確認 = 既存シグナルシートの保有ハイライトを最新の保有状況で更新する。
+// 株価取得は行わない（全銘柄走査は scheduledScan 側の役割）。立会対象（営業日 9:00-17:00）のみ実行。
+function scheduledHeldCheck() {
+  const now = new Date();
+  if (!isMarketOpen_(now)) { Logger.log('立会時間外のため保有確認をスキップ: ' + now); return; }
+  const sig = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.SIGNALS);
+  if (!sig || sig.getLastRow() < 2) { Logger.log('シグナル未生成のため保有確認をスキップ'); return; }
+  finalizeSignals_(sig);
+  Logger.log('購入ポートフォリオ確認: 保有ハイライトを更新');
 }
 
 function finalizeSignals_(sig) {

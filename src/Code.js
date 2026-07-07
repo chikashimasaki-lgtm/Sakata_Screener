@@ -113,8 +113,9 @@ function scanSignals() {
     // 新規走査: 銘柄リストからキューを作り、シグナルシートを初期化
     const rows = uni.getRange(2, 1, uni.getLastRow() - 1, 2).getValues().filter(r => r[0]);
     queue = rows.map(r => [String(r[0]).trim(), r[1] || '']);
+    const oldFilter = sig.getFilter(); if (oldFilter) oldFilter.remove();
     sig.clear();
-    sig.getRange(1, 1, 1, 7).setValues([['日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説']]);
+    sig.getRange(1, 1, 1, 9).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説']]);
   }
 
   const start = Date.now();
@@ -141,6 +142,7 @@ function scanSignals() {
       const dir  = dirs.size > 1 ? '混在' : [...dirs][0];
       const names = signals.map(s => s.name);
       buffer.push([
+        '', '',   // 保有・強さ は finalizeSignals_ で埋める
         Utilities.formatDate(new Date(last.t * 1000), 'JST', 'yyyy/MM/dd'),
         code, name, last.c, dir, names.map(s => '・' + s).join('\n'), signalExplain_(names),
       ]);
@@ -148,7 +150,7 @@ function scanSignals() {
     Utilities.sleep(200);
   }
 
-  if (buffer.length) sig.getRange(sig.getLastRow() + 1, 1, buffer.length, 7).setValues(buffer);
+  if (buffer.length) sig.getRange(sig.getLastRow() + 1, 1, buffer.length, 9).setValues(buffer);
 
   clearResumeTriggers_();
   if (queue.length > 0) {
@@ -207,44 +209,74 @@ function scheduledHeldCheck() {
   Logger.log('購入ポートフォリオ確認: 保有ハイライトを更新');
 }
 
+// 列構成: 1保有 2強さ 3日付 4コード 5銘柄名 6終値 7方向 8シグナル 9解説
 function finalizeSignals_(sig) {
   if (sig.getLastRow() < 2) return;
   const n = sig.getLastRow() - 1;
-  // 「傾向が強い順」に並べ替え：各シグナルの強さ重みの合計が大きい銘柄を上に。
-  const data = sig.getRange(2, 1, n, 7).getValues();
-  data.sort((a, b) => signalStrength_(b[5]) - signalStrength_(a[5]));  // 6列目=シグナル(箇条書き)
-  sig.getRange(2, 1, n, 7).setValues(data);
 
-  // B列（コード）を TradingView 日足チャート（保存レイアウト）へのハイパーリンクにする。
-  // 並べ替え後に設定するので、後続の再書き込みで消えない。index.html のリンクと同一挙動。
+  // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き の強さ重み合計）。
+  const data = sig.getRange(2, 1, n, 9).getValues();
+  data.sort((a, b) => signalStrength_(b[7]) - signalStrength_(a[7]));
+
+  // 強さ(2列目)を★で可視化、方向(7列目)を矢印付きバッジに整形。
+  data.forEach(row => {
+    const s = signalStrength_(row[7]);
+    row[1] = s >= 6 ? '★★★' : s >= 4 ? '★★' : '★';
+    const d = String(row[6] || '');
+    row[6] = d === '買い' ? '▲ 買い' : d === '売り' ? '▼ 売り' : d === '混在' ? '◆ 混在' : d;
+  });
+  sig.getRange(2, 1, n, 9).setValues(data);
+
+  // コード(4列目)を TradingView 日足チャートへのハイパーリンクに。
   const TV = 'vrWJ3cQi';
-  sig.getRange(2, 2, n, 1).setFormulas(data.map(row => {
-    const code = to4_(String(row[1] || '').trim()).toUpperCase();   // 5桁→4桁に正規化
+  sig.getRange(2, 4, n, 1).setFormulas(data.map(row => {
+    const code = to4_(String(row[3] || '').trim()).toUpperCase();
     return [code ? `=HYPERLINK("https://jp.tradingview.com/chart/${TV}/?symbol=TSE:${code}&interval=D","${code}")` : ''];
   }));
 
-  sig.getRange(2, 4, n, 1).setNumberFormat('#,##0');        // 終値カンマ（4列目）
-  sig.getRange(2, 2, n, 1).setHorizontalAlignment('right'); // コード右寄せ
-  styleSheet_(sig, 7, '#3a1530', '#f7ecf3');
-  autoFit_(sig, 5);                                         // 5列目まで内容にフィット
-  sig.setColumnWidth(6, 180);                               // シグナルは箇条書き（固定幅＋折返し）
-  sig.getRange(2, 6, n, 1).setWrap(true).setVerticalAlignment('top');
-  sig.setColumnWidth(7, 460);                               // シグナル解説は固定幅＋折返し
-  sig.getRange(2, 7, n, 1).setWrap(true).setVerticalAlignment('top');
-  // 方向（5列目）の色分け（買い=緑 / 売り=赤 / 混在=橙）
-  const dirs = sig.getRange(2, 5, n, 1).getValues();
-  const bg = dirs.map(([d]) => [d === '買い' ? '#e7f6ec' : d === '売り' ? '#fdeaea' : '#fff5e6']);
-  sig.getRange(2, 5, n, 1).setBackgrounds(bg);
+  // 全体スタイル: 濃紺ヘッダ＋淡色の行帯＋ヘッダ固定
+  styleSheet_(sig, 9, '#141a33', '#eef1fb');
+  autoFit_(sig, 7);                                          // 保有〜方向まで内容にフィット
+  sig.setColumnWidth(8, 210);                                // シグナル（箇条書き・折返し）
+  sig.getRange(2, 8, n, 1).setWrap(true).setVerticalAlignment('top');
+  sig.setColumnWidth(9, 460);                                // 解説（折返し）
+  sig.getRange(2, 9, n, 1).setWrap(true).setVerticalAlignment('top');
 
-  // SBI証券（日本株／日本株信用）で保有中の銘柄は、行ごと半透明赤でハイライト
+  sig.getRange(2, 6, n, 1).setNumberFormat('#,##0');         // 終値カンマ
+  sig.getRange(2, 4, n, 1).setHorizontalAlignment('right');  // コード右寄せ
+  sig.getRange(2, 1, n, 2).setHorizontalAlignment('center').setVerticalAlignment('middle'); // 保有・強さ
+  sig.getRange(2, 7, n, 1).setHorizontalAlignment('center').setVerticalAlignment('middle'); // 方向
+  sig.getRange(2, 2, n, 1).setFontColor('#e8a200').setFontWeight('bold');                    // 強さ=金
+
+  // 明示背景をいったんリセット（売却済み銘柄のハイライトを残さないため）
+  sig.getRange(2, 1, n, 9).setBackground(null);
+
+  // 保有銘柄: 保有列に○、行を淡い赤でハイライト
   try {
     const held = getSbiHeldCodes_();
+    const marks = [];
     for (let i = 0; i < n; i++) {
-      const code = to4_(String(data[i][1] || '').trim()).toUpperCase();   // 5桁→4桁に正規化
-      if (held.has(code)) sig.getRange(2 + i, 1, 1, 7).setBackground('#f2a9a9');
+      const code = to4_(String(data[i][3] || '').trim()).toUpperCase();
+      const isHeld = held.has(code);
+      marks.push([isHeld ? '○' : '']);
+      if (isHeld) sig.getRange(2 + i, 1, 1, 9).setBackground('#fbe3e3');
     }
+    sig.getRange(2, 1, n, 1).setValues(marks).setFontColor('#c0392b').setFontWeight('bold');
   } catch (e) { Logger.log('SBI保有ハイライト失敗: ' + e.message); }
 
+  // 方向の色分け（最後に適用し、方向セルは常に方向色を優先）買い=緑/売り=赤/混在=橙
+  const dirCells = sig.getRange(2, 7, n, 1).getValues();
+  const dbg = [], dfc = [];
+  dirCells.forEach(([d]) => {
+    const buy = String(d).indexOf('買い') >= 0, sell = String(d).indexOf('売り') >= 0;
+    dbg.push([buy ? '#e3f5ea' : sell ? '#fce4e4' : '#fff3da']);
+    dfc.push([buy ? '#1b7a3d' : sell ? '#c0392b' : '#b8860b']);
+  });
+  sig.getRange(2, 7, n, 1).setBackgrounds(dbg).setFontColors(dfc).setFontWeight('bold');
+
+  // フィルタを張り直し（保有=○ で絞り込み可能に）
+  const old = sig.getFilter(); if (old) old.remove();
+  sig.getRange(1, 1, n + 1, 9).createFilter();
   sig.setTabColor('#e0567a');
 }
 
@@ -648,7 +680,10 @@ function createUsageSheet() {
     ['2. 「銘柄」シートにコード(4桁)を入力。または「プライム銘柄を取得（J-Quants）」で自動取得', 'p'],
     ['   ※J-Quants取得を使う場合はスクリプトプロパティ JQUANTS_API_KEY が必要', 'p'],
     ['3. 「シグナル走査/続行」を実行（銘柄数が多いと時間分割で自動再開）', 'p'],
-    ['4. 「シグナル」シートに結果。SBI証券(日本株/信用)で保有中の銘柄は行を半透明赤でハイライト', 'p'],
+    ['4. 「シグナル」シートに結果（傾向が強い順に並ぶ）', 'p'],
+    ['   ・保有列 … SBI保有銘柄は○＋淡赤ハイライト。ヘッダのフィルタで「○」を選ぶと保有だけ表示', 'p'],
+    ['   ・強さ列 … 点灯フォーメーションの重み合計を★★★/★★/★で表示', 'p'],
+    ['   ・方向列 … ▲買い(緑)/▼売り(赤)/◆混在(橙)。コードはTradingViewチャートへのリンク', 'p'],
     ['', 'p'],
     ['■ 自動実行（トリガー）', 'h'],
     ['メニュー「自動実行を設定（走査:平日18時/保有確認:毎時）」で以下の2つを設定します。', 'p'],

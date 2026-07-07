@@ -24,7 +24,7 @@ const SK = {
 
 // 実績スコアリング設定（バックテスト学習・自動修正）
 // バックテスト対象期間 = 過去6ヶ月（SK.YAHOO_RANGE '6mo'）
-const BT_FORWARD     = 5;    // 先読み営業日数（発生から1週間後の騰落率で的中/リターンを評価）
+const BT_FORWARD     = 3;    // 先読み営業日数（発生から3営業日後の騰落率で的中/リターンを評価）
 const BT_MIN_HISTORY = 30;   // シグナル検出に必要な最低バー数（三山/三川が25本必要）
 const BT_MIN_SAMPLE  = 20;   // 実績を重みに採用する最低件数（未満は静的重みで代替）
 
@@ -715,7 +715,7 @@ function createUsageSheet() {
     ['', 'p'],
     ['■ 実績バックテスト（重みの自動学習・自動修正）', 'h'],
     ['メニュー「実績バックテスト（重みを自動学習）」で、過去6ヶ月の全銘柄を対象に', 'p'],
-    ['各パターンが「発生から1週間(5営業日)後にどれだけ騰落したか」を集計します。', 'p'],
+    ['各パターンが「発生から3営業日後にどれだけ騰落したか」を集計します。', 'p'],
     ['結果は「パターン成績」シートに出力（件数/勝率%/平均騰落率%/推奨重み）。', 'p'],
     ['この成績を使い、シグナルの並び順・強さを実績ベースに自動補正します（毎月1日に自動再学習）。', 'p'],
     ['', 'p'],
@@ -848,7 +848,7 @@ function backtestWeights() {
         if (!signals.length) continue;
         const base = bars[i].c;
         if (!base) continue;
-        const ret = (bars[i + BT_FORWARD].c - base) / base;   // 発生から1週間(5営業日)後の騰落率
+        const ret = (bars[i + BT_FORWARD].c - base) / base;   // 発生から3営業日後の騰落率
         signals.forEach(s => {
           const sign = s.dir === '買い' ? 1 : s.dir === '売り' ? -1 : 0;
           if (!sign) return;

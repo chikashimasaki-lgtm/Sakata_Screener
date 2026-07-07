@@ -16,11 +16,17 @@
 // ============================================================================
 
 const SK = {
-  SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方' },
+  SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方', STATS: 'パターン成績', HISTORY: 'シグナル履歴' },
   YAHOO_RANGE: '6mo',
   BATCH: 40,
   TIME_BUDGET_MS: 4.5 * 60 * 1000,
 };
+
+// 実績スコアリング設定（バックテスト学習・自動修正）
+// バックテスト対象期間 = 過去6ヶ月（SK.YAHOO_RANGE '6mo'）
+const BT_FORWARD     = 5;    // 先読み営業日数（発生から1週間後の騰落率で的中/リターンを評価）
+const BT_MIN_HISTORY = 30;   // シグナル検出に必要な最低バー数（三山/三川が25本必要）
+const BT_MIN_SAMPLE  = 20;   // 実績を重みに採用する最低件数（未満は静的重みで代替）
 
 // ---- メニュー ----
 function onOpen() {
@@ -29,7 +35,8 @@ function onOpen() {
     .addSeparator()
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行',            'scanSignals')
-    .addItem('自動実行を設定（走査:平日18時/保有確認:毎時）', 'installDailyScanTrigger')
+    .addItem('実績バックテスト（重みを自動学習）', 'backtestWeights')
+    .addItem('自動実行を設定（走査:平日18時/保有確認:毎時/実績学習:月次）', 'installDailyScanTrigger')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
     .addItem('走査の進捗リセット',           'resetScanQueue')
@@ -181,12 +188,13 @@ function clearResumeTriggers_() {
 // ---- 定期実行（平日18時・土日祝／年末年始はスキップ） ----
 function installDailyScanTrigger() {
   ScriptApp.getProjectTriggers()
-    .filter(t => ['scheduledScan', 'scheduledHeldCheck'].includes(t.getHandlerFunction()))
+    .filter(t => ['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest'].includes(t.getHandlerFunction()))
     .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();  // 全銘柄 株価取得＋走査（1日1回）
-  ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();       // 購入ポートフォリオ確認（毎時）
-  SpreadsheetApp.getActive().toast('自動実行を設定しました（全銘柄走査:平日18時 / 保有確認:毎時・立会時間内）', '酒田五法', 6);
-  Logger.log('トリガー設定: scheduledScan(平日18時) / scheduledHeldCheck(毎時・立会時間内)');
+  ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
+  ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();            // 購入ポートフォリオ確認（毎時）
+  ScriptApp.newTrigger('scheduledBacktest').timeBased().onMonthDay(1).atHour(20).create();  // 実績を月次で自動学習し直す（自動修正）
+  SpreadsheetApp.getActive().toast('自動実行を設定しました（走査:平日18時 / 保有確認:毎時 / 実績学習:毎月1日）', '酒田五法', 6);
+  Logger.log('トリガー設定: scheduledScan(平日18時) / scheduledHeldCheck(毎時) / scheduledBacktest(毎月1日)');
 }
 
 // 平日18時に発火。全銘柄の株価取得＋シグナル走査（重い処理・1日1回）。
@@ -214,13 +222,14 @@ function finalizeSignals_(sig) {
   if (sig.getLastRow() < 2) return;
   const n = sig.getLastRow() - 1;
 
-  // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き の強さ重み合計）。
+  // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き）。実績DB(過去6ヶ月バックテスト)があれば実績スコアで。
+  const statsMap = readStatsSheet_();
   const data = sig.getRange(2, 1, n, 9).getValues();
-  data.sort((a, b) => signalStrength_(b[7]) - signalStrength_(a[7]));
+  data.sort((a, b) => signalStrength_(b[7], statsMap) - signalStrength_(a[7], statsMap));
 
   // 強さ(2列目)を★で可視化、方向(7列目)を矢印付きバッジに整形。
   data.forEach(row => {
-    const s = signalStrength_(row[7]);
+    const s = signalStrength_(row[7], statsMap);
     row[1] = s >= 6 ? '★★★' : s >= 4 ? '★★' : '★';
     const d = String(row[6] || '');
     row[6] = d === '買い' ? '▲ 買い' : d === '売り' ? '▼ 売り' : d === '混在' ? '◆ 混在' : d;
@@ -375,14 +384,32 @@ const SIGNAL_WEIGHT_ = {
   'RSI過熱(80超)': 1, 'RSI底値(20割れ)': 1, 'RSIダイバージェンス(弱気)': 1, 'RSIダイバージェンス(強気)': 1,
 };
 
+// 各パターンの方向（実績集計・履歴記録に使用）
+const SIGNAL_DIR_ = {
+  '赤三兵': '買い', '三空叩き込み': '買い', '上げ三法': '買い', '三川(逆三尊)': '買い',
+  '明けの明星': '買い', '捨て子線(明け)': '買い', '切り込み線': '買い', '包み線(強気)': '買い',
+  'はらみ線(強気)': '買い', '毛抜き底': '買い', 'RSI底値(20割れ)': '買い', 'RSIダイバージェンス(強気)': '買い',
+  '三羽烏(黒三兵)': '売り', '三空踏み上げ': '売り', '下げ三法': '売り', '三山(三尊天井)': '売り',
+  '三山(三点天井)': '売り', '宵の明星': '売り', '捨て子線(宵)': '売り', 'かぶせ線': '売り',
+  '包み線(弱気)': '売り', 'はらみ線(弱気)': '売り', '毛抜き天井': '売り', '先詰まり赤三兵(警戒)': '売り',
+  '上放れ二羽烏': '売り', 'RSI過熱(80超)': '売り', 'RSIダイバージェンス(弱気)': '売り',
+};
+
 // 箇条書きのシグナル列テキストからシグナル名配列を取り出す
 function parseSignalNames_(cellText) {
   return String(cellText || '').split('\n').map(s => s.replace(/^・/, '').trim()).filter(Boolean);
 }
 
-// 傾向の強さ = 各シグナルの重みの合計
-function signalStrength_(cellText) {
-  return parseSignalNames_(cellText).reduce((sum, name) => sum + (SIGNAL_WEIGHT_[name] || 1), 0);
+// パターン1つの点数：実績が十分あれば期待リターン%（方向調整）、不足なら静的重みで代替
+function patternPoints_(name, statsMap) {
+  const s = statsMap && statsMap[name];
+  if (s && s.n >= BT_MIN_SAMPLE) return s.retSum / s.n * 100;
+  return SIGNAL_WEIGHT_[name] || 1;
+}
+
+// 傾向の強さ = 各シグナルの点数の合計（statsMap があれば実績ベース＝自動修正）
+function signalStrength_(cellText, statsMap) {
+  return parseSignalNames_(cellText).reduce((sum, name) => sum + patternPoints_(name, statsMap), 0);
 }
 
 function signalExplain_(names) {
@@ -684,6 +711,13 @@ function createUsageSheet() {
     ['   ・保有列 … SBI保有銘柄は○＋淡赤ハイライト。ヘッダのフィルタで「○」を選ぶと保有だけ表示', 'p'],
     ['   ・強さ列 … 点灯フォーメーションの重み合計を★★★/★★/★で表示', 'p'],
     ['   ・方向列 … ▲買い(緑)/▼売り(赤)/◆混在(橙)。コードはTradingViewチャートへのリンク', 'p'],
+    ['   ・強さ列は「実績」で自動補正 … 下記バックテストの成績があれば、静的重みより実績スコアを優先', 'p'],
+    ['', 'p'],
+    ['■ 実績バックテスト（重みの自動学習・自動修正）', 'h'],
+    ['メニュー「実績バックテスト（重みを自動学習）」で、過去6ヶ月の全銘柄を対象に', 'p'],
+    ['各パターンが「発生から1週間(5営業日)後にどれだけ騰落したか」を集計します。', 'p'],
+    ['結果は「パターン成績」シートに出力（件数/勝率%/平均騰落率%/推奨重み）。', 'p'],
+    ['この成績を使い、シグナルの並び順・強さを実績ベースに自動補正します（毎月1日に自動再学習）。', 'p'],
     ['', 'p'],
     ['■ 自動実行（トリガー）', 'h'],
     ['メニュー「自動実行を設定（走査:平日18時/保有確認:毎時）」で以下の2つを設定します。', 'p'],
@@ -729,4 +763,134 @@ function createUsageSheet() {
   sh.setTabColor('#f4b400');
   ss.setActiveSheet(sh);
   return sh;
+}
+
+// ============================================================================
+//  実績スコアリング：過去6ヶ月バックテスト → パターン成績DB（重みを自動学習・自動修正）
+// ============================================================================
+
+// パターン成績シートを map に読み込む: name -> {dir, n, wins, retSum}
+function readStatsSheet_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.STATS);
+  const map = {};
+  if (!sh || sh.getLastRow() < 2) return map;
+  // 列: パターン, 方向, 件数, 勝ち, リターン合計, 勝率%, 期待リターン%, 推奨重み
+  const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 5).getValues();
+  rows.forEach(r => {
+    const name = String(r[0] || '').trim();
+    if (name) map[name] = { dir: r[1] || '', n: Number(r[2]) || 0, wins: Number(r[3]) || 0, retSum: Number(r[4]) || 0 };
+  });
+  return map;
+}
+
+// map をパターン成績シートへ書き出す（勝率・期待リターン・推奨重みを再計算、期待リターン降順）
+function writeStatsSheet_(map) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(SK.SHEETS.STATS);
+  if (!sh) sh = ss.insertSheet(SK.SHEETS.STATS);
+  const old = sh.getFilter(); if (old) old.remove();
+  sh.clear();
+  const header = ['パターン', '方向', '件数', '勝ち', '騰落率合計', '勝率%', '平均騰落率%', '推奨重み'];
+  const rows = Object.keys(map).map(name => {
+    const s = map[name], nn = s.n || 0;
+    const win = nn ? s.wins / nn * 100 : 0;
+    const exp = nn ? s.retSum / nn * 100 : 0;
+    const suggest = nn < BT_MIN_SAMPLE ? (SIGNAL_WEIGHT_[name] || 1) : (win >= 60 ? 3 : win >= 50 ? 2 : 1);
+    return [name, s.dir || SIGNAL_DIR_[name] || '', nn, s.wins || 0,
+            Math.round((s.retSum || 0) * 10000) / 10000, Math.round(win * 10) / 10, Math.round(exp * 100) / 100, suggest];
+  });
+  rows.sort((a, b) => b[6] - a[6]);
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    sh.getRange(2, 6, rows.length, 1).setNumberFormat('0.0');
+    sh.getRange(2, 7, rows.length, 1).setNumberFormat('0.00');
+  }
+  styleSheet_(sh, header.length, '#141a33', '#eef1fb');
+  autoFit_(sh, header.length);
+  sh.setTabColor('#4a90d9');
+}
+
+// 過去6ヶ月バックテスト（時間分割・自動再開）。各パターンの N日後リターン実績を集計し成績DBを自動更新。
+function backtestWeights() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) { Logger.log('別の処理が進行中のためスキップ'); return; }
+
+  const ss  = SpreadsheetApp.getActive();
+  const uni = ss.getSheetByName(SK.SHEETS.UNIVERSE);
+  if (!uni || uni.getLastRow() < 2) throw new Error('「銘柄」シートにコードを入れてください');
+
+  const props = PropertiesService.getScriptProperties();
+  let queue = JSON.parse(props.getProperty('BT_QUEUE') || 'null');
+  let acc   = JSON.parse(props.getProperty('BT_ACC')   || 'null');
+  if (!queue) {
+    queue = uni.getRange(2, 1, uni.getLastRow() - 1, 1).getValues().map(r => String(r[0]).trim()).filter(Boolean);
+    acc = {};   // name -> [n, wins, retSum]
+    ss.toast('バックテスト開始（自動再開で完走します）', '酒田五法', 5);
+  }
+
+  const start = Date.now();
+  while (queue.length > 0) {
+    if (Date.now() - start > SK.TIME_BUDGET_MS) break;
+    const slice = queue.splice(0, SK.BATCH);
+    const reqs = slice.map(code => ({
+      url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(code) +
+           '.T?range=' + SK.YAHOO_RANGE + '&interval=1d',
+      headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true,
+    }));
+    let resps;
+    try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { queue.unshift.apply(queue, slice); break; }
+    resps.forEach(res => {
+      const bars = parseYahooBars_(res);
+      if (bars.length < BT_MIN_HISTORY + BT_FORWARD + 1) return;
+      for (let i = BT_MIN_HISTORY; i <= bars.length - 1 - BT_FORWARD; i++) {
+        const signals = detectSakata_(bars.slice(0, i + 1));
+        if (!signals.length) continue;
+        const base = bars[i].c;
+        if (!base) continue;
+        const ret = (bars[i + BT_FORWARD].c - base) / base;   // 発生から1週間(5営業日)後の騰落率
+        signals.forEach(s => {
+          const sign = s.dir === '買い' ? 1 : s.dir === '売り' ? -1 : 0;
+          if (!sign) return;
+          const dr = ret * sign;                              // 方向調整リターン
+          const a = acc[s.name] || (acc[s.name] = [0, 0, 0]);
+          a[0] += 1; a[1] += dr > 0 ? 1 : 0; a[2] += dr;
+        });
+      }
+    });
+    Utilities.sleep(150);
+  }
+
+  clearBtResume_();
+  if (queue.length > 0) {
+    props.setProperty('BT_QUEUE', JSON.stringify(queue));
+    props.setProperty('BT_ACC',   JSON.stringify(acc));
+    ScriptApp.newTrigger('backtestWeights').timeBased().after(90 * 1000).create();
+    Logger.log('バックテスト一時停止: 残り ' + queue.length + '銘柄。90秒後に自動再開。');
+    ss.toast('BT残り ' + queue.length + '銘柄。自動再開します', '酒田五法', 5);
+  } else {
+    const map = {};
+    Object.keys(acc).forEach(name => {
+      const a = acc[name];
+      map[name] = { dir: SIGNAL_DIR_[name] || '', n: a[0], wins: a[1], retSum: a[2] };
+    });
+    writeStatsSheet_(map);                                    // 成績DBを自動更新＝重みを自動修正
+    props.deleteProperty('BT_QUEUE'); props.deleteProperty('BT_ACC');
+    Logger.log('バックテスト完了: ' + Object.keys(map).length + 'パターン。成績DBを更新（自動修正）。');
+    ss.toast('バックテスト完了。パターン成績を更新しました', '酒田五法', 6);
+    // 最新の実績スコアをシグナルシートへ即反映
+    const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
+    if (sig && sig.getLastRow() >= 2) finalizeSignals_(sig);
+  }
+}
+
+function clearBtResume_() {
+  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'backtestWeights')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+// 平日18時台に月次で自動学習し直す（＝実績の自動修正）。営業日のみ。
+function scheduledBacktest() {
+  if (!isBusinessDay_(new Date())) { Logger.log('休場日のためバックテストをスキップ'); return; }
+  backtestWeights();
 }

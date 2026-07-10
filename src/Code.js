@@ -693,13 +693,7 @@ function styleSheet_(sheet, numCols, headerColor, altColor) {
 //  使い方シート
 // ============================================================================
 function createUsageSheet() {
-  const ss = SpreadsheetApp.getActive();
-  const old = ss.getSheetByName(SK.SHEETS.USAGE);
-  if (old) ss.deleteSheet(old);
-  const sh = ss.insertSheet(SK.SHEETS.USAGE, 0);
-  sh.setHiddenGridlines(true);
-  sh.setColumnWidth(1, 760);
-
+  // [テキスト, 種別]  種別: title / h(見出し) / p(本文) / note
   const rows = [
     ['酒田五法 シグナル・スクリーナー　使い方', 'title'],
     ['', 'p'],
@@ -756,18 +750,8 @@ function createUsageSheet() {
     ['■ 注意', 'h'],
     ['・シグナルは補助情報です。だましもあります。必ず自身で確認してください。', 'note'],
   ];
-  sh.getRange(1, 1, rows.length, 1).setValues(rows.map(r => [r[0]]));
-  rows.forEach((r, i) => {
-    const cell = sh.getRange(i + 1, 1);
-    if (r[1] === 'title') { cell.setFontSize(16).setFontWeight('bold').setFontColor('#ffffff').setBackground('#1a1e3a'); sh.setRowHeight(i + 1, 40); }
-    else if (r[1] === 'h') { cell.setFontSize(12).setFontWeight('bold').setFontColor('#1a3c6e').setBackground('#e7effb'); sh.setRowHeight(i + 1, 26); }
-    else if (r[1] === 'note') { cell.setFontColor('#666666').setWrap(true); }
-    else { cell.setWrap(true); }
-  });
-  sh.getRange(1, 1, rows.length, 1).setVerticalAlignment('middle');
-  sh.setTabColor('#f4b400');
-  ss.setActiveSheet(sh);
-  return sh;
+
+  return UsageSheet.buildDoc(SpreadsheetApp.getActive(), SK.SHEETS.USAGE, rows);
 }
 
 // ============================================================================

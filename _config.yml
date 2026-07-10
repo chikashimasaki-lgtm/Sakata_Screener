@@ -1,0 +1,12 @@
+# GitHub Pages (Jekyll) 用の設定。
+#
+# src/ には共通モジュール(UsageSheet.js など)への相対シンボリックリンクがあり、
+# 実体は ~/projects 直下でリポジトリに属さない。Jekyll は
+# symlink_outside_site_source? で実体を解決しようとして
+# "No such file or directory @ rb_check_realpath_internal" で失敗する。
+#
+# EntryFilter#filter は excluded? を symlink? より先に評価して短絡するため、
+# src を除外すればこのクラッシュを回避できる。GAS のソースは Pages で公開しない。
+exclude:
+  - src
+  - .clasp.json

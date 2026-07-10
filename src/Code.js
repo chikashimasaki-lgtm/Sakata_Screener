@@ -687,21 +687,7 @@ function styleSheet_(sheet, numCols, headerColor, altColor) {
   sheet.setRowHeight(1, 30);
 }
 
-function autoFit_(sheet, numCols) {
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 1 || numCols < 1) return;
-  const values = sheet.getRange(1, 1, lastRow, numCols).getDisplayValues();
-  for (let c = 0; c < numCols; c++) {
-    let maxUnits = 1;
-    for (let r = 0; r < values.length; r++) {
-      const s = String(values[r][c] == null ? '' : values[r][c]);
-      let units = 0;
-      for (const ch of s) units += (ch.charCodeAt(0) > 0xFF ? 2 : 1);
-      if (units > maxUnits) maxUnits = units;
-    }
-    sheet.setColumnWidth(c + 1, Math.min(Math.max(maxUnits * 8 + 16, 60), 520));
-  }
-}
+// autoFit_ は共通モジュール AutoFit.js（~/projects/AutoFit.js のsymlink）に定義
 
 // ============================================================================
 //  使い方シート

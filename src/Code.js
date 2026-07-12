@@ -673,19 +673,7 @@ function detectHeadShoulders_(bars, rsi) {
 // ============================================================================
 //  共通: 装飾・列幅
 // ============================================================================
-function styleSheet_(sheet, numCols, headerColor, altColor) {
-  if (!sheet || sheet.getLastRow() < 1 || numCols < 1) return;
-  const lastRow = sheet.getLastRow();
-  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).getBandings().forEach(b => b.remove());
-  const band = sheet.getRange(1, 1, lastRow, numCols)
-    .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
-  band.setHeaderRowColor(headerColor).setFirstRowColor('#ffffff').setSecondRowColor(altColor);
-  sheet.getRange(1, 1, 1, numCols)
-    .setFontColor('#ffffff').setFontWeight('bold')
-    .setHorizontalAlignment('center').setVerticalAlignment('middle');
-  sheet.setFrozenRows(1);
-  sheet.setRowHeight(1, 30);
-}
+// styleSheet_ は共通モジュール SheetStyle.js（~/projects/SheetStyle.js のsymlink）に定義
 
 // autoFit_ は共通モジュール AutoFit.js（~/projects/AutoFit.js のsymlink）に定義
 

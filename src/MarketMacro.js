@@ -428,7 +428,8 @@ function updateMarketMacro() {
     ' ・好決算sell=' + (earn ? (earn.alert ? 'YES' : 'NO') + '(' + earn.drops + '/' + earn.total + ')' : '手入力'));
   try {
     SpreadsheetApp.getActive().toast(
-      (tse ? '東証売残' + tse.sellOku + '億・倍率' + tse.ratio : '⚠ mtseisan未取込（ファイル/認可を確認）') +
+      (tse ? '東証売残' + tse.sellOku + '億' : '⚠ mtseisan未取込') +
+      '・倍率' + (r1570 ? r1570.ratio + '(1570)' : '手入力') +
       ' ・急落' + lit + '/7 ・地合い' + regime, '相場マクロ', 8);
   } catch (e) {}
 }

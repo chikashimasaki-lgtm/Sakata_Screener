@@ -147,6 +147,22 @@ function pickForeignFlow_(rows) {
   return { netOku: Math.round(Number(r.ForeignersBalanceValue) / 100000), week: r.EndDate, section: r.Section };  // 千円→億円
 }
 
+// 日経レバ(1570)の信用倍率を J-Quants /markets/weekly_margin_interest から取得。
+// 買残÷売残(株数)。1570は空売りが積むと倍率<1.0になり得る＝ショートカバー燃料の指標。
+// 市場全体の信用倍率は常に買残>>売残で約9倍固定のため、動画の「信用倍率<1.0」判定には1570を使う。
+function fetch1570MarginRatio_() {
+  var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
+  if (!key) return null;
+  var from = fmtDate_(new Date(Date.now() - 90 * 86400000));
+  var rows = jqGet_('markets/weekly_margin_interest', { code: '1570', from: from }, key);
+  if (!rows || !rows.length) return null;
+  rows.sort(function (a, b) { return (a.Date < b.Date) ? 1 : (a.Date > b.Date ? -1 : 0); });   // 最新週
+  var r = rows[0];
+  var lng = Number(r.LongMarginOutstanding), sht = Number(r.ShortMarginOutstanding);
+  if (!isFinite(lng) || !isFinite(sht) || sht <= 0) return null;
+  return { ratio: Math.round(lng / sht * 100) / 100, date: r.Date };
+}
+
 // 好決算sell-on-news の頻発を J-Quants で自動判定（条件7）。
 // 直近 WINDOW 営業日に黒字の実績決算を発表した銘柄のうち、決算後（翌営業日）に DROP_PCT 超
 // 下落した割合が FREQ 以上なら「頻発」= 点灯。単位・閾値は MACRO.EARN。
@@ -369,18 +385,22 @@ function readMacroInputSheet_() {
 
 // メニュー本体：手入力＋自動(NS/VIX)から7条件を判定し「急落サイン」へ出力、地合いをキャッシュ。
 function updateMarketMacro() {
-  const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls を自動取込
+  const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls（売残億円）を自動取込
+  const r1570 = fetch1570MarginRatio_();                       // 信用倍率は日経レバ1570（<1.0になり得る）
+  const marginRatio = r1570 ? r1570.ratio : (tse ? tse.ratio : null);   // 1570優先・無ければ東証全体にフォールバック
   const eps = fetchNikkeiEps_();                               // 日経EPS(加重平均)トレンドを自動取得
   const flow = fetchForeignFlow_();                            // 海外投資家 現物ネット（J-Quants）
   const earn = fetchEarningsSelloff_();                        // 好決算sell-on-news 頻発（J-Quants）
   var writes = [];
-  if (tse) { writes.push({ re: /売残.*億|売残高/, value: tse.sellOku }); writes.push({ re: /信用倍率/, value: tse.ratio }); }
+  if (tse) writes.push({ re: /売残.*億|売残高/, value: tse.sellOku });
+  if (marginRatio != null) writes.push({ re: /信用倍率/, value: marginRatio });
   if (eps) writes.push({ re: /EPS/, value: eps.trend });
   if (flow) writes.push({ re: /海外/, value: flow.netOku });
   if (earn) writes.push({ re: /決算|sell/i, value: earn.alert ? 'YES' : 'NO' });
   if (writes.length) writeMacroInputValues_(writes);
   const manual = readMacroInputSheet_();                       // 取込値を書き戻した後に読む
-  if (tse) { manual.sell_margin_oku = tse.sellOku; manual.margin_ratio = tse.ratio; }
+  if (tse) manual.sell_margin_oku = tse.sellOku;
+  if (marginRatio != null) manual.margin_ratio = marginRatio;
   if (eps) manual.nikkei_eps_trend = eps.trend;
   if (flow) manual.foreign_net_oku = flow.netOku;
   if (earn) manual.earnings_selloff = earn.alert ? 'YES' : 'NO';
@@ -401,7 +421,9 @@ function updateMarketMacro() {
   const regime = marginRegime_(data.sell_margin_oku, data.margin_ratio);
   PropertiesService.getScriptProperties().setProperty(MACRO.REGIME_PROP, regime);
   Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix +
-    ' ・東証売残=' + (tse ? tse.sellOku + '億/倍率' + tse.ratio : '未取込') +
+    ' ・東証売残=' + (tse ? tse.sellOku + '億' : '未取込') +
+    ' ・信用倍率=' + (marginRatio != null ? marginRatio + (r1570 ? '(1570)' : '(東証全体)') : '手入力') +
+    (tse ? ' [東証全体倍率' + tse.ratio + ']' : '') +
     ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力') +
     ' ・海外投資家=' + (flow ? flow.netOku + '億(' + flow.week + ')' : '手入力') +
     ' ・好決算sell=' + (earn ? (earn.alert ? 'YES' : 'NO') + '(' + earn.drops + '/' + earn.total + ')' : '手入力'));

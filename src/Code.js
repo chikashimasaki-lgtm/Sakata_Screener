@@ -375,6 +375,8 @@ const SIGNAL_DESC_ = {
   'RSI底値(20割れ)':          'RSIが20割れで売られ過ぎ。三空叩き込みの反発を補強（買い）。',
   'RSIダイバージェンス(弱気)': '高値圏でRSIが切り下がり上昇の勢いが減衰。天井を補強（売り）。',
   'RSIダイバージェンス(強気)': '安値圏でRSIが切り上がり下落の勢いが減衰。大底を補強（買い）。',
+  'MACDゴールデンクロス': 'MACDがシグナル線を下から上抜け。上昇転換のサイン（買い）。',
+  'MACDデッドクロス':     'MACDがシグナル線を上から下抜け。下落転換のサイン（売り）。',
 };
 // シグナルの強さ重み（「傾向が強い順」の並べ替えに使用）。大きいほど強いフォーメーション。
 const SIGNAL_WEIGHT_ = {
@@ -385,6 +387,7 @@ const SIGNAL_WEIGHT_ = {
   '包み線(強気)': 2, '包み線(弱気)': 2, 'かぶせ線': 2, '切り込み線': 2,
   'はらみ線(強気)': 1, 'はらみ線(弱気)': 1, '毛抜き天井': 1, '毛抜き底': 1, '先詰まり赤三兵(警戒)': 1,
   'RSI過熱(80超)': 1, 'RSI底値(20割れ)': 1, 'RSIダイバージェンス(弱気)': 1, 'RSIダイバージェンス(強気)': 1,
+  'MACDゴールデンクロス': 2, 'MACDデッドクロス': 2,
 };
 
 // 各パターンの方向（実績集計・履歴記録に使用）
@@ -396,6 +399,7 @@ const SIGNAL_DIR_ = {
   '三山(三点天井)': '売り', '宵の明星': '売り', '捨て子線(宵)': '売り', 'かぶせ線': '売り',
   '包み線(弱気)': '売り', 'はらみ線(弱気)': '売り', '毛抜き天井': '売り', '先詰まり赤三兵(警戒)': '売り',
   '上放れ二羽烏': '売り', 'RSI過熱(80超)': '売り', 'RSIダイバージェンス(弱気)': '売り',
+  'MACDゴールデンクロス': '買い', 'MACDデッドクロス': '売り',
 };
 
 // パターン別の評価ホライズン（先読み営業日数）。
@@ -449,6 +453,26 @@ function rsiSeries_(closes, p) {
     }
   }
   return out;
+}
+
+// MACD(12,26,9) 系列。close値のみ。EMA は逐次計算（pandas ewm(adjust=False) 相当：
+// 先頭値をシードにする）。戻り値 { macd:[], signal:[] }（長さ = closes.length）。
+function macdSeries_(closes, fast, slow, signalP) {
+  fast = fast || 12; slow = slow || 26; signalP = signalP || 9;
+  const ema = (arr, p) => {
+    const k = 2 / (p + 1);
+    const out = new Array(arr.length);
+    let prev = null;
+    for (let i = 0; i < arr.length; i++) {
+      prev = (prev == null) ? arr[i] : arr[i] * k + prev * (1 - k);
+      out[i] = prev;
+    }
+    return out;
+  };
+  const ef = ema(closes, fast), es = ema(closes, slow);
+  const macd   = closes.map((_, i) => ef[i] - es[i]);
+  const signal = ema(macd, signalP);
+  return { macd, signal };
 }
 
 // ============================================================================
@@ -510,6 +534,14 @@ function detectSakata_(bars) {
 
   // 三川系の2本足 反転パターン: かぶせ線 / 切り込み線 / 包み線 / はらみ線 / 毛抜き天井・底
   detectReversalPairs_(bars).forEach(s => sig.push(s));
+
+  // MACD(12,26,9) ゴールデン/デッドクロス（直近バーでのクロス）
+  const mac = macdSeries_(bars.map(b => b.c), 12, 26, 9);
+  const mN = mac.macd[n - 1], sN = mac.signal[n - 1], mP = mac.macd[n - 2], sP = mac.signal[n - 2];
+  if (mN != null && sN != null && mP != null && sP != null) {
+    if (mP <= sP && mN > sN) sig.push({ name: 'MACDゴールデンクロス', dir: '買い' });
+    if (mP >= sP && mN < sN) sig.push({ name: 'MACDデッドクロス', dir: '売り' });
+  }
 
   return sig;
 }

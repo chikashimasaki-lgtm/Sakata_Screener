@@ -113,24 +113,35 @@ function importTseMarginFile_() {
   }
   if (!latest) { Logger.log('mtseisan*.xls が見つかりません（JPX信用残ファイルをDriveに置いてください）'); return null; }
 
-  var converted = null;
+  var newId = null;
   try {
-    // .xls → Google スプレッドシートへ変換（Drive Advanced Service v2。要 Drive API 有効化）
-    converted = Drive.Files.insert(
-      { title: '__tmp_tse_margin', mimeType: MimeType.GOOGLE_SHEETS },
-      latest.getBlob(), { convert: true });
-    var sh = SpreadsheetApp.openById(converted.id).getSheets()[0];
+    newId = convertXlsToSheet_(latest.getId());   // .xls → Google スプレッドシート（Drive REST v3）
+    var sh = SpreadsheetApp.openById(newId).getSheets()[0];
     var r = parseTseMarginGrid_(sh.getDataRange().getValues());
     if (r) Logger.log('東証信用残 取込: ' + latest.getName() +
       ' 売残=' + r.sellOku + '億 倍率=' + r.ratio + '（売残株' + r.sellShares + '/買残株' + r.buyShares + '）');
     else Logger.log('東証信用残 パース失敗: ' + latest.getName());
     return r;
   } catch (e) {
-    Logger.log('東証信用残 取込エラー: ' + e.message + '（Drive API の有効化が必要な場合あり）');
+    Logger.log('東証信用残 取込エラー: ' + e.message);
     return null;
   } finally {
-    if (converted && converted.id) { try { DriveApp.getFileById(converted.id).setTrashed(true); } catch (e2) {} }
+    if (newId) { try { DriveApp.getFileById(newId).setTrashed(true); } catch (e2) {} }
   }
+}
+
+// Drive上の .xls を Google スプレッドシートに変換したコピーを作り fileId を返す。
+// Drive REST v3 の files.copy（mimeType 指定で変換）を UrlFetchApp で直接呼ぶ（詳細サービス不要）。
+function convertXlsToSheet_(fileId) {
+  var res = UrlFetchApp.fetch(
+    'https://www.googleapis.com/drive/v3/files/' + fileId + '/copy?fields=id&supportsAllDrives=true', {
+      method: 'post', contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      payload: JSON.stringify({ name: '__tmp_tse_margin', mimeType: 'application/vnd.google-apps.spreadsheet' }),
+      muteHttpExceptions: true });
+  if (res.getResponseCode() >= 300)
+    throw new Error('Drive変換失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200));
+  return JSON.parse(res.getContentText()).id;
 }
 
 // 変換済みグリッド(2次元配列)から東証の 売残(億円)・信用倍率(株数ベース) を読む。

@@ -1,9 +1,9 @@
 // ============================================================================
 //  相場マクロ監視（Sho「日本株急落の7条件」）＋ 銘柄別スクリーナーへの地合い供給
 //  ---------------------------------------------------------------------------
-//  ・NS倍率(日経/ S&P500) と VIX MACD は Yahoo から自動取得。
-//    信用売残/倍率・日経EPS・海外投資家・好決算sell-on-news は「相場マクロ」シートの
-//    手入力（JPX/日経公表値。スクレイピングは後付け。取得不可時は手入力へフォールバック）。
+//  ・自動取得: NS倍率(Yahoo ^N225/^GSPC)・VIX MACD(Yahoo ^VIX)・東証信用売残/倍率
+//    (Driveのmtseisan*.xls)・日経EPS(stock-marketdata.com)。取得失敗時は手入力へフォールバック。
+//  ・手入力のみ: 海外投資家 現物ネット・好決算sell-on-news（無料の機械可読源が無いため）。
 //  ・7条件の点灯を「急落サイン」シートに N/7 で出力。
 //  ・条件1・2（売残・信用倍率）から地合い(SHORT_COVER/NEUTRAL/SUPPLY_RISK)を算出し、
 //    Code.js の finalizeSignals_ がシグナルの強さ(★)スコアに反映する。
@@ -88,6 +88,39 @@ function checkMarketConditions_(data) {
 }
 
 // ── I/O（GAS） ──────────────────────────────────────────────────────────────
+
+// 日経平均の予想EPS(加重平均)トレンドを stock-marketdata.com から取得。
+// 日経公式/証券系はボット遮断が多いが当サイトはHTML表で公開。数値・日付はASCIIなので
+// エンコーディングに依らず抽出可能。取得/解析に失敗したら null（→手入力にフォールバック）。
+function fetchNikkeiEps_() {
+  try {
+    var res = UrlFetchApp.fetch('https://stock-marketdata.com/kabukashihyo.html',
+      { headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) { Logger.log('日経EPS取得失敗 HTTP ' + res.getResponseCode()); return null; }
+    return parseNikkeiEpsHtml_(res.getContentText());
+  } catch (e) { Logger.log('日経EPS取得エラー: ' + e.message); return null; }
+}
+
+// HTMLから日付ごとのEPS(加重平均)を拾い、直近トレンド(UP/FLAT/DOWN)を判定。
+// 各日付トークン(yyyy-mm-dd)直後のセルから、最初に現れる 2000〜5500 の数値をEPSとみなす
+// （PER≈18/PBR≈1/配当≈2 は範囲外、日経終値>6000も範囲外で除外）。
+function parseNikkeiEpsHtml_(html) {
+  var re = /(\d{4}-\d{2}-\d{2})([\s\S]{0,400}?)(?=\d{4}-\d{2}-\d{2}|$)/g, m, seen = {}, out = [];
+  while ((m = re.exec(html)) !== null) {
+    if (seen[m[1]]) continue;
+    var seg = m[2].replace(/<[^>]+>/g, ' ');
+    var nums = seg.match(/\d[\d,]*\.\d+/g) || [];
+    for (var i = 0; i < nums.length; i++) {
+      var v = parseFloat(nums[i].replace(/,/g, ''));
+      if (v >= 2000 && v <= 5500) { out.push({ date: m[1], eps: v }); seen[m[1]] = 1; break; }
+    }
+  }
+  if (out.length < 6) return null;
+  out.sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : 0; });  // 新しい順
+  var latest = out[0].eps, prior = out[5].eps;   // 約1週間前(5営業日前)と比較
+  var trend = latest < prior * 0.997 ? 'DOWN' : latest > prior * 1.003 ? 'UP' : 'FLAT';
+  return { eps: latest, date: out[0].date, trend: trend };
+}
 
 // Yahoo チャートAPIから指数の終値配列を取得（^N225 / ^GSPC / ^VIX 等）。parseYahooBars_(Code.js) 流用。
 function fetchIndexCloses_(symbol) {
@@ -176,14 +209,15 @@ function parseTseMarginGrid_(grid) {
 }
 
 // 「相場マクロ」入力シートの指定ラベル行(B列)に値を書き戻す（取込値の可視化・永続化）。
-function writeMacroInputValues_(sellOku, ratio) {
+function writeMacroInputValues_(pairs) {   // pairs: [{ re, value }]
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(MACRO.INPUT_SHEET); if (!sh) sh = setupMacroSheets_().input;
   var vals = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2).getValues();
   for (var i = 0; i < vals.length; i++) {
     var k = String(vals[i][0] || '');
-    if (/売残.*億|売残高/.test(k) && sellOku != null) sh.getRange(i + 1, 2).setValue(sellOku);
-    else if (/信用倍率/.test(k) && ratio != null) sh.getRange(i + 1, 2).setValue(ratio);
+    for (var j = 0; j < pairs.length; j++) {
+      if (pairs[j].value != null && pairs[j].re.test(k)) { sh.getRange(i + 1, 2).setValue(pairs[j].value); break; }
+    }
   }
 }
 
@@ -207,9 +241,14 @@ function readMacroInputSheet_() {
 // メニュー本体：手入力＋自動(NS/VIX)から7条件を判定し「急落サイン」へ出力、地合いをキャッシュ。
 function updateMarketMacro() {
   const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls を自動取込
-  if (tse) writeMacroInputValues_(tse.sellOku, tse.ratio);
+  const eps = fetchNikkeiEps_();                               // 日経EPS(加重平均)トレンドを自動取得
+  var writes = [];
+  if (tse) { writes.push({ re: /売残.*億|売残高/, value: tse.sellOku }); writes.push({ re: /信用倍率/, value: tse.ratio }); }
+  if (eps) writes.push({ re: /EPS/, value: eps.trend });
+  if (writes.length) writeMacroInputValues_(writes);
   const manual = readMacroInputSheet_();                       // 取込値を書き戻した後に読む
   if (tse) { manual.sell_margin_oku = tse.sellOku; manual.margin_ratio = tse.ratio; }
+  if (eps) manual.nikkei_eps_trend = eps.trend;
 
   let ns = 'FLAT', vix = 'NONE';
   try {
@@ -227,7 +266,8 @@ function updateMarketMacro() {
   const regime = marginRegime_(data.sell_margin_oku, data.margin_ratio);
   PropertiesService.getScriptProperties().setProperty(MACRO.REGIME_PROP, regime);
   Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix +
-    ' ・東証売残=' + (tse ? tse.sellOku + '億/倍率' + tse.ratio : '未取込'));
+    ' ・東証売残=' + (tse ? tse.sellOku + '億/倍率' + tse.ratio : '未取込') +
+    ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力'));
   try {
     SpreadsheetApp.getActive().toast(
       (tse ? '東証売残' + tse.sellOku + '億・倍率' + tse.ratio : '⚠ mtseisan未取込（ファイル/認可を確認）') +
@@ -272,7 +312,7 @@ function setupMacroSheets_() {
       ['項目', '値（東証売残・信用倍率はDLした mtseisan*.xls から自動。NS倍率/VIXも自動。他は手入力）'],
       ['東証 売残（億円）', 8000],
       ['東証 信用倍率（買残÷売残・株数）', 1.0],
-      ['日経平均EPSトレンド（UP/FLAT/DOWN）', 'FLAT'],
+      ["日経平均EPSトレンド（自動取得:stock-marketdata・手入力も可）", "FLAT"],
       ['海外投資家 現物ネット（億円・売越は負）', 0],
       ['好決算sell-on-news 頻発（YES/NO）', 'NO'],
     ];

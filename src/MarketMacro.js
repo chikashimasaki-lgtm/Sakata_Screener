@@ -2,8 +2,9 @@
 //  相場マクロ監視（Sho「日本株急落の7条件」）＋ 銘柄別スクリーナーへの地合い供給
 //  ---------------------------------------------------------------------------
 //  ・自動取得: NS倍率(Yahoo ^N225/^GSPC)・VIX MACD(Yahoo ^VIX)・東証信用売残/倍率
-//    (Driveのmtseisan*.xls)・日経EPS(stock-marketdata.com)。取得失敗時は手入力へフォールバック。
-//  ・手入力のみ: 海外投資家 現物ネット・好決算sell-on-news（無料の機械可読源が無いため）。
+//    (Driveのmtseisan*.xls)・日経EPS(stock-marketdata.com)・海外投資家 現物ネット
+//    (J-Quants /markets/trades_spec)。取得失敗時は手入力へフォールバック。
+//  ・手入力のみ: 好決算sell-on-news（客観的な自動判定が困難なため）。
 //  ・7条件の点灯を「急落サイン」シートに N/7 で出力。
 //  ・条件1・2（売残・信用倍率）から地合い(SHORT_COVER/NEUTRAL/SUPPLY_RISK)を算出し、
 //    Code.js の finalizeSignals_ がシグナルの強さ(★)スコアに反映する。
@@ -120,6 +121,46 @@ function parseNikkeiEpsHtml_(html) {
   var latest = out[0].eps, prior = out[5].eps;   // 約1週間前(5営業日前)と比較
   var trend = latest < prior * 0.997 ? 'DOWN' : latest > prior * 1.003 ? 'UP' : 'FLAT';
   return { eps: latest, date: out[0].date, trend: trend };
+}
+
+// 海外投資家の現物ネット（投資部門別売買状況）を J-Quants /markets/trades_spec から取得。
+// ForeignersBalanceValue（買-売, 単位=千円）を億円換算。売り越しなら負。取得不可は null。
+function fetchForeignFlow_() {
+  var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
+  if (!key) { Logger.log('海外投資家: JQUANTS_API_KEY 未設定（手入力にフォールバック）'); return null; }
+  var from = Utilities.formatDate(new Date(Date.now() - 90 * 86400000), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var rows = jqGet_('markets/trades_spec', { from: from }, key);
+  return pickForeignFlow_(rows);
+}
+
+// trades_spec 応答から、最新週の東証プライム（無ければ最新週の任意）海外投資家ネットを億円で返す。
+function pickForeignFlow_(rows) {
+  if (!rows || !rows.length) return null;
+  var prime = rows.filter(function (x) { return /Prime/i.test(x.Section || ''); });
+  var pool = (prime.length ? prime : rows).slice();
+  pool.sort(function (a, b) { return (a.EndDate < b.EndDate) ? 1 : (a.EndDate > b.EndDate ? -1 : 0); });  // 最新週
+  var r = pool[0];
+  if (!r || r.ForeignersBalanceValue == null) return null;
+  return { netOku: Math.round(Number(r.ForeignersBalanceValue) / 100000), week: r.EndDate, section: r.Section };  // 千円→億円
+}
+
+// J-Quants V2 の GET（x-api-key・ページング・配列抽出）。失敗時 null。
+function jqGet_(path, params, key) {
+  var base = 'https://api.jquants.com/v2/' + path;
+  var q = Object.keys(params || {}).filter(function (k) { return params[k] != null; })
+    .map(function (k) { return k + '=' + encodeURIComponent(params[k]); }).join('&');
+  var url = q ? base + '?' + q : base, out = [], pg = null;
+  do {
+    var u = pg ? url + (url.indexOf('?') >= 0 ? '&' : '?') + 'pagination_key=' + encodeURIComponent(pg) : url;
+    var res = UrlFetchApp.fetch(u, { headers: { 'x-api-key': key }, muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) { Logger.log('J-Quants ' + path + ' 失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200)); return null; }
+    var j = JSON.parse(res.getContentText());
+    var arr = j.trades_spec || j.data;
+    if (!arr) { for (var k in j) { if (Array.isArray(j[k])) { arr = j[k]; break; } } }   // 配列プロパティを拾う
+    out = out.concat(arr || []);
+    pg = j.pagination_key || null;
+  } while (pg);
+  return out;
 }
 
 // Yahoo チャートAPIから指数の終値配列を取得（^N225 / ^GSPC / ^VIX 等）。parseYahooBars_(Code.js) 流用。
@@ -242,13 +283,16 @@ function readMacroInputSheet_() {
 function updateMarketMacro() {
   const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls を自動取込
   const eps = fetchNikkeiEps_();                               // 日経EPS(加重平均)トレンドを自動取得
+  const flow = fetchForeignFlow_();                            // 海外投資家 現物ネット（J-Quants）
   var writes = [];
   if (tse) { writes.push({ re: /売残.*億|売残高/, value: tse.sellOku }); writes.push({ re: /信用倍率/, value: tse.ratio }); }
   if (eps) writes.push({ re: /EPS/, value: eps.trend });
+  if (flow) writes.push({ re: /海外/, value: flow.netOku });
   if (writes.length) writeMacroInputValues_(writes);
   const manual = readMacroInputSheet_();                       // 取込値を書き戻した後に読む
   if (tse) { manual.sell_margin_oku = tse.sellOku; manual.margin_ratio = tse.ratio; }
   if (eps) manual.nikkei_eps_trend = eps.trend;
+  if (flow) manual.foreign_net_oku = flow.netOku;
 
   let ns = 'FLAT', vix = 'NONE';
   try {
@@ -267,7 +311,8 @@ function updateMarketMacro() {
   PropertiesService.getScriptProperties().setProperty(MACRO.REGIME_PROP, regime);
   Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix +
     ' ・東証売残=' + (tse ? tse.sellOku + '億/倍率' + tse.ratio : '未取込') +
-    ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力'));
+    ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力') +
+    ' ・海外投資家=' + (flow ? flow.netOku + '億(' + flow.week + ')' : '手入力'));
   try {
     SpreadsheetApp.getActive().toast(
       (tse ? '東証売残' + tse.sellOku + '億・倍率' + tse.ratio : '⚠ mtseisan未取込（ファイル/認可を確認）') +

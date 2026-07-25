@@ -118,19 +118,19 @@ function importTseMarginFile_() {
     Logger.log('東証信用残 取込エラー: ' + e.message);
     return null;
   } finally {
-    if (newId) { try { DriveApp.getFileById(newId).setTrashed(true); } catch (e2) {} }
+    if (newId) { try { Drive.Files.remove(newId); } catch (e2) {} }
   }
 }
 
 // mtseisan*.xls の最新を Drive REST v3 で探す（マイドライブ＋共有ドライブ横断）。{id,name} を返す。
 function findLatestMtseisan_() {
-  var q = "name contains 'mtseisan' and mimeType != 'application/vnd.google-apps.spreadsheet' and trashed = false";
-  var url = 'https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(q) +
-    '&fields=files(id,name,modifiedTime)&pageSize=50&orderBy=name desc' +
-    '&includeItemsFromAllDrives=true&supportsAllDrives=true&corpora=allDrives';
-  var res = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
-  if (res.getResponseCode() >= 300) { Logger.log('Drive検索失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200)); return null; }
-  var files = (JSON.parse(res.getContentText()).files) || [];
+  // Drive 詳細サービス(v3)。マイドライブ＋共有ドライブ横断で mtseisan*.xls を検索。
+  var r = Drive.Files.list({
+    q: "name contains 'mtseisan' and mimeType != 'application/vnd.google-apps.spreadsheet' and trashed = false",
+    fields: 'files(id,name)', pageSize: 50, orderBy: 'name desc',
+    includeItemsFromAllDrives: true, supportsAllDrives: true, corpora: 'allDrives'
+  });
+  var files = (r && r.files) || [];
   if (!files.length) return null;
   files.sort(function (a, b) { return a.name < b.name ? 1 : a.name > b.name ? -1 : 0; });  // mtseisanYYYYMMDD 降順
   return files[0];
@@ -139,15 +139,11 @@ function findLatestMtseisan_() {
 // Drive上の .xls を Google スプレッドシートに変換したコピーを作り fileId を返す。
 // Drive REST v3 の files.copy（mimeType 指定で変換）を UrlFetchApp で直接呼ぶ（詳細サービス不要）。
 function convertXlsToSheet_(fileId) {
-  var res = UrlFetchApp.fetch(
-    'https://www.googleapis.com/drive/v3/files/' + fileId + '/copy?fields=id&supportsAllDrives=true', {
-      method: 'post', contentType: 'application/json',
-      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
-      payload: JSON.stringify({ name: '__tmp_tse_margin', mimeType: 'application/vnd.google-apps.spreadsheet' }),
-      muteHttpExceptions: true });
-  if (res.getResponseCode() >= 300)
-    throw new Error('Drive変換失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200));
-  return JSON.parse(res.getContentText()).id;
+  // Drive 詳細サービス(v3)。mimeType 指定コピーで .xls → Google スプレッドシートに変換。
+  var f = Drive.Files.copy(
+    { name: '__tmp_tse_margin', mimeType: 'application/vnd.google-apps.spreadsheet' },
+    fileId, { supportsAllDrives: true });
+  return f.id;
 }
 
 // 変換済みグリッド(2次元配列)から東証の 売残(億円)・信用倍率(株数ベース) を読む。

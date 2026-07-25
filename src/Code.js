@@ -180,9 +180,7 @@ function resetScanQueue() {
 }
 
 function clearResumeTriggers_() {
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'scanSignals')
-    .forEach(t => ScriptApp.deleteTrigger(t));
+  clearTriggersFor_('scanSignals');   // 共通モジュール TriggerUtils.js
 }
 
 // ---- 定期実行（平日18時・土日祝／年末年始はスキップ） ----
@@ -864,8 +862,7 @@ function backtestWeights() {
 }
 
 function clearBtResume_() {
-  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'backtestWeights')
-    .forEach(t => ScriptApp.deleteTrigger(t));
+  clearTriggersFor_('backtestWeights');   // 共通モジュール TriggerUtils.js
 }
 
 // 平日18時台に月次で自動学習し直す（＝実績の自動修正）。営業日のみ。

@@ -97,11 +97,80 @@ function fetchIndexCloses_(symbol) {
   return parseYahooBars_(res).map(b => b.c);
 }
 
-// JPX週次「信用取引現在高」等のスクレイピング（後付け）。
-// 取得できたら { sell_margin_oku, margin_ratio } を返す。未実装/失敗時は null（→手入力にフォールバック）。
-// TODO: 実URL/様式を現物確認して実装。Google IP からのブロック可能性あり（みんかぶ事例）。
-function fetchMarketMarginJPX_() {
+// JPX週次「信用取引現在高」(.xls) を取り込む。JPXはボット遮断(403)でGAS直取得不可のため、
+// ユーザーがブラウザでDLした mtseisan*.xls を Drive に置く運用。ここでは最新の同ファイルを探し、
+// Drive詳細サービス(v2)で Google スプレッドシートに変換して東証の売残/買残を読み取る。
+// 返り値 { sellOku, ratio, sellShares, buyShares } / 見つからなければ null（→手入力にフォールバック）。
+function importTseMarginFile_() {
+  var latest = null, latestKey = '';
+  var it = DriveApp.searchFiles(
+    'title contains "mtseisan" and mimeType != "application/vnd.google-apps.spreadsheet" and trashed = false');
+  while (it.hasNext()) {
+    var f = it.next();
+    var m = f.getName().match(/mtseisan(\d{8})/);
+    var key = m ? m[1] : Utilities.formatDate(f.getLastUpdated(), 'Asia/Tokyo', 'yyyyMMdd');
+    if (!latest || key > latestKey) { latest = f; latestKey = key; }
+  }
+  if (!latest) { Logger.log('mtseisan*.xls が見つかりません（JPX信用残ファイルをDriveに置いてください）'); return null; }
+
+  var converted = null;
+  try {
+    // .xls → Google スプレッドシートへ変換（Drive Advanced Service v2。要 Drive API 有効化）
+    converted = Drive.Files.insert(
+      { title: '__tmp_tse_margin', mimeType: MimeType.GOOGLE_SHEETS },
+      latest.getBlob(), { convert: true });
+    var sh = SpreadsheetApp.openById(converted.id).getSheets()[0];
+    var r = parseTseMarginGrid_(sh.getDataRange().getValues());
+    if (r) Logger.log('東証信用残 取込: ' + latest.getName() +
+      ' 売残=' + r.sellOku + '億 倍率=' + r.ratio + '（売残株' + r.sellShares + '/買残株' + r.buyShares + '）');
+    else Logger.log('東証信用残 パース失敗: ' + latest.getName());
+    return r;
+  } catch (e) {
+    Logger.log('東証信用残 取込エラー: ' + e.message + '（Drive API の有効化が必要な場合あり）');
+    return null;
+  } finally {
+    if (converted && converted.id) { try { DriveApp.getFileById(converted.id).setTrashed(true); } catch (e2) {} }
+  }
+}
+
+// 変換済みグリッド(2次元配列)から東証の 売残(億円)・信用倍率(株数ベース) を読む。
+// 「信用取引現在高」ブロックの『東京 Tokyo × 株数Shs.』行（最初の一致）をアンカーにし、
+// 合計 売残高=L列(index11)/買残高=N列(index13)、直下の『金額Val.』行から合計売残金額(百万円)を取る。
+function parseTseMarginGrid_(grid) {
+  var num = function (v) {
+    if (typeof v === 'number') return v;
+    var s = String(v == null ? '' : v).replace(/[,\s　]/g, '').replace(/▲/, '-');
+    var n = parseFloat(s); return isFinite(n) ? n : NaN;
+  };
+  var hit = function (v, re) { return re.test(String(v == null ? '' : v)); };
+  for (var i = 0; i + 1 < grid.length; i++) {
+    var row = grid[i];
+    if (hit(row[1], /東京|Tokyo/i) && hit(row[2], /株数|Shs/i)) {   // 現在高ブロックの東京・株数行（最初の一致）
+      var sellShares = num(row[11]);   // 合計 売残高(株数)
+      var buyShares  = num(row[13]);   // 合計 買残高(株数)
+      var valRow     = grid[i + 1];    // 直下の金額行
+      var sellMil    = (valRow && hit(valRow[2], /金額|Val/i)) ? num(valRow[11]) : NaN;  // 合計 売残高(百万円)
+      if (isFinite(sellShares) && isFinite(buyShares) && sellShares > 0) {
+        return {
+          sellShares: sellShares, buyShares: buyShares,
+          ratio:   Math.round(buyShares / sellShares * 100) / 100,      // 信用倍率(株数ベース)
+          sellOku: isFinite(sellMil) ? Math.round(sellMil / 100) : null, // 百万円→億円
+        };
+      }
+    }
+  }
   return null;
+}
+
+// 「相場マクロ」入力シートの指定ラベル行(B列)に値を書き戻す（取込値の可視化・永続化）。
+function writeMacroInputValues_(map) {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(MACRO.INPUT_SHEET); if (!sh) sh = setupMacroSheets_().input;
+  var rng = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2), vals = rng.getValues();
+  for (var i = 0; i < vals.length; i++) {
+    var k = String(vals[i][0] || '').trim();
+    if (map.hasOwnProperty(k) && map[k] != null) sh.getRange(i + 1, 2).setValue(map[k]);
+  }
 }
 
 // 「相場マクロ」シート（A列=項目 / B列=値）から手入力値を読む。無ければ作成。
@@ -113,8 +182,8 @@ function readMacroInputSheet_() {
   const map = {};
   rows.forEach(([k, v]) => { if (k) map[String(k).trim()] = v; });
   return {
-    sell_margin_oku:  map['二市場売残（億円）'],
-    margin_ratio:     map['市場信用倍率（買残÷売残）'],
+    sell_margin_oku:  map['東証 売残（億円）'],
+    margin_ratio:     map['東証 信用倍率（買残÷売残・株数）'],
     nikkei_eps_trend: String(map['日経平均EPSトレンド（UP/FLAT/DOWN）'] || 'FLAT').toUpperCase(),
     foreign_net_oku:  map['海外投資家 現物ネット（億円・売越は負）'],
     earnings_selloff: String(map['好決算sell-on-news 頻発（YES/NO）'] || 'NO').toUpperCase(),
@@ -123,9 +192,10 @@ function readMacroInputSheet_() {
 
 // メニュー本体：手入力＋自動(NS/VIX)から7条件を判定し「急落サイン」へ出力、地合いをキャッシュ。
 function updateMarketMacro() {
-  const manual = readMacroInputSheet_();
-  const jpx = fetchMarketMarginJPX_();                          // 後付けスクレイピング（今は null）
-  if (jpx) { manual.sell_margin_oku = jpx.sell_margin_oku; manual.margin_ratio = jpx.margin_ratio; }
+  const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls を自動取込
+  if (tse) writeMacroInputValues_({ '東証 売残（億円）': tse.sellOku, '東証 信用倍率（買残÷売残・株数）': tse.ratio });
+  const manual = readMacroInputSheet_();                       // 取込値を書き戻した後に読む
+  if (tse) { manual.sell_margin_oku = tse.sellOku; manual.margin_ratio = tse.ratio; }
 
   let ns = 'FLAT', vix = 'NONE';
   try {
@@ -180,9 +250,9 @@ function setupMacroSheets_() {
   if (!input) {
     input = ss.insertSheet(MACRO.INPUT_SHEET);
     const seed = [
-      ['項目', '値（手入力：JPX/日経公表値。NS倍率・VIXは自動。取得自動化は後付け）'],
-      ['二市場売残（億円）', 8000],
-      ['市場信用倍率（買残÷売残）', 1.0],
+      ['項目', '値（東証売残・信用倍率はDLした mtseisan*.xls から自動。NS倍率/VIXも自動。他は手入力）'],
+      ['東証 売残（億円）', 8000],
+      ['東証 信用倍率（買残÷売残・株数）', 1.0],
       ['日経平均EPSトレンド（UP/FLAT/DOWN）', 'FLAT'],
       ['海外投資家 現物ネット（億円・売越は負）', 0],
       ['好決算sell-on-news 頻発（YES/NO）', 'NO'],

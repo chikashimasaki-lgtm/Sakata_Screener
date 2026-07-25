@@ -164,6 +164,29 @@ function fetch1570MarginRatio_() {
   return { ratio: Math.round(lng / sht * 100) / 100, date: r.Date };
 }
 
+// 全銘柄の「制度信用倍率」(制度買残÷制度売残) を J-Quants weekly_margin_interest から取得。
+// 直近の週次データを1回で取り、code(4桁)→倍率 のマップを返す（銘柄別に個別APIは呼ばない）。
+// finalizeSignals_(Code.js) がシグナル一覧の各行に結合する。取得不可/キー無は {} を返す。
+function fetchStandardizedMarginMap_() {
+  var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
+  if (!key) { Logger.log('制度信用倍率: JQUANTS_API_KEY 未設定'); return {}; }
+  var from = fmtDate_(new Date(Date.now() - 21 * 86400000));
+  var rows = jqGet_('markets/weekly_margin_interest', { from: from }, key);
+  if (!rows || !rows.length) { Logger.log('制度信用倍率: データなし（プラン外/遅延の可能性）'); return {}; }
+  var latest = {};   // code -> { date, ratio }（最新週のみ採用）
+  rows.forEach(function (r) {
+    var code = to4_(String(r.Code || ''));
+    var lng = Number(r.LongStandardizedMarginOutstanding), sht = Number(r.ShortStandardizedMarginOutstanding);
+    if (!code || !isFinite(lng) || !isFinite(sht) || sht <= 0) return;
+    var d = String(r.Date || '');
+    if (!latest[code] || d > latest[code].date) latest[code] = { date: d, ratio: Math.round(lng / sht * 100) / 100 };
+  });
+  var map = {};
+  Object.keys(latest).forEach(function (c) { map[c] = latest[c].ratio; });
+  Logger.log('制度信用倍率: ' + Object.keys(map).length + '銘柄分を取得');
+  return map;
+}
+
 // 好決算sell-on-news の頻発を J-Quants で自動判定（条件7）。
 // 直近 WINDOW 営業日に黒字の実績決算を発表した銘柄のうち、決算後（翌営業日）に DROP_PCT 超
 // 下落した割合が FREQ 以上なら「頻発」= 点灯。単位・閾値は MACRO.EARN。

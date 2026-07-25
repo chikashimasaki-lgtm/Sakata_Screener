@@ -125,7 +125,7 @@ function scanSignals() {
     queue = rows.map(r => [String(r[0]).trim(), r[1] || '']);
     const oldFilter = sig.getFilter(); if (oldFilter) oldFilter.remove();
     sig.clear();
-    sig.getRange(1, 1, 1, 9).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説']]);
+    sig.getRange(1, 1, 1, 10).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '制度信用倍率']]);
   }
 
   const start = Date.now();
@@ -245,6 +245,15 @@ function finalizeSignals_(sig) {
   });
   sig.getRange(2, 1, n, 9).setValues(data);
 
+  // 制度信用倍率(制度買残÷制度売残)を J-Quants から結合（10列目）。取得不可の銘柄は空欄。
+  const marginMap = fetchStandardizedMarginMap_();
+  sig.getRange(2, 10, n, 1).setValues(data.map(row => {
+    const c = to4_(String(row[3] || '').trim());
+    return [marginMap[c] != null ? marginMap[c] : ''];
+  }));
+  sig.setColumnWidth(10, 96);
+  sig.getRange(2, 10, n, 1).setNumberFormat('0.00').setHorizontalAlignment('center').setVerticalAlignment('middle');
+
   // コード(4列目)を TradingView 日足チャートへのハイパーリンクに。
   const TV = 'vrWJ3cQi';
   sig.getRange(2, 4, n, 1).setFormulas(data.map(row => {
@@ -253,7 +262,7 @@ function finalizeSignals_(sig) {
   }));
 
   // 全体スタイル: 濃紺ヘッダ＋淡色の行帯＋ヘッダ固定
-  styleSheet_(sig, 9, '#141a33', '#eef1fb');
+  styleSheet_(sig, 10, '#141a33', '#eef1fb');
   autoFit_(sig, 7);                                          // 保有〜方向まで内容にフィット
   sig.setColumnWidth(8, 210);                                // シグナル（箇条書き・折返し）
   sig.getRange(2, 8, n, 1).setWrap(true).setVerticalAlignment('top');
@@ -267,7 +276,7 @@ function finalizeSignals_(sig) {
   sig.getRange(2, 2, n, 1).setFontColor('#e8a200').setFontWeight('bold');                    // 強さ=金
 
   // 明示背景をいったんリセット（売却済み銘柄のハイライトを残さないため）
-  sig.getRange(2, 1, n, 9).setBackground(null);
+  sig.getRange(2, 1, n, 10).setBackground(null);
 
   // 保有銘柄: 保有列に○、行を淡い赤でハイライト
   try {
@@ -277,7 +286,7 @@ function finalizeSignals_(sig) {
       const code = to4_(String(data[i][3] || '').trim()).toUpperCase();
       const isHeld = held.has(code);
       marks.push([isHeld ? '○' : '']);
-      if (isHeld) sig.getRange(2 + i, 1, 1, 9).setBackground('#fbe3e3');
+      if (isHeld) sig.getRange(2 + i, 1, 1, 10).setBackground('#fbe3e3');
     }
     sig.getRange(2, 1, n, 1).setValues(marks).setFontColor('#c0392b').setFontWeight('bold');
   } catch (e) { Logger.log('SBI保有ハイライト失敗: ' + e.message); }
@@ -294,7 +303,7 @@ function finalizeSignals_(sig) {
 
   // フィルタを張り直し（保有=○ で絞り込み可能に）
   const old = sig.getFilter(); if (old) old.remove();
-  sig.getRange(1, 1, n + 1, 9).createFilter();
+  sig.getRange(1, 1, n + 1, 10).createFilter();
   sig.setTabColor('#e0567a');
 }
 

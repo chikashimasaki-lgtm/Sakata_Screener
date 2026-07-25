@@ -99,10 +99,7 @@ function fetchPrimeUniverse() {
   SpreadsheetApp.getActive().toast('プライム ' + collect.length + '件を取得', '酒田五法', 5);
 }
 
-function to4_(code) {
-  const c = String(code == null ? '' : code);
-  return (c.length === 5 && c.slice(-1) === '0') ? c.slice(0, 4) : c;
-}
+// to4_() の本体は共通モジュール StockCode.js（gas-shared/modules/StockCode.js の symlink）
 
 // ============================================================================
 //  シグナル走査（時間分割・自動再開）

@@ -40,17 +40,17 @@ function regimeFactor_(regime, dir) {
   return 1;
 }
 
-// NS倍率(日経/ S&P500)のトレンド：直近 window 本の平均比率が、その前 window 本の平均比率を
-// 下回れば DOWN（日本株劣位＝米国株優位）、上回れば UP、ほぼ横ばいなら FLAT。
+// NS倍率(日経/ S&P500)のトレンド。日米は休場日が異なり配列長も違うため（例:60本 vs 61本）、
+// 比率を配列位置で対応付けると日付がズレて不正確になる。そこで各指数の「直近 window 営業日の
+// 自己リターン」を比較する（NS倍率低下 ⟺ 日経の伸びがS&Pに劣る）。
+// DOWN＝米国株優位/日本株劣位（急落サイン点灯）、UP＝日本株優位、FLAT＝拮抗。
 function nsRatioTrend_(n225, spx, window) {
-  const m = Math.min(n225.length, spx.length);
-  if (m < window * 2) return 'FLAT';
-  const ratio = [];
-  for (let i = m - window * 2; i < m; i++) ratio.push(n225[i] / spx[i]);
-  const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
-  const prev = avg(ratio.slice(0, window)), now = avg(ratio.slice(window));
-  if (now < prev * 0.995) return 'DOWN';
-  if (now > prev * 1.005) return 'UP';
+  if (!n225 || !spx || n225.length <= window || spx.length <= window) return 'FLAT';
+  var nRet = n225[n225.length - 1] / n225[n225.length - 1 - window];
+  var sRet = spx[spx.length - 1] / spx[spx.length - 1 - window];
+  if (!isFinite(nRet) || !isFinite(sRet) || sRet === 0) return 'FLAT';
+  if (nRet < sRet * 0.995) return 'DOWN';
+  if (nRet > sRet * 1.005) return 'UP';
   return 'FLAT';
 }
 

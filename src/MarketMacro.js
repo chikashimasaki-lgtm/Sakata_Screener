@@ -1,10 +1,10 @@
 // ============================================================================
 //  相場マクロ監視（Sho「日本株急落の7条件」）＋ 銘柄別スクリーナーへの地合い供給
 //  ---------------------------------------------------------------------------
-//  ・自動取得: NS倍率(Yahoo ^N225/^GSPC)・VIX MACD(Yahoo ^VIX)・東証信用売残/倍率
+//  ・自動取得(7条件すべて): NS倍率/VIX MACD(Yahoo ^N225/^GSPC/^VIX)・東証信用売残/倍率
 //    (Driveのmtseisan*.xls)・日経EPS(stock-marketdata.com)・海外投資家 現物ネット
-//    (J-Quants /markets/trades_spec)。取得失敗時は手入力へフォールバック。
-//  ・手入力のみ: 好決算sell-on-news（客観的な自動判定が困難なため）。
+//    (J-Quants /markets/trades_spec)・好決算sell-on-news(J-Quants fins/statements×prices)。
+//    各取得は失敗/サンプル不足/プラン遅延時に「相場マクロ」シートの手入力へフォールバック。
 //  ・7条件の点灯を「急落サイン」シートに N/7 で出力。
 //  ・条件1・2（売残・信用倍率）から地合い(SHORT_COVER/NEUTRAL/SUPPLY_RISK)を算出し、
 //    Code.js の finalizeSignals_ がシグナルの強さ(★)スコアに反映する。
@@ -17,6 +17,9 @@ const MACRO = {
   REGIME_PROP: 'SK_MARGIN_REGIME',
   NS_WINDOW:   20,      // NS倍率トレンド判定窓（営業日）
   YAHOO_RANGE: '6mo',
+  // 好決算sell-on-news(条件7): 直近WINDOW_DAYS営業日の黒字決算のうち翌日DROP_PCT超下落の
+  // 割合がFREQ以上で点灯。MIN_SAMPLE未満は判定しない（手入力にフォールバック）。
+  EARN: { WINDOW_DAYS: 14, DROP_PCT: 0.03, FREQ: 0.35, MIN_SAMPLE: 10 },
 };
 
 // ── 純ロジック（GAS非依存・ヘッドレステスト可能） ───────────────────────────
@@ -143,6 +146,91 @@ function pickForeignFlow_(rows) {
   if (!r || r.ForeignersBalanceValue == null) return null;
   return { netOku: Math.round(Number(r.ForeignersBalanceValue) / 100000), week: r.EndDate, section: r.Section };  // 千円→億円
 }
+
+// 好決算sell-on-news の頻発を J-Quants で自動判定（条件7）。
+// 直近 WINDOW 営業日に黒字の実績決算を発表した銘柄のうち、決算後（翌営業日）に DROP_PCT 超
+// 下落した割合が FREQ 以上なら「頻発」= 点灯。単位・閾値は MACRO.EARN。
+// 好決算プロキシ=黒字(Profit>0)、急落=翌営業日リターン<=-DROP_PCT。取得不可/サンプル不足は null。
+function fetchEarningsSelloff_() {
+  var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
+  if (!key) { Logger.log('好決算sell-on-news: JQUANTS_API_KEY 未設定'); return null; }
+  var C = MACRO.EARN;
+  var today = new Date();
+  var stmts = jqGet_('fins/statements',
+    { from: fmtDate_(new Date(today.getTime() - (C.WINDOW_DAYS + 10) * 86400000)), to: fmtDate_(today) }, key);
+  if (!stmts || !stmts.length) { Logger.log('好決算: 対象決算なし（プラン遅延の可能性）'); return null; }
+
+  var events = [];   // { code, date }（黒字の実績決算）
+  stmts.forEach(function (s) {
+    if (!/FinancialStatements/i.test(String(s.TypeOfDocument || ''))) return;   // 実績決算のみ（予想修正等は除外）
+    var profit = Number(s.Profit);
+    if (!isFinite(profit) || profit <= 0) return;                              // 黒字（好決算プロキシ）
+    var code = to4_(String(s.LocalCode || s.Code || ''));
+    var d = String(s.DisclosedDate || '').slice(0, 10);
+    if (code && /^\d{4}-\d{2}-\d{2}$/.test(d)) events.push({ code: code, date: d });
+  });
+  if (events.length < C.MIN_SAMPLE) { Logger.log('好決算: サンプル不足 ' + events.length + '件'); return null; }
+
+  // 必要期間の日次終値を date→{code:adjClose} で取得
+  var ds = events.map(function (e) { return e.date; }).sort();
+  var priceMap = fetchPricesByDateRange_(
+    fmtDate_(new Date(parseDate_(ds[0]).getTime() - 4 * 86400000)),
+    fmtDate_(new Date(parseDate_(ds[ds.length - 1]).getTime() + 5 * 86400000)), key);
+  var dates = Object.keys(priceMap).sort();
+  if (!dates.length) { Logger.log('好決算: 価格取得不可'); return null; }
+
+  var reactions = [];
+  events.forEach(function (ev) {
+    var prev = null, next = null;
+    for (var i = 0; i < dates.length; i++) {
+      if (dates[i] <= ev.date) prev = dates[i];
+      if (dates[i] > ev.date && next === null) next = dates[i];
+    }
+    if (!prev || !next) return;
+    var p = priceMap[prev][ev.code], n = priceMap[next][ev.code];
+    if (isFinite(p) && isFinite(n) && p > 0) reactions.push(n / p - 1);   // 決算後（翌営業日）リターン
+  });
+
+  var st = selloffFrequency_(reactions, C.DROP_PCT);
+  if (st.total < C.MIN_SAMPLE) { Logger.log('好決算: 価格照合後サンプル不足 ' + st.total); return null; }
+  var alert = st.frac >= C.FREQ;
+  Logger.log('好決算sell-on-news: ' + st.drops + '/' + st.total + '銘柄が翌日' + (C.DROP_PCT * 100) + '%超下落 (率' +
+    (st.frac * 100).toFixed(0) + '%, 閾値' + (C.FREQ * 100) + '%) → ' + (alert ? 'YES(頻発)' : 'NO'));
+  return { alert: alert, frac: st.frac, drops: st.drops, total: st.total };
+}
+
+// リターン配列から、-dropPct 以下の急落の件数・総数・割合を返す（純ロジック）。
+function selloffFrequency_(reactions, dropPct) {
+  var total = 0, drops = 0;
+  (reactions || []).forEach(function (r) { if (isFinite(r)) { total++; if (r <= -dropPct) drops++; } });
+  return { total: total, drops: drops, frac: total ? drops / total : 0 };
+}
+
+// 期間内の各営業日について /prices/daily_quotes を取得し date→{code:adjClose} を返す。
+function fetchPricesByDateRange_(fromStr, toStr, key) {
+  var map = {}, d = parseDate_(fromStr), end = parseDate_(toStr);
+  while (d <= end) {
+    var dow = d.getDay();
+    if (dow !== 0 && dow !== 6) {   // 土日は取得しない（呼び出し削減）
+      var ds = fmtDate_(d);
+      var rows = jqGet_('prices/daily_quotes', { date: ds }, key);
+      if (rows && rows.length) {
+        var m = {};
+        rows.forEach(function (r) {
+          var c = to4_(String(r.Code || ''));
+          var px = Number(r.AdjustmentClose != null ? r.AdjustmentClose : r.Close);
+          if (c && isFinite(px)) m[c] = px;
+        });
+        if (Object.keys(m).length) map[ds] = m;
+      }
+    }
+    d = new Date(d.getTime() + 86400000);
+  }
+  return map;
+}
+
+function fmtDate_(d) { return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd'); }
+function parseDate_(s) { var p = String(s).split('-'); return new Date(+p[0], +p[1] - 1, +p[2]); }
 
 // J-Quants V2 の GET（x-api-key・ページング・配列抽出）。失敗時 null。
 function jqGet_(path, params, key) {
@@ -284,15 +372,18 @@ function updateMarketMacro() {
   const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls を自動取込
   const eps = fetchNikkeiEps_();                               // 日経EPS(加重平均)トレンドを自動取得
   const flow = fetchForeignFlow_();                            // 海外投資家 現物ネット（J-Quants）
+  const earn = fetchEarningsSelloff_();                        // 好決算sell-on-news 頻発（J-Quants）
   var writes = [];
   if (tse) { writes.push({ re: /売残.*億|売残高/, value: tse.sellOku }); writes.push({ re: /信用倍率/, value: tse.ratio }); }
   if (eps) writes.push({ re: /EPS/, value: eps.trend });
   if (flow) writes.push({ re: /海外/, value: flow.netOku });
+  if (earn) writes.push({ re: /決算|sell/i, value: earn.alert ? 'YES' : 'NO' });
   if (writes.length) writeMacroInputValues_(writes);
   const manual = readMacroInputSheet_();                       // 取込値を書き戻した後に読む
   if (tse) { manual.sell_margin_oku = tse.sellOku; manual.margin_ratio = tse.ratio; }
   if (eps) manual.nikkei_eps_trend = eps.trend;
   if (flow) manual.foreign_net_oku = flow.netOku;
+  if (earn) manual.earnings_selloff = earn.alert ? 'YES' : 'NO';
 
   let ns = 'FLAT', vix = 'NONE';
   try {
@@ -312,7 +403,8 @@ function updateMarketMacro() {
   Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix +
     ' ・東証売残=' + (tse ? tse.sellOku + '億/倍率' + tse.ratio : '未取込') +
     ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力') +
-    ' ・海外投資家=' + (flow ? flow.netOku + '億(' + flow.week + ')' : '手入力'));
+    ' ・海外投資家=' + (flow ? flow.netOku + '億(' + flow.week + ')' : '手入力') +
+    ' ・好決算sell=' + (earn ? (earn.alert ? 'YES' : 'NO') + '(' + earn.drops + '/' + earn.total + ')' : '手入力'));
   try {
     SpreadsheetApp.getActive().toast(
       (tse ? '東証売残' + tse.sellOku + '億・倍率' + tse.ratio : '⚠ mtseisan未取込（ファイル/認可を確認）') +

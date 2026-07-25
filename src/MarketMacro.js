@@ -387,7 +387,7 @@ function readMacroInputSheet_() {
 function updateMarketMacro() {
   const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls（売残億円）を自動取込
   const r1570 = fetch1570MarginRatio_();                       // 信用倍率は日経レバ1570（<1.0になり得る）
-  const marginRatio = r1570 ? r1570.ratio : (tse ? tse.ratio : null);   // 1570優先・無ければ東証全体にフォールバック
+  const marginRatio = r1570 ? r1570.ratio : null;              // 1570のみ。取得不可時は手入力値を使う（東証全体9.21は使わない）
   const eps = fetchNikkeiEps_();                               // 日経EPS(加重平均)トレンドを自動取得
   const flow = fetchForeignFlow_();                            // 海外投資家 現物ネット（J-Quants）
   const earn = fetchEarningsSelloff_();                        // 好決算sell-on-news 頻発（J-Quants）
@@ -422,8 +422,7 @@ function updateMarketMacro() {
   PropertiesService.getScriptProperties().setProperty(MACRO.REGIME_PROP, regime);
   Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix +
     ' ・東証売残=' + (tse ? tse.sellOku + '億' : '未取込') +
-    ' ・信用倍率=' + (marginRatio != null ? marginRatio + (r1570 ? '(1570)' : '(東証全体)') : '手入力') +
-    (tse ? ' [東証全体倍率' + tse.ratio + ']' : '') +
+    ' ・信用倍率(1570)=' + (r1570 ? r1570.ratio + '(' + r1570.date + ')' : '取得不可→手入力') +
     ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力') +
     ' ・海外投資家=' + (flow ? flow.netOku + '億(' + flow.week + ')' : '手入力') +
     ' ・好決算sell=' + (earn ? (earn.alert ? 'YES' : 'NO') + '(' + earn.drops + '/' + earn.total + ')' : '手入力'));
@@ -470,7 +469,7 @@ function setupMacroSheets_() {
     const seed = [
       ['項目', '値（東証売残・信用倍率はDLした mtseisan*.xls から自動。NS倍率/VIXも自動。他は手入力）'],
       ['東証 売残（億円）', 8000],
-      ['信用倍率（日経レバ1570・買残÷売残。取得不可時は東証全体）', 1.0],
+      ['信用倍率（日経レバ1570・買残÷売残。取得不可時は手入力）', 1.0],
       ["日経平均EPSトレンド（自動取得:stock-marketdata・手入力も可）", "FLAT"],
       ['海外投資家 現物ネット（億円・売越は負）', 0],
       ['好決算sell-on-news 頻発（YES/NO）', 'NO'],

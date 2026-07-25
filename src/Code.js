@@ -20,6 +20,8 @@ const SK = {
   YAHOO_RANGE: '6mo',
   BATCH: 40,
   TIME_BUDGET_MS: 4.5 * 60 * 1000,
+  // 信用需給フィルター（動画の閾値）。地合いと係数の単一ソース。MarketMacro.js が参照。
+  MARGIN: { SELL_THRESHOLD_OKU: 8000, RATIO_PIVOT: 1.0, BUY_BOOST: 1.5, SELL_BOOST: 1.5 },
 };
 
 // 実績スコアリング設定（バックテスト学習・自動修正）
@@ -36,6 +38,7 @@ function onOpen() {
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行',            'scanSignals')
     .addItem('実績バックテスト（重みを自動学習）', 'backtestWeights')
+    .addItem('相場マクロ/急落サインを更新', 'updateMarketMacro')
     .addItem('自動実行を設定（走査:平日18時/保有確認:毎時/実績学習:月次）', 'installDailyScanTrigger')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
@@ -186,8 +189,9 @@ function clearResumeTriggers_() {
 // ---- 定期実行（平日18時・土日祝／年末年始はスキップ） ----
 function installDailyScanTrigger() {
   ScriptApp.getProjectTriggers()
-    .filter(t => ['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest'].includes(t.getHandlerFunction()))
+    .filter(t => ['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest', 'updateMarketMacro'].includes(t.getHandlerFunction()))
     .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('updateMarketMacro').timeBased().everyDays(1).atHour(17).create();    // 相場マクロ/急落サイン・地合い更新（走査の前）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
   ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();            // 購入ポートフォリオ確認（毎時）
   ScriptApp.newTrigger('scheduledBacktest').timeBased().onMonthDay(1).atHour(20).create();  // 実績を月次で自動学習し直す（自動修正）
@@ -222,8 +226,10 @@ function finalizeSignals_(sig) {
 
   // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き）。実績DB(過去6ヶ月バックテスト)があれば実績スコアで。
   const statsMap = readStatsSheet_();
+  const regime = getMarketRegime_();   // 信用需給の地合い（MarketMacro.js）。買い/売りスコアに反映。
   const data = sig.getRange(2, 1, n, 9).getValues();
-  const scoreOf = row => signalStrength_(row[7], statsMap);
+  // 強さ = 実績重み合計 × 地合い係数（row[6]=方向 買い/売り。地合いで順位が動く）
+  const scoreOf = row => signalStrength_(row[7], statsMap) * regimeFactor_(regime, row[6]);
   data.sort((a, b) => scoreOf(b) - scoreOf(a));
 
   // 強さ★は「相対順位」で付与（上位1/3=★★★, 中位=★★, 下位=★）。

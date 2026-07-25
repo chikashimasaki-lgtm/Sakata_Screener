@@ -20,7 +20,7 @@ const MACRO = {
 
 // ── 純ロジック（GAS非依存・ヘッドレステスト可能） ───────────────────────────
 
-// 地合い：二市場売残(億円) と 市場信用倍率(買残÷売残) から3区分。
+// 地合い：東証 売残(億円) と 東証 信用倍率(買残÷売残) から3区分。
 function marginRegime_(sellBalOku, ratio) {
   const T = SK.MARGIN.SELL_THRESHOLD_OKU, P = SK.MARGIN.RATIO_PIVOT;
   const s = Number(sellBalOku), r = Number(ratio);
@@ -70,7 +70,7 @@ function vixMacdSignal_(vixCloses) {
 function checkMarketConditions_(data) {
   const g = (k, d) => (data[k] != null && data[k] !== '' ? data[k] : d);
   return [
-    { key: '1_short_margin', condition: '日証金/二市場 売残 8,000億円未満', value: g('sell_margin_oku', null),
+    { key: '1_short_margin', condition: '東証 売残 8,000億円未満', value: g('sell_margin_oku', null),
       alert: Number(g('sell_margin_oku', 9e9)) < SK.MARGIN.SELL_THRESHOLD_OKU },
     { key: '2_margin_ratio', condition: '信用倍率 1.0倍以上（買い方過多）', value: g('margin_ratio', null),
       alert: Number(g('margin_ratio', 0)) >= SK.MARGIN.RATIO_PIVOT },

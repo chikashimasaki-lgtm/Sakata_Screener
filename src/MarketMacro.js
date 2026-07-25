@@ -102,25 +102,17 @@ function fetchIndexCloses_(symbol) {
 // Drive詳細サービス(v2)で Google スプレッドシートに変換して東証の売残/買残を読み取る。
 // 返り値 { sellOku, ratio, sellShares, buyShares } / 見つからなければ null（→手入力にフォールバック）。
 function importTseMarginFile_() {
-  var latest = null, latestKey = '';
-  var it = DriveApp.searchFiles(
-    'title contains "mtseisan" and mimeType != "application/vnd.google-apps.spreadsheet" and trashed = false');
-  while (it.hasNext()) {
-    var f = it.next();
-    var m = f.getName().match(/mtseisan(\d{8})/);
-    var key = m ? m[1] : Utilities.formatDate(f.getLastUpdated(), 'Asia/Tokyo', 'yyyyMMdd');
-    if (!latest || key > latestKey) { latest = f; latestKey = key; }
-  }
+  var latest = findLatestMtseisan_();   // Drive REST v3（マイドライブ＋共有ドライブ横断）
   if (!latest) { Logger.log('mtseisan*.xls が見つかりません（JPX信用残ファイルをDriveに置いてください）'); return null; }
 
   var newId = null;
   try {
-    newId = convertXlsToSheet_(latest.getId());   // .xls → Google スプレッドシート（Drive REST v3）
+    newId = convertXlsToSheet_(latest.id);   // .xls → Google スプレッドシート（Drive REST v3）
     var sh = SpreadsheetApp.openById(newId).getSheets()[0];
     var r = parseTseMarginGrid_(sh.getDataRange().getValues());
-    if (r) Logger.log('東証信用残 取込: ' + latest.getName() +
+    if (r) Logger.log('東証信用残 取込: ' + latest.name +
       ' 売残=' + r.sellOku + '億 倍率=' + r.ratio + '（売残株' + r.sellShares + '/買残株' + r.buyShares + '）');
-    else Logger.log('東証信用残 パース失敗: ' + latest.getName());
+    else Logger.log('東証信用残 パース失敗（グリッドで東京行を検出できず）: ' + latest.name);
     return r;
   } catch (e) {
     Logger.log('東証信用残 取込エラー: ' + e.message);
@@ -128,6 +120,20 @@ function importTseMarginFile_() {
   } finally {
     if (newId) { try { DriveApp.getFileById(newId).setTrashed(true); } catch (e2) {} }
   }
+}
+
+// mtseisan*.xls の最新を Drive REST v3 で探す（マイドライブ＋共有ドライブ横断）。{id,name} を返す。
+function findLatestMtseisan_() {
+  var q = "name contains 'mtseisan' and mimeType != 'application/vnd.google-apps.spreadsheet' and trashed = false";
+  var url = 'https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(q) +
+    '&fields=files(id,name,modifiedTime)&pageSize=50&orderBy=name desc' +
+    '&includeItemsFromAllDrives=true&supportsAllDrives=true&corpora=allDrives';
+  var res = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+  if (res.getResponseCode() >= 300) { Logger.log('Drive検索失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200)); return null; }
+  var files = (JSON.parse(res.getContentText()).files) || [];
+  if (!files.length) return null;
+  files.sort(function (a, b) { return a.name < b.name ? 1 : a.name > b.name ? -1 : 0; });  // mtseisanYYYYMMDD 降順
+  return files[0];
 }
 
 // Drive上の .xls を Google スプレッドシートに変換したコピーを作り fileId を返す。
@@ -174,13 +180,14 @@ function parseTseMarginGrid_(grid) {
 }
 
 // 「相場マクロ」入力シートの指定ラベル行(B列)に値を書き戻す（取込値の可視化・永続化）。
-function writeMacroInputValues_(map) {
+function writeMacroInputValues_(sellOku, ratio) {
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(MACRO.INPUT_SHEET); if (!sh) sh = setupMacroSheets_().input;
-  var rng = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2), vals = rng.getValues();
+  var vals = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2).getValues();
   for (var i = 0; i < vals.length; i++) {
-    var k = String(vals[i][0] || '').trim();
-    if (map.hasOwnProperty(k) && map[k] != null) sh.getRange(i + 1, 2).setValue(map[k]);
+    var k = String(vals[i][0] || '');
+    if (/売残.*億|売残高/.test(k) && sellOku != null) sh.getRange(i + 1, 2).setValue(sellOku);
+    else if (/信用倍率/.test(k) && ratio != null) sh.getRange(i + 1, 2).setValue(ratio);
   }
 }
 
@@ -190,21 +197,21 @@ function readMacroInputSheet_() {
   let sh = ss.getSheetByName(MACRO.INPUT_SHEET);
   if (!sh) sh = setupMacroSheets_().input;
   const rows = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2).getValues();
-  const map = {};
-  rows.forEach(([k, v]) => { if (k) map[String(k).trim()] = v; });
+  // ラベルはキーワードで照合（旧「二市場売残」等が残っていても拾えるよう寛容に）
+  const find = (re) => { for (var i = 0; i < rows.length; i++) { if (re.test(String(rows[i][0] || ''))) return rows[i][1]; } return undefined; };
   return {
-    sell_margin_oku:  map['東証 売残（億円）'],
-    margin_ratio:     map['東証 信用倍率（買残÷売残・株数）'],
-    nikkei_eps_trend: String(map['日経平均EPSトレンド（UP/FLAT/DOWN）'] || 'FLAT').toUpperCase(),
-    foreign_net_oku:  map['海外投資家 現物ネット（億円・売越は負）'],
-    earnings_selloff: String(map['好決算sell-on-news 頻発（YES/NO）'] || 'NO').toUpperCase(),
+    sell_margin_oku:  find(/売残.*億|売残高/),
+    margin_ratio:     find(/信用倍率/),
+    nikkei_eps_trend: String(find(/EPS/) || 'FLAT').toUpperCase(),
+    foreign_net_oku:  find(/海外/),
+    earnings_selloff: String(find(/決算|sell/i) || 'NO').toUpperCase(),
   };
 }
 
 // メニュー本体：手入力＋自動(NS/VIX)から7条件を判定し「急落サイン」へ出力、地合いをキャッシュ。
 function updateMarketMacro() {
   const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls を自動取込
-  if (tse) writeMacroInputValues_({ '東証 売残（億円）': tse.sellOku, '東証 信用倍率（買残÷売残・株数）': tse.ratio });
+  if (tse) writeMacroInputValues_(tse.sellOku, tse.ratio);
   const manual = readMacroInputSheet_();                       // 取込値を書き戻した後に読む
   if (tse) { manual.sell_margin_oku = tse.sellOku; manual.margin_ratio = tse.ratio; }
 
@@ -223,8 +230,13 @@ function updateMarketMacro() {
 
   const regime = marginRegime_(data.sell_margin_oku, data.margin_ratio);
   PropertiesService.getScriptProperties().setProperty(MACRO.REGIME_PROP, regime);
-  Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix);
-  try { SpreadsheetApp.getActive().toast('急落サイン ' + lit + '/7 ・地合い ' + regime, '相場マクロ', 6); } catch (e) {}
+  Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix +
+    ' ・東証売残=' + (tse ? tse.sellOku + '億/倍率' + tse.ratio : '未取込'));
+  try {
+    SpreadsheetApp.getActive().toast(
+      (tse ? '東証売残' + tse.sellOku + '億・倍率' + tse.ratio : '⚠ mtseisan未取込（ファイル/認可を確認）') +
+      ' ・急落' + lit + '/7 ・地合い' + regime, '相場マクロ', 8);
+  } catch (e) {}
 }
 
 // finalizeSignals_(Code.js) が参照する現在の地合い。未更新時は NEUTRAL。

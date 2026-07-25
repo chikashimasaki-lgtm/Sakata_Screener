@@ -153,7 +153,7 @@ function pickForeignFlow_(rows) {
 function fetch1570MarginRatio_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
   if (!key) return null;
-  var from = fmtDate_(new Date(Date.now() - 90 * 86400000));
+  var from = fmtDate_(new Date(Date.now() - 130 * 86400000));   // フリープランの約12週遅延をカバー
   // 1570はETF。weekly_margin_interestは4桁だと普通株のみ返すため、5桁コード「15700」で指定する。
   var rows = jqGet_('markets/weekly_margin_interest', { code: '15700', from: from }, key);
   if (!rows || !rows.length) return null;
@@ -170,7 +170,7 @@ function fetch1570MarginRatio_() {
 function fetchStandardizedMarginMap_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
   if (!key) { Logger.log('制度信用倍率: JQUANTS_API_KEY 未設定'); return {}; }
-  var from = fmtDate_(new Date(Date.now() - 21 * 86400000));
+  var from = fmtDate_(new Date(Date.now() - 130 * 86400000));   // フリープランの約12週遅延をカバー
   var rows = jqGet_('markets/weekly_margin_interest', { from: from }, key);
   if (!rows || !rows.length) { Logger.log('制度信用倍率: データなし（プラン外/遅延の可能性）'); return {}; }
   var latest = {};   // code -> { date, ratio }（最新週のみ採用）

@@ -125,7 +125,7 @@ function scanSignals() {
     queue = rows.map(r => [String(r[0]).trim(), r[1] || '']);
     const oldFilter = sig.getFilter(); if (oldFilter) oldFilter.remove();
     sig.clear();
-    sig.getRange(1, 1, 1, 10).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '制度信用倍率']]);
+    sig.getRange(1, 1, 1, 10).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '信用倍率']]);
   }
 
   const start = Date.now();
@@ -245,8 +245,8 @@ function finalizeSignals_(sig) {
   });
   sig.getRange(2, 1, n, 9).setValues(data);
 
-  // 制度信用倍率(制度買残÷制度売残)を J-Quants から結合（10列目）。取得不可の銘柄は空欄。
-  const marginMap = fetchStandardizedMarginMap_();
+  // 信用倍率(合計)を Yahoo Finance Japan から結合（10列目）。点灯銘柄のみ取得。取得不可は空欄。
+  const marginMap = fetchYahooJpMarginRatios_(data.map(row => row[3]));
   sig.getRange(2, 10, n, 1).setValues(data.map(row => {
     const c = to4_(String(row[3] || '').trim());
     return [marginMap[c] != null ? marginMap[c] : ''];

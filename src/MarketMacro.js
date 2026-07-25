@@ -151,17 +151,37 @@ function pickForeignFlow_(rows) {
 // 買残÷売残(株数)。1570は空売りが積むと倍率<1.0になり得る＝ショートカバー燃料の指標。
 // 市場全体の信用倍率は常に買残>>売残で約9倍固定のため、動画の「信用倍率<1.0」判定には1570を使う。
 function fetch1570MarginRatio_() {
-  var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
-  if (!key) return null;
-  var from = fmtDate_(new Date(Date.now() - 130 * 86400000));   // フリープランの約12週遅延をカバー
-  // 1570はETF。weekly_margin_interestは4桁だと普通株のみ返すため、5桁コード「15700」で指定する。
-  var rows = jqGet_('markets/weekly_margin_interest', { code: '15700', from: from }, key);
-  if (!rows || !rows.length) return null;
-  rows.sort(function (a, b) { return (a.Date < b.Date) ? 1 : (a.Date > b.Date ? -1 : 0); });   // 最新週
-  var r = rows[0];
-  var lng = Number(r.LongMarginOutstanding), sht = Number(r.ShortMarginOutstanding);
-  if (!isFinite(lng) || !isFinite(sht) || sht <= 0) return null;
-  return { ratio: Math.round(lng / sht * 100) / 100, date: r.Date };
+  var m = fetchYahooJpMarginRatios_(['1570']);
+  return (m['1570'] != null) ? { ratio: m['1570'], date: '' } : null;
+}
+
+// Yahoo Finance Japan の各銘柄ページから信用倍率(合計)を取得し code→倍率 マップを返す。
+// J-Quantsの信用残がプラン外/空のときの代替。制度/一般の内訳は無く合計倍率のみ。
+// 点灯銘柄など少数を渡す想定（fetchAllでバッチ）。取得不可の銘柄は欠落。
+function fetchYahooJpMarginRatios_(codes) {
+  var map = {};
+  var uniq = Array.from(new Set((codes || []).map(function (c) { return to4_(String(c).trim()); }).filter(Boolean)));
+  for (var i = 0; i < uniq.length; i += 25) {
+    var slice = uniq.slice(i, i + 25);
+    var reqs = slice.map(function (c) {
+      return { url: 'https://finance.yahoo.co.jp/quote/' + c + '.T', headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true };
+    });
+    var resps; try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { continue; }
+    resps.forEach(function (res, j) {
+      try { if (res.getResponseCode() === 200) { var r = parseYahooJpMarginRatio_(res.getContentText()); if (r != null) map[slice[j]] = r; } } catch (e) {}
+    });
+    Utilities.sleep(150);
+  }
+  return map;
+}
+
+// Yahoo JapanのHTMLから信用倍率を抽出。①「信用倍率」直後の小数、無ければ②信用買残÷信用売残。
+function parseYahooJpMarginRatio_(html) {
+  var m = html.match(/信用倍率[^0-9\-]{0,60}?([0-9]+\.[0-9]+)/);
+  if (m) return parseFloat(m[1]);
+  var b = html.match(/信用買残[^0-9]{0,60}?([0-9,]+)/), s = html.match(/信用売残[^0-9]{0,60}?([0-9,]+)/);
+  if (b && s) { var bv = parseFloat(b[1].replace(/,/g, '')), sv = parseFloat(s[1].replace(/,/g, '')); if (sv > 0) return Math.round(bv / sv * 100) / 100; }
+  return null;
 }
 
 // 全銘柄の「制度信用倍率」(制度買残÷制度売残) を J-Quants weekly_margin_interest から取得。

@@ -154,7 +154,8 @@ function fetch1570MarginRatio_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
   if (!key) return null;
   var from = fmtDate_(new Date(Date.now() - 90 * 86400000));
-  var rows = jqGet_('markets/weekly_margin_interest', { code: '1570', from: from }, key);
+  // 1570はETF。weekly_margin_interestは4桁だと普通株のみ返すため、5桁コード「15700」で指定する。
+  var rows = jqGet_('markets/weekly_margin_interest', { code: '15700', from: from }, key);
   if (!rows || !rows.length) return null;
   rows.sort(function (a, b) { return (a.Date < b.Date) ? 1 : (a.Date > b.Date ? -1 : 0); });   // 最新週
   var r = rows[0];

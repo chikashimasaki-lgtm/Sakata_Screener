@@ -22,6 +22,11 @@ const SK = {
   TIME_BUDGET_MS: 4.5 * 60 * 1000,
   // 信用需給フィルター（動画の閾値）。地合いと係数の単一ソース。MarketMacro.js が参照。
   MARGIN: { SELL_THRESHOLD_OKU: 8000, RATIO_PIVOT: 1.0, BUY_BOOST: 1.5, SELL_BOOST: 1.5 },
+  // 流動性フィルター。売買代金が細い銘柄は、実際には取引が成立していない「気配だけの窓」で
+  // 三空・捨て子線が点灯しやすく、しかも実際にはその値段で売買できない。
+  // 直近 LIQ_DAYS 日の売買代金（終値×出来高）中央値が LIQ_MIN_TURNOVER 未満なら走査対象外。
+  LIQ_DAYS: 20,
+  LIQ_MIN_TURNOVER: 50 * 1000 * 1000,   // 5,000万円/日
 };
 
 // 実績スコアリング設定（バックテスト学習・自動修正）
@@ -142,6 +147,7 @@ function scanSignals() {
       const [code, name] = slice[i];
       const bars = parseYahooBars_(res);
       if (bars.length < 5) return;
+      if (!isLiquidEnough_(bars)) return;   // 薄商い銘柄は気配だけの窓を拾うため除外
       const signals = detectSakata_(bars);
       if (signals.length === 0) return;
       const last = bars[bars.length - 1];
@@ -343,19 +349,66 @@ function getSbiHeldCodes_() {
 // ============================================================================
 //  Yahoo 日足パース
 // ============================================================================
+// 1日の秒数。欠損日をまたいだ足かどうかの判定に使う。
+const ONE_DAY_SEC_ = 24 * 60 * 60;
+// 前の足からこの日数を超えて空いていたら「連続していない足」とみなし、窓（三空等）の判定に使わない。
+// 3連休＋臨時休場を吸収できる幅にしている。
+const MAX_BAR_GAP_DAYS_ = 5;
+
+/**
+ * Yahoo 日足レスポンスを bars 配列へ。
+ *
+ * 分割・配当調整：Yahoo は生値(quote)と調整後終値(adjclose)の両方を返す。生値のままだと
+ * 株式分割日に巨大な窓が開き、三空叩き込みや明けの明星が誤点灯する（日本株は分割が多い）。
+ * adjclose/close の比率を OHLC 全体に掛けて調整済み系列にする。adjclose が無い場合のみ
+ * 生値へフォールバックする。
+ *
+ * 出来高：quote[0].volume は元から応答に含まれている。以前は読んでいなかったため
+ * 「日足barsに出来高が無い」とされていたが、実際は取得できる。流動性フィルタで使う。
+ *
+ * 連続性：null 足を単に読み飛ばすと、欠損日をまたいだ足が隣接して実在しないギャップが
+ * できる。前の足との日数差を見て cont（連続しているか）を持たせ、窓判定側で参照する。
+ */
 function parseYahooBars_(res) {
   try {
     if (res.getResponseCode() !== 200) return [];
     const r = JSON.parse(res.getContentText()).chart.result[0];
     const ts = r.timestamp, q = r.indicators.quote[0];
+    const adj = (r.indicators.adjclose && r.indicators.adjclose[0])
+      ? r.indicators.adjclose[0].adjclose : null;
     const bars = [];
+    let prevT = null;
     for (let i = 0; i < ts.length; i++) {
       const o = q.open[i], h = q.high[i], l = q.low[i], c = q.close[i];
-      if (o == null || h == null || l == null || c == null) continue;
-      bars.push({ o, h, l, c, t: ts[i] });
+      if (o == null || h == null || l == null || c == null || !(c > 0)) continue;
+      // 調整係数（adjclose/close）。欠損・異常値のときは 1（＝生値のまま）。
+      const a = (adj && adj[i] != null && adj[i] > 0) ? adj[i] / c : 1;
+      const v = (q.volume && q.volume[i] != null) ? q.volume[i] : null;
+      const t = ts[i];
+      const cont = (prevT == null) ? false : ((t - prevT) <= MAX_BAR_GAP_DAYS_ * ONE_DAY_SEC_);
+      bars.push({ o: o * a, h: h * a, l: l * a, c: c * a, v, t, cont });
+      prevT = t;
     }
     return bars;
   } catch (e) { return []; }
+}
+
+/**
+ * 直近の売買代金（終値×出来高）の中央値。出来高が取れない銘柄は null。
+ * 平均でなく中央値を使うのは、1日だけの大口約定で薄商いの銘柄が通過するのを避けるため。
+ */
+function medianTurnover_(bars, days) {
+  const tail = bars.slice(-days).filter(b => b.v != null && b.v > 0);
+  if (!tail.length) return null;
+  const vals = tail.map(b => b.c * b.v).sort((x, y) => x - y);
+  const m = Math.floor(vals.length / 2);
+  return vals.length % 2 ? vals[m] : (vals[m - 1] + vals[m]) / 2;
+}
+
+// 走査対象とするだけの流動性があるか。出来高が取得できない場合は従来どおり通す（判定不能で落とさない）。
+function isLiquidEnough_(bars) {
+  const t = medianTurnover_(bars, SK.LIQ_DAYS);
+  return (t == null) ? true : t >= SK.LIQ_MIN_TURNOVER;
 }
 
 // シグナルの意味（解説列に表示）
@@ -449,6 +502,16 @@ function signalExplain_(names) {
 }
 
 // RSI(14) 系列（close値のみで計算）。HTML版スクリーナーの現代版フィルターを移植。
+/**
+ * RSI(Wilder) 系列。
+ *
+ * 旧実装は、シード時点の g/l に「合計」を入れたまま再帰 g=(g*(p-1)+up)/p に渡していた。
+ * 再帰の第2項 up は等倍なので、古い項（p倍のまま）と新しい項（等倍）でスケールが混ざる。
+ * g/l の比を取るため破綻はしないが収束が非常に遅く、標準RSIとの乖離は bar30 で最大約34pt、
+ * bar90 で約3.5pt、bar124 でようやく0.3pt程度まで縮む。実運用スキャン（6mo≒124本）の
+ * 末尾はほぼ正しかったが、バックテストは30本目から評価するため誤差の大きい区間を集計していた。
+ * シードを合計から平均へ直し、正しいWilder平滑化（α=1/p）にする。
+ */
 function rsiSeries_(closes, p) {
   const out = new Array(closes.length).fill(null);
   let g = 0, l = 0;
@@ -457,14 +520,22 @@ function rsiSeries_(closes, p) {
     const up = Math.max(ch, 0), dn = Math.max(-ch, 0);
     if (i <= p) {
       g += up; l += dn;
-      if (i === p) out[i] = (l === 0) ? 100 : 100 - 100 / (1 + g / l);
+      if (i === p) { g /= p; l /= p; out[i] = rsiFrom_(g, l); }   // 合計→平均にしてシード
     } else {
       g = (g * (p - 1) + up) / p;
       l = (l * (p - 1) + dn) / p;
-      out[i] = (l === 0) ? 100 : 100 - 100 / (1 + g / l);
+      out[i] = rsiFrom_(g, l);
     }
   }
   return out;
+}
+
+// 平均上昇幅・平均下落幅から RSI を求める。
+// 値動きが全く無い（上げも下げもゼロ）区間は方向感が無いので中立50を返す。
+// 旧実装は l===0 で一律100を返していたため、完全フラットな系列に「RSI過熱(80超)」が誤点灯していた。
+function rsiFrom_(g, l) {
+  if (l === 0) return (g === 0) ? 50 : 100;
+  return 100 - 100 / (1 + g / l);
 }
 
 // MACD(12,26,9) 系列。close値のみ。EMA は逐次計算（pandas ewm(adjust=False) 相当：
@@ -498,6 +569,10 @@ function detectSakata_(bars) {
   const A = bars[n - 1], B = bars[n - 2], C = bars[n - 3], D = bars[n - 4], E = bars[n - 5];
   const bull = b => b.c > b.o;
   const bear = b => b.c < b.o;
+  // 窓（空）は「隣り合う営業日の間に空いた値幅」でなければ意味がない。データ欠損で日付が
+  // 飛んでいる箇所を窓と誤認しないよう、連続していない足を含む区間では窓判定を行わない。
+  // cont は parseYahooBars_ が付ける（前の足との日数差が MAX_BAR_GAP_DAYS_ 以内なら true）。
+  const contiguous = (...bs) => bs.every(b => b.cont !== false);
   const rsi  = rsiSeries_(bars.map(b => b.c), 14);  // 現代版フィルター（RSI補強）
   const rNow = rsi[n - 1];
 
@@ -515,13 +590,13 @@ function detectSakata_(bars) {
     sig.push({ name: '三羽烏(黒三兵)', dir: '売り' });
 
   // 三空踏み上げ: 直近3つの窓が上向き（買われ過ぎ→反落）＋ RSI80超で過熱を補強
-  if (A.l > B.h && B.l > C.h && C.l > D.h) {
+  if (contiguous(A, B, C) && A.l > B.h && B.l > C.h && C.l > D.h) {
     sig.push({ name: '三空踏み上げ', dir: '売り' });
     if (rNow != null && rNow >= 80) sig.push({ name: 'RSI過熱(80超)', dir: '売り' });
   }
 
   // 三空叩き込み: 直近3つの窓が下向き（売られ過ぎ→反発）＋ RSI20割れで底値を補強
-  if (A.h < B.l && B.h < C.l && C.h < D.l) {
+  if (contiguous(A, B, C) && A.h < B.l && B.h < C.l && C.h < D.l) {
     sig.push({ name: '三空叩き込み', dir: '買い' });
     if (rNow != null && rNow <= 20) sig.push({ name: 'RSI底値(20割れ)', dir: '買い' });
   }
@@ -535,7 +610,7 @@ function detectSakata_(bars) {
     sig.push({ name: '下げ三法', dir: '売り' });
 
   // 上放れ二羽烏: C陽線 → 窓を開けて陰線B → 陰線Aが陰線Bを包むが窓は埋めない（天井・売り）
-  if (bull(C) && bear(B) && bear(A) && Math.min(B.o, B.c) > C.c && A.o > B.o && A.c < B.c && A.c > C.c)
+  if (contiguous(A, B) && bull(C) && bear(B) && bear(A) && Math.min(B.o, B.c) > C.c && A.o > B.o && A.c < B.c && A.c > C.c)
     sig.push({ name: '上放れ二羽烏', dir: '売り' });
 
   // 三山(三尊天井) / 三川(逆三尊) / 単純三山（RSIダイバージェンスで補強）
@@ -631,16 +706,18 @@ function detectStars_(bars) {
   const cBig  = body(C) >= avg;                     // 中日前は長大線
   const bStar = body(B) <= body(C) * 0.5;           // 中央は小さな実体（星／コマ）
   const bDoji = body(B) <= (B.h - B.l) * 0.1;       // ほぼ同事線（寄引同値）
+  // 明星は「窓を開けて放れる」形が本質なので、データ欠損で日付が飛んでいる区間では判定しない
+  const cont  = (A.cont !== false) && (B.cont !== false);
 
   // 明けの明星: 星がC終値の下に窓を開けて放れ、翌日の陽線がC実体の中心を上回る
-  if (cBig && bear(C) && bStar && upper(B) < C.c && bull(A) && A.c > mid(C)) {
+  if (cont && cBig && bear(C) && bStar && upper(B) < C.c && bull(A) && A.c > mid(C)) {
     out.push({ name: '明けの明星', dir: '買い' });
     // 捨て子線（明け）: 星が同事線で、前後ともヒゲを含め窓が開く（強い底打ち反転）
     if (bDoji && B.h < C.l && A.l > B.h) out.push({ name: '捨て子線(明け)', dir: '買い' });
   }
 
   // 宵の明星: 星がC終値の上に窓を開けて放れ、翌日の陰線がC実体の中心を下回る
-  if (cBig && bull(C) && bStar && lower(B) > C.c && bear(A) && A.c < mid(C)) {
+  if (cont && cBig && bull(C) && bStar && lower(B) > C.c && bear(A) && A.c < mid(C)) {
     out.push({ name: '宵の明星', dir: '売り' });
     // 捨て子線（宵）: 星が同事線で、前後ともヒゲを含め窓が開く（強い天井反転）
     if (bDoji && B.l > C.h && A.h < B.l) out.push({ name: '捨て子線(宵)', dir: '売り' });

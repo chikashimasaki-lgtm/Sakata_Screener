@@ -39,7 +39,12 @@ const MACRO = {
  */
 function marginRegime_(sellBalOku, ratio) {
   const T = SK.MARGIN.SELL_THRESHOLD_OKU, P = SK.MARGIN.RATIO_PIVOT;
-  const s = Number(sellBalOku), r = Number(ratio);
+  // 空セルは getValues() が '' を返し Number('') は 0 になる。そのまま判定すると
+  // 「売残が未入力」＝「売残0億円＝枯渇」と読まれ、倍率が1.0以上なら SUPPLY_RISK が立って
+  // 全ての売りシグナルが1.5倍に増幅される（倍率が未入力なら逆に SHORT_COVER）。
+  // 手入力運用なので未入力は普通に起きる。未入力は判定材料にせず中立へ落とす。
+  const toNum = v => (v === '' || v == null) ? NaN : Number(v);
+  const s = toNum(sellBalOku), r = toNum(ratio);
   if (isFinite(s) && isFinite(r)) {
     if (s >= T && r <  P) return 'SHORT_COVER';   // 売残潤沢＋倍率低 ＝ ショートカバー好機（買い追い風）
     if (s <  T && r >= P) return 'SUPPLY_RISK';    // 売残枯渇＋倍率高 ＝ 需給悪化・投げ売り警戒（売り追い風）
@@ -424,7 +429,9 @@ function parseTseMarginGrid_(grid) {
     var n = parseFloat(s); return isFinite(n) ? n : NaN;
   };
   var hit = function (v, re) { return re.test(String(v == null ? '' : v)); };
-  for (var i = 0; i + 1 < grid.length; i++) {
+  // 最終行まで見る（i+1 で打ち切ると、株数行がグリッド末尾に来た場合に読めなくなる。
+  // 直下の金額行は無いこともあるので valRow 側で存在を確認する）
+  for (var i = 0; i < grid.length; i++) {
     var row = grid[i];
     if (hit(row[1], /東京|Tokyo/i) && hit(row[2], /株数|Shs/i)) {   // 現在高ブロックの東京・株数行（最初の一致）
       var sellShares = num(row[11]);   // 合計 売残高(株数)

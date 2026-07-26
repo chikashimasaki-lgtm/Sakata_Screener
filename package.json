@@ -1,0 +1,10 @@
+{
+  "name": "sakata-screener",
+  "version": "1.0.0",
+  "private": true,
+  "description": "酒田五法シグナル・スクリーナー（Google Apps Script）の純ロジック検証",
+  "scripts": {
+    "test": "node tests/verify.js"
+  },
+  "license": "UNLICENSED"
+}

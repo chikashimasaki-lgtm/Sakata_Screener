@@ -331,10 +331,8 @@ function installDailyScanTrigger() {
 
   // 定期トリガーに加え、走査/集計の「自動再開」トリガーも掃除する。
   // 以前は再開トリガーが対象外で、中断状態のまま残った再開トリガーが後から発火していた。
-  ScriptApp.getProjectTriggers()
-    .filter(t => ['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest', 'updateMarketMacro',
-                  'scanSignals', 'backtestWeights'].includes(t.getHandlerFunction()))
-    .forEach(t => ScriptApp.deleteTrigger(t));
+  clearTriggersFor_(['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest', 'updateMarketMacro',
+                     'scanSignals', 'backtestWeights']);   // 共通モジュール TriggerUtils.js
   ScriptApp.newTrigger('updateMarketMacro').timeBased().everyDays(1).atHour(17).create();    // 相場マクロ/急落サイン・地合い更新（走査の前）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
   ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();            // 購入ポートフォリオ確認（毎時）

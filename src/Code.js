@@ -397,10 +397,15 @@ function finalizeSignals_(sig) {
   sig.getRange(2, 10, n, 1).setNumberFormat('0.00').setHorizontalAlignment('center').setVerticalAlignment('middle');
 
   // コード(4列目)を TradingView 日足チャートへのハイパーリンクに。
-  const TV = 'vrWJ3cQi';
+  // 個人のチャートレイアウトIDはスクリプトプロパティ TRADINGVIEW_LAYOUT_ID で差し替えられる。
+  // 未設定ならレイアウト指定なしの汎用チャートを開く。
+  const TV = PropertiesService.getScriptProperties().getProperty('TRADINGVIEW_LAYOUT_ID') || '';
+  const tvUrl = code => TV
+    ? `https://jp.tradingview.com/chart/${TV}/?symbol=TSE:${code}&interval=D`
+    : `https://jp.tradingview.com/chart/?symbol=TSE:${code}&interval=D`;
   sig.getRange(2, 4, n, 1).setFormulas(data.map(row => {
     const code = to4_(String(row[3] || '').trim()).toUpperCase();
-    return [code ? `=HYPERLINK("https://jp.tradingview.com/chart/${TV}/?symbol=TSE:${code}&interval=D","${code}")` : ''];
+    return [code ? `=HYPERLINK("${tvUrl(code)}","${code}")` : ''];
   }));
 
   // 全体スタイル: 濃紺ヘッダ＋淡色の行帯＋ヘッダ固定
@@ -474,10 +479,17 @@ function applySignalFormatRules_(sig, n) {
 // SBI証券の保有銘柄コードを参照元スプレッドシート（Asset_Status）から収集する。
 // 「SBI証券（日本株）」「SBI証券（日本株信用）」の「銘柄コード」列から4桁の証券コードを抽出。
 function getSbiHeldCodes_() {
-  const SBI_SS_ID = '1VSSDMV5u8wNmGe9bh4wQI7wOULodzMq309cgWKljobg'; // Asset_Status のスプレッドシート
+  // 参照先スプレッドシートIDはスクリプトプロパティ ASSET_STATUS_SS_ID に置く。
+  // 個人の資産管理シートのIDを公開リポジトリのソースに直接書かないため。
+  // 未設定なら保有ハイライトを行わない（機能を止めるだけで走査自体は続行する）。
+  const SBI_SS_ID = PropertiesService.getScriptProperties().getProperty('ASSET_STATUS_SS_ID');
   const SHEET_NAMES = ['SBI証券（日本株）', 'SBI証券（日本株信用）'];
   const CODE_RE = /^[0-9][0-9A-Z]{3}$/;                            // 4桁の証券コード（例 7203 / 130A）
   const set = new Set();
+  if (!SBI_SS_ID) {
+    Logger.log('ASSET_STATUS_SS_ID が未設定のため保有ハイライトをスキップ');
+    return set;
+  }
   let ss;
   try { ss = SpreadsheetApp.openById(SBI_SS_ID); }
   catch (e) { Logger.log('SBIスプレッドシートを開けません: ' + e.message); return set; }

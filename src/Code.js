@@ -73,6 +73,23 @@ function onOpen() {
     .addToUi();
 }
 
+/**
+ * 取り返しのつかない操作の前に確認を取る。
+ * トリガー起動では getUi() が使えないため、その場合は確認を求めず続行する
+ * （定期実行の妨げにしない）。
+ * @return {boolean} 続行してよければ true
+ */
+function confirmDestructive_(title, message) {
+  let ui;
+  try { ui = SpreadsheetApp.getUi(); } catch (e) { return true; }   // トリガー実行時
+  const res = ui.alert(title, message, ui.ButtonSet.YES_NO);
+  if (res !== ui.Button.YES) {
+    SpreadsheetApp.getActive().toast('操作をキャンセルしました', '酒田五法', 4);
+    return false;
+  }
+  return true;
+}
+
 function setup() {
   const ss = SpreadsheetApp.getActive();
   let uni = ss.getSheetByName(SK.SHEETS.UNIVERSE);
@@ -85,6 +102,9 @@ function setup() {
     ]);
   }
   if (!ss.getSheetByName(SK.SHEETS.SIGNALS)) ss.insertSheet(SK.SHEETS.SIGNALS);
+  // 相場マクロ・急落サインもここで作る。以前はセットアップ対象外だったため、
+  // 初回は「相場マクロ/急落サインを更新」を実行するまでシート自体が存在しなかった。
+  try { setupMacroSheets_(); } catch (e) { Logger.log('相場マクロシートの作成に失敗: ' + e.message); }
   createUsageSheet();
   const u = ss.getSheetByName(SK.SHEETS.UNIVERSE);
   styleSheet_(u, 2, '#1a1e3a', '#eef3fc');   // 銘柄シートも配色
@@ -99,6 +119,13 @@ function setup() {
 //  プライム銘柄の取得（J-Quants V2・任意）
 // ============================================================================
 function fetchPrimeUniverse() {
+  // この処理は「銘柄」シートを全消去して入れ替える。手入力した銘柄リストが
+  // 無警告で消えていたため、実行前に確認する。
+  const uniNow = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.UNIVERSE);
+  const cur = uniNow ? Math.max(uniNow.getLastRow() - 1, 0) : 0;
+  if (!confirmDestructive_('プライム銘柄を取得',
+      '「銘柄」シートの内容（現在 ' + cur + '件）をすべて置き換えます。\n手入力した銘柄も消えます。続行しますか？')) return;
+
   const key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
   if (!key) throw new Error('JQUANTS_API_KEY をスクリプトプロパティに設定してください（プライム取得に必要）');
 
@@ -160,7 +187,15 @@ function scanSignals() {
   let failed = Number(props.getProperty('SK_FAILED') || 0);
 
   if (!cursor) {
-    // 新規走査: シグナルシートを初期化
+    // 新規走査はシグナルシートを消して作り直す。前回の結果を見ている最中に
+    // 誤って実行すると消えてしまうため、既存結果があるときだけ確認する。
+    if (sig.getLastRow() > 1 && !confirmDestructive_('シグナル走査',
+        '現在の「シグナル」シートの結果（' + (sig.getLastRow() - 1) + '件）を消して、'
+        + total + '銘柄を新たに走査します。続行しますか？\n'
+        + '（中断した走査を再開したい場合は「いいえ」を選び、そのまま再実行してください）')) {
+      lock.releaseLock();
+      return;
+    }
     const oldFilter = sig.getFilter(); if (oldFilter) oldFilter.remove();
     sig.clear();
     sig.getRange(1, 1, 1, 10).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '信用倍率']]);
@@ -288,6 +323,12 @@ function clearResumeTriggers_() {
 
 // ---- 定期実行（平日18時・土日祝／年末年始はスキップ） ----
 function installDailyScanTrigger() {
+  // 既存トリガーを消してから作り直すため、実行中の走査があると止まる
+  const existing = ScriptApp.getProjectTriggers().length;
+  if (existing && !confirmDestructive_('自動実行を設定',
+      '既存のトリガー（' + existing + '件）をすべて削除して設定し直します。\n'
+      + '中断中の走査があれば、その自動再開も取り消されます。続行しますか？')) return;
+
   // 定期トリガーに加え、走査/集計の「自動再開」トリガーも掃除する。
   // 以前は再開トリガーが対象外で、中断状態のまま残った再開トリガーが後から発火していた。
   ScriptApp.getProjectTriggers()
@@ -379,20 +420,14 @@ function finalizeSignals_(sig) {
   // 明示背景をいったんリセット（売却済み銘柄のハイライトを残さないため）
   sig.getRange(2, 1, n, 10).setBackground(null);
 
-  // 保有銘柄: 保有列に○、行を淡い赤でハイライト
-  // 以前は保有銘柄1件ごとに setBackground を呼んでいたため、保有数に比例してAPI呼び出しが
-  // 増えていた。背景色の二次元配列を組み立てて一度に流し込む。
+  // 保有銘柄: 保有列に○を立てる（行のハイライトは条件付き書式が○を見て行う）
   try {
     const held = getSbiHeldCodes_();
-    const marks = [], bgs = [];
-    const rowBg = c => new Array(10).fill(c);
+    const marks = [];
     for (let i = 0; i < n; i++) {
       const code = to4_(String(data[i][3] || '').trim()).toUpperCase();
-      const isHeld = held.has(code);
-      marks.push([isHeld ? '○' : '']);
-      bgs.push(rowBg(isHeld ? '#fbe3e3' : null));
+      marks.push([held.has(code) ? '○' : '']);
     }
-    sig.getRange(2, 1, n, 10).setBackgrounds(bgs);
     sig.getRange(2, 1, n, 1).setValues(marks).setFontColor('#c0392b').setFontWeight('bold');
   } catch (e) {
     // 参照元スプレッドシートの権限切れ等で落ちることがある。以前はログのみで、
@@ -401,20 +436,39 @@ function finalizeSignals_(sig) {
     SpreadsheetApp.getActive().toast('保有銘柄のハイライトを取得できませんでした: ' + e.message, '酒田五法', 8);
   }
 
-  // 方向の色分け（最後に適用し、方向セルは常に方向色を優先）買い=緑/売り=赤/混在=橙
-  const dirCells = sig.getRange(2, 7, n, 1).getValues();
-  const dbg = [], dfc = [];
-  dirCells.forEach(([d]) => {
-    const buy = String(d).indexOf('買い') >= 0, sell = String(d).indexOf('売り') >= 0;
-    dbg.push([buy ? '#e3f5ea' : sell ? '#fce4e4' : '#fff3da']);
-    dfc.push([buy ? '#1b7a3d' : sell ? '#c0392b' : '#b8860b']);
-  });
-  sig.getRange(2, 7, n, 1).setBackgrounds(dbg).setFontColors(dfc).setFontWeight('bold');
+  // 方向・保有の色分けは条件付き書式で持たせる。
+  // 直接 setBackground で塗ると、利用者がフィルタで並べ替えたときに色だけ元の行位置に
+  // residual として残り、方向と色がずれて見える。条件付き書式なら値に追従する。
+  applySignalFormatRules_(sig, n);
 
   // フィルタを張り直し（保有=○ で絞り込み可能に）
   const old = sig.getFilter(); if (old) old.remove();
   sig.getRange(1, 1, n + 1, 10).createFilter();
   sig.setTabColor('#e0567a');
+}
+
+/**
+ * シグナルシートの色分けを条件付き書式で設定する（値に追従するので並べ替えに強い）。
+ * 方向列: 買い=緑 / 売り=赤 / 混在=橙、保有行: 淡赤。
+ */
+function applySignalFormatRules_(sig, n) {
+  const dir = sig.getRange(2, 7, n, 1);
+  const all = sig.getRange(2, 1, n, 10);
+  const textRule = (range, text, bg, fc) =>
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextContains(text).setBackground(bg).setFontColor(fc).setBold(true)
+      .setRanges([range]).build();
+  // 保有行は A列が「○」かどうかで行全体を塗る（$A で列を固定した数式）
+  const heldRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied('=$A2="○"').setBackground('#fbe3e3')
+    .setRanges([all]).build();
+
+  sig.setConditionalFormatRules([
+    heldRule,   // 先に行全体、あとから方向セルが上書きする
+    textRule(dir, '買い', '#e3f5ea', '#1b7a3d'),
+    textRule(dir, '売り', '#fce4e4', '#c0392b'),
+    textRule(dir, '混在', '#fff3da', '#b8860b'),
+  ]);
 }
 
 // SBI証券の保有銘柄コードを参照元スプレッドシート（Asset_Status）から収集する。
@@ -981,22 +1035,40 @@ function createUsageSheet() {
     ['3. 「シグナル走査/続行」を実行（銘柄数が多いと時間分割で自動再開）', 'p'],
     ['4. 「シグナル」シートに結果（傾向が強い順に並ぶ）', 'p'],
     ['   ・保有列 … SBI保有銘柄は○＋淡赤ハイライト。ヘッダのフィルタで「○」を選ぶと保有だけ表示', 'p'],
-    ['   ・強さ列 … 点灯フォーメーションの重み合計を★★★/★★/★で表示', 'p'],
+    ['   ・強さ列 … 点灯パターンの重み合計×地合い係数を、絶対しきい値で★★★/★★/★に分類', 'p'],
+    ['     （相対順位ではないので、弱いシグナルしか出ていない日は★★★が0件になります）', 'p'],
     ['   ・方向列 … ▲買い(緑)/▼売り(赤)/◆混在(橙)。コードはTradingViewチャートへのリンク', 'p'],
-    ['   ・強さ列は「実績」で自動補正 … 下記バックテストの成績があれば、静的重みより実績スコアを優先', 'p'],
+    ['   ・K1セル … 走査の進捗と最終更新時刻を表示（走査中／完了・取得失敗件数）', 'p'],
     ['', 'p'],
-    ['■ 実績バックテスト（重みの自動学習・自動修正）', 'h'],
-    ['メニュー「実績バックテスト（重みを自動学習）」で、過去6ヶ月の全銘柄を対象に', 'p'],
-    ['各パターンが「発生後にどれだけ騰落したか」を集計します（酒田五法は日足が最適）。', 'p'],
+    ['■ 「相場マクロ」シート（地合いの入力）', 'h'],
+    ['急落サインの判定材料を入れるシートです。B列が値、C列が最終更新日です。', 'p'],
+    ['・東証 売残／信用倍率 … JPXの信用取引現在高ファイル(mtseisan*.xls)から自動取込', 'p'],
+    ['   ※JPXのサイトからDLした mtseisan*.xls を、このスプレッドシートと同じGoogleドライブに置いてください', 'p'],
+    ['   （JPXはボットからの直接ダウンロードを拒否するため、ファイルの入手だけは手作業になります）', 'p'],
+    ['・日経EPS／海外投資家／好決算sell-on-news … 自動取得を試み、取れないときは手入力', 'p'],
+    ['・C列の最終更新日が10日以上前、または空欄だと「更新が古い」と警告します', 'p'],
+    ['   値だけ見ていると更新忘れに気づけず、古い需給のまま判定してしまうためです', 'p'],
+    ['', 'p'],
+    ['■ 「急落サイン」シート', 'h'],
+    ['相場全体の急落リスクを7つの条件で判定し、点灯数をN/7で表示します。', 'p'],
+    ['目安 … 2件以下=落ち着いている / 3〜4件=注意 / 5件以上=警戒領域', 'p'],
+    ['判定結果は個別シグナルの強さ(★)にも反映されます（買い/売りで逆方向に作用）。', 'p'],
+    ['', 'p'],
+    ['■ 「パターン成績」シート（参考値）', 'h'],
+    ['メニュー「パターン成績を集計」で、過去6ヶ月の全銘柄を対象に', 'p'],
+    ['各パターンが「発生後にどれだけ騰落したか」を集計します。', 'p'],
     ['評価は時間軸別 … 短期系は3営業日後、中期系(三山/三川/三法)は20営業日後の騰落率で判定。', 'p'],
-    ['結果は「パターン成績」シートに出力（件数/勝率%/平均騰落率%/推奨重み）。', 'p'],
-    ['この成績を使い、シグナルの並び順・強さを実績ベースに自動補正します（毎月1日に自動再学習）。', 'p'],
+    ['※この集計はシグナルの順位付けには使っていません（あくまで傾向を眺めるための参考値）。', 'note'],
+    ['   生の騰落率のみでベンチマークを控除しておらず、上昇相場では買いパターンが軒並み', 'p'],
+    ['   高勝率と出ます。また件数20件では勝率60%と50%を統計的に区別できません。', 'p'],
     ['', 'p'],
     ['■ 自動実行（トリガー）', 'h'],
-    ['メニュー「自動実行を設定（走査:平日18時/保有確認:毎時）」で以下の2つを設定します。', 'p'],
-    ['① 全銘柄走査 … 平日18時に1回、全銘柄の株価を取得して酒田五法シグナルを走査（重い処理）', 'p'],
-    ['② 購入ポートフォリオ確認 … 毎時、SBI保有銘柄をシグナルシート上で最新のハイライトに更新（株価取得はしない）', 'p'],
-    ['   ※いずれも東証の立会対象（営業日9:00-17:00、土日祝・年末年始は除外）のときだけ実行', 'p'],
+    ['メニュー「自動実行を設定」で以下の3つを設定します。', 'p'],
+    ['① 相場マクロ更新 … 毎日17時、地合いと急落サインを更新（走査の前に走らせる）', 'p'],
+    ['② 全銘柄走査 … 平日18時に1回、全銘柄の株価を取得して酒田五法シグナルを走査（重い処理）', 'p'],
+    ['③ 購入ポートフォリオ確認 … 毎時、SBI保有銘柄をシグナルシート上で最新のハイライトに更新（株価取得はしない）', 'p'],
+    ['   ※いずれも休場日（土日祝・年末年始）はスキップします', 'p'],
+    ['   ※パターン成績の集計は自動実行しません（必要なときにメニューから実行）', 'p'],
     ['', 'p'],
     ['■ 検出する酒田五法', 'h'],
     ['赤三兵 … 陽線3本の切り上げ（買い）', 'p'],
@@ -1023,6 +1095,15 @@ function createUsageSheet() {
     ['', 'p'],
     ['■ 注意', 'h'],
     ['・シグナルは補助情報です。だましもあります。必ず自身で確認してください。', 'note'],
+    ['・★は「形の強さ」であって期待収益ではありません。', 'note'],
+    ['・損切り・利確・ポジションサイズ・銘柄分散はこのツールの対象外です。', 'note'],
+    ['・株価は分割・配当調整済み。売買代金が細い銘柄（直近20日の中央値5,000万円未満）は対象外です。', 'p'],
+    ['', 'p'],
+    ['■ 用語', 'h'],
+    ['J-Quants … 日本取引所グループ系のマーケットデータ配信サービス。プライム銘柄一覧や', 'p'],
+    ['   海外投資家の売買動向の取得に使います。利用にはAPIキーの登録が必要です。', 'p'],
+    ['スクリプトプロパティ … Apps Scriptに秘密の設定値（APIキー等）を保存する場所。', 'p'],
+    ['   Apps Scriptエディタ → 左の歯車（プロジェクトの設定） → スクリプト プロパティ から設定します。', 'p'],
   ];
 
   return UsageSheet.buildDoc(SpreadsheetApp.getActive(), SK.SHEETS.USAGE, rows);

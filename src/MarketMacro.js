@@ -20,11 +20,23 @@ const MACRO = {
   // 好決算sell-on-news(条件7): 直近WINDOW_DAYS営業日の黒字決算のうち翌日DROP_PCT超下落の
   // 割合がFREQ以上で点灯。MIN_SAMPLE未満は判定しない（手入力にフォールバック）。
   EARN: { WINDOW_DAYS: 14, DROP_PCT: 0.03, FREQ: 0.35, MIN_SAMPLE: 10 },
+  // 手入力項目がこの日数を超えて更新されていなければ「古い」とみなして警告する。
+  // 値だけ見ていると更新忘れに気づけず、数か月前の需給で地合いを判定してしまうため。
+  STALE_DAYS: 10,
 };
 
 // ── 純ロジック（GAS非依存・ヘッドレステスト可能） ───────────────────────────
 
-// 地合い：東証 売残(億円) と 東証 信用倍率(買残÷売残) から3区分。
+/**
+ * 地合い：東証 売残(億円) と 信用倍率 から3区分。
+ *
+ * 【注意・既知の非整合】この2つは母集団が違う。売残は東証全体（金額ベース・億円）だが、
+ * 信用倍率は日経レバ1570というETF単体の値（買残株÷売残株）を使っている。
+ * 1570を使っているのは、東証全体の倍率（9倍前後）では RATIO_PIVOT=1.0 の条件が
+ * 成立しないため。異なる母集団を1つの判定に混ぜている点は承知の上の割り切りで、
+ * 「東証全体の需給」と読むと誤るので、シート上でも1570表記のまま出している。
+ * SELL_THRESHOLD_OKU=8000 も名目円の固定値で、時価総額・売買代金による正規化はしていない。
+ */
 function marginRegime_(sellBalOku, ratio) {
   const T = SK.MARGIN.SELL_THRESHOLD_OKU, P = SK.MARGIN.RATIO_PIVOT;
   const s = Number(sellBalOku), r = Number(ratio);
@@ -122,6 +134,18 @@ function parseNikkeiEpsHtml_(html) {
   if (out.length < 6) return null;
   out.sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : 0; });  // 新しい順
   var latest = out[0].eps, prior = out[5].eps;   // 約1週間前(5営業日前)と比較
+
+  // この抽出は「日付の後に現れる2000〜5500の最初の小数」というヒューリスティックなので、
+  // サイト改修で無関係な数値を拾っても気づけない。EPSが1週間で大きく動くことは通常ないため、
+  // 想定外の変化率なら「取得できなかった」扱いにして手入力へ委ねる（誤った自動値で上書きしない）。
+  if (!(latest > 0) || !(prior > 0)) return null;
+  var change = Math.abs(latest - prior) / prior;
+  if (change > 0.15) {
+    Logger.log('⚠ 日経EPSの変化が想定外に大きいため採用しません: ' + prior + ' → ' + latest +
+      '（' + Math.round(change * 100) + '%）。抽出パターンがサイト改修でずれた可能性');
+    return null;
+  }
+
   var trend = latest < prior * 0.997 ? 'DOWN' : latest > prior * 1.003 ? 'UP' : 'FLAT';
   return { eps: latest, date: out[0].date, trend: trend };
 }
@@ -358,8 +382,26 @@ function findLatestMtseisan_() {
   });
   var files = (r && r.files) || [];
   if (!files.length) return null;
-  files.sort(function (a, b) { return a.name < b.name ? 1 : a.name > b.name ? -1 : 0; });  // mtseisanYYYYMMDD 降順
-  return files[0];
+  // ファイル名の日付(YYYYMMDD)を実際にパースして新しい順に並べる。
+  // 以前は名前の文字列降順だけで「最新」を決めていたため、命名が揺れると古いファイルが
+  // 選ばれ、数か月前の需給が黙って採用されることがあった。
+  var withDate = files.map(function (f) {
+    var m = String(f.name).match(/(20\d{2})(\d{2})(\d{2})/);
+    var t = m ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : -1;
+    return { file: f, t: t };
+  });
+  withDate.sort(function (a, b) { return b.t - a.t; });
+  var top = withDate[0];
+  if (top.t < 0) {
+    Logger.log('⚠ mtseisan ファイル名から日付を読み取れません: ' + top.file.name + '（名前順で代用）');
+    return top.file;
+  }
+  var ageDays = Math.floor((Date.now() - top.t) / 86400000);
+  if (ageDays > MACRO.STALE_DAYS) {
+    Logger.log('⚠ 取り込んだ mtseisan が ' + ageDays + '日前のものです（' + top.file.name + '）。JPXから最新版をDLしてください');
+  }
+  top.file.ageDays = ageDays;
+  return top.file;
 }
 
 // Drive上の .xls を Google スプレッドシートに変換したコピーを作り fileId を返す。
@@ -406,17 +448,27 @@ function writeMacroInputValues_(pairs) {   // pairs: [{ re, value }]
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(MACRO.INPUT_SHEET); if (!sh) sh = setupMacroSheets_().input;
   var rows = Math.max(sh.getLastRow(), 1);
-  var vals = sh.getRange(1, 1, rows, 2).getValues();
-  // 該当行ごとに setValue を呼ばず、B列全体を組み立てて一度に書き戻す（API呼び出しを1回にする）
+  var vals = sh.getRange(1, 1, rows, 3).getValues();
+  // 該当行ごとに setValue を呼ばず、B列・C列を組み立てて一度に書き戻す（API呼び出しを減らす）
   var out = vals.map(function (r) { return [r[1]]; });
+  var stamps = vals.map(function (r) { return [r[2]]; });
+  var today = new Date();
   var changed = false;
   for (var i = 0; i < vals.length; i++) {
     var k = String(vals[i][0] || '');
     for (var j = 0; j < pairs.length; j++) {
-      if (pairs[j].value != null && pairs[j].re.test(k)) { out[i] = [pairs[j].value]; changed = true; break; }
+      if (pairs[j].value != null && pairs[j].re.test(k)) {
+        out[i] = [pairs[j].value];
+        stamps[i] = [today];   // 自動取得できた項目は更新日も一緒に打つ
+        changed = true; break;
+      }
     }
   }
-  if (changed) sh.getRange(1, 2, rows, 1).setValues(out);
+  if (changed) {
+    sh.getRange(1, 2, rows, 1).setValues(out);
+    sh.getRange(1, 3, rows, 1).setValues(stamps);
+    sh.getRange(2, 3, Math.max(rows - 1, 1), 1).setNumberFormat('yyyy/MM/dd');
+  }
 }
 
 // 「相場マクロ」シート（A列=項目 / B列=値）から手入力値を読む。無ければ作成。
@@ -424,20 +476,56 @@ function readMacroInputSheet_() {
   const ss = SpreadsheetApp.getActive();
   let sh = ss.getSheetByName(MACRO.INPUT_SHEET);
   if (!sh) sh = setupMacroSheets_().input;
-  const rows = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2).getValues();
+  const rows = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 3).getValues();
   // ラベルはキーワードで照合（旧「二市場売残」等が残っていても拾えるよう寛容に）
   const find = (re) => { for (var i = 0; i < rows.length; i++) { if (re.test(String(rows[i][0] || ''))) return rows[i][1]; } return undefined; };
+  // C列の最終更新日から鮮度を見る。値だけでは「更新済み」と「放置」を区別できない。
+  const age = (re) => {
+    for (var i = 0; i < rows.length; i++) {
+      if (!re.test(String(rows[i][0] || ''))) continue;
+      const d = rows[i][2];
+      if (!(d instanceof Date) || isNaN(d.getTime())) return null;   // 未記入は不明
+      return Math.floor((Date.now() - d.getTime()) / 86400000);
+    }
+    return null;
+  };
+  const items = {
+    sell_margin_oku:  { re: /売残.*億|売残高/,   label: '東証 売残' },
+    margin_ratio:     { re: /信用倍率/,          label: '信用倍率' },
+    nikkei_eps_trend: { re: /EPS/,               label: '日経平均EPSトレンド' },
+    foreign_net_oku:  { re: /海外/,              label: '海外投資家 現物ネット' },
+    earnings_selloff: { re: /決算|sell/i,        label: '好決算sell-on-news' },
+  };
+  // 古い／日付未記入の項目名を集めて、判定結果と一緒に表示できるようにする
+  const stale = [];
+  Object.keys(items).forEach((k) => {
+    const a = age(items[k].re);
+    if (a == null) stale.push(items[k].label + '(日付未記入)');
+    else if (a > MACRO.STALE_DAYS) stale.push(items[k].label + '(' + a + '日前)');
+  });
+
   return {
-    sell_margin_oku:  find(/売残.*億|売残高/),
-    margin_ratio:     find(/信用倍率/),
-    nikkei_eps_trend: String(find(/EPS/) || 'FLAT').toUpperCase(),
-    foreign_net_oku:  find(/海外/),
-    earnings_selloff: String(find(/決算|sell/i) || 'NO').toUpperCase(),
+    sell_margin_oku:  find(items.sell_margin_oku.re),
+    margin_ratio:     find(items.margin_ratio.re),
+    nikkei_eps_trend: String(find(items.nikkei_eps_trend.re) || 'FLAT').toUpperCase(),
+    foreign_net_oku:  find(items.foreign_net_oku.re),
+    earnings_selloff: String(find(items.earnings_selloff.re) || 'NO').toUpperCase(),
+    stale: stale,
   };
 }
 
 // メニュー本体：手入力＋自動(NS/VIX)から7条件を判定し「急落サイン」へ出力、地合いをキャッシュ。
 function updateMarketMacro() {
+  // 休場日は各種データが更新されないため、古い値で地合いを計算し直して上書きしても意味がない。
+  // scheduledScan には営業日ガードがあるのに、こちらには無く土日祝も走っていた。
+  // 手動実行（メニュー）は確認のため回したいこともあるので、トリガー起動時のみ止める。
+  try {
+    if (!isBusinessDay_(new Date()) && !isUserTriggered_()) {
+      Logger.log('休場日のため相場マクロの更新をスキップ');
+      return;
+    }
+  } catch (e) { /* 営業日判定が使えない環境でも更新自体は続行する */ }
+
   const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls（売残億円）を自動取込
   const r1570 = fetch1570MarginRatio_();                       // 信用倍率は日経レバ1570（<1.0になり得る）
   const marginRatio = r1570 ? r1570.ratio : null;              // 1570のみ。取得不可時は手入力値を使う（東証全体9.21は使わない）
@@ -479,12 +567,16 @@ function updateMarketMacro() {
     ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力') +
     ' ・海外投資家=' + (flow ? flow.netOku + '億(' + flow.week + ')' : '手入力') +
     ' ・好決算sell=' + (earn ? (earn.alert ? 'YES' : 'NO') + '(' + earn.drops + '/' + earn.total + ')' : '手入力'));
+  // 入力の欠損・古さは、判定結果(N/7)だけ見ていると気づけない。必ず表に出す。
+  const stale = (manual.stale || []).slice(0, 4);
   try {
     SpreadsheetApp.getActive().toast(
       (tse ? '東証売残' + tse.sellOku + '億' : '⚠ mtseisan未取込') +
       '・倍率' + (r1570 ? r1570.ratio + '(1570)' : '手入力') +
-      ' ・急落' + lit + '/7 ・地合い' + regime, '相場マクロ', 8);
-  } catch (e) {}
+      ' ・急落' + lit + '/7 ・地合い' + regime +
+      (stale.length ? '\n⚠ 古い入力: ' + stale.join('、') : ''), '相場マクロ', stale.length ? 15 : 8);
+  } catch (e) { Logger.log('トースト表示に失敗: ' + e.message); }
+  if (stale.length) Logger.log('⚠ 更新が古い/日付未記入の項目: ' + stale.join('、'));
 }
 
 // finalizeSignals_(Code.js) が参照する現在の地合い。未更新時は NEUTRAL。
@@ -492,20 +584,46 @@ function getMarketRegime_() {
   return PropertiesService.getScriptProperties().getProperty(MACRO.REGIME_PROP) || 'NEUTRAL';
 }
 
+/**
+ * メニューから手動で呼ばれたか（＝UIが使えるか）を判定する。
+ * トリガー起動では getUi() が例外になるため、それを利用する。
+ */
+function isUserTriggered_() {
+  try { SpreadsheetApp.getUi(); return true; } catch (e) { return false; }
+}
+
+// 内部の英語enum（DOWN / GOLDEN_CROSS 等）をそのまま表示すると意味が伝わらないため日本語にする
+function macroValueLabel_(v) {
+  if (v == null || v === '') return '';
+  const s = String(v);
+  const dict = {
+    UP: '上昇', DOWN: '下落', FLAT: '横ばい',
+    GOLDEN_CROSS: 'ゴールデンクロス', DEAD_CROSS: 'デッドクロス', NONE: 'クロスなし',
+    YES: 'あり', NO: 'なし',
+  };
+  return dict[s] || s;
+}
+
 function writeAlertSheet_(conds, lit, data) {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(MACRO.ALERT_SHEET) || ss.insertSheet(MACRO.ALERT_SHEET);
   sh.clear();
   const regime = marginRegime_(data.sell_margin_oku, data.margin_ratio);
+  // 点灯数だけでは強弱が読み取れないため、目安を併記する
+  const scale = lit >= 5 ? '（5件以上＝警戒領域）' : lit >= 3 ? '（3〜4件＝注意）' : '（2件以下＝落ち着いている）';
   const rows = [
-    ['急落サイン 点灯数', lit + ' / 7'],
+    ['急落サイン 点灯数', lit + ' / 7' + scale],
     ['市場地合い', regime + (regime === 'SHORT_COVER' ? '（ショートカバー好機・買い追い風）'
       : regime === 'SUPPLY_RISK' ? '（需給悪化・売り警戒）' : '（中立）')],
-    ['更新', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm')],
-    ['', ''],
-    ['条件', '状態', '値'],
+    ['この表を更新した時刻', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm')
+      + '（※データそのものの基準日は「相場マクロ」シートのC列を参照）'],
   ];
-  conds.forEach(c => rows.push([c.condition, c.alert ? '⚠ 点灯' : '正常', c.value == null ? '' : String(c.value)]));
+  // 入力が古いままだと、判定は動いていても中身は数か月前の需給ということが起きる
+  const stale = data.stale || [];
+  if (stale.length) rows.push(['⚠ 更新が古い/日付未記入の入力', stale.join('、')]);
+  rows.push(['', '']);
+  rows.push(['条件', '状態', '値']);
+  conds.forEach(c => rows.push([c.condition, c.alert ? '⚠ 点灯' : '正常', macroValueLabel_(c.value)]));
   // 列数を3に揃える
   const width = 3;
   const grid = rows.map(r => { const a = r.slice(0, width); while (a.length < width) a.push(''); return a; });
@@ -514,23 +632,43 @@ function writeAlertSheet_(conds, lit, data) {
   sh.setTabColor('#c0392b');
 }
 
+/**
+ * 相場マクロ入力シートに入力規則（プルダウン）を張る。
+ * EPSトレンドと sell-on-news は決まった語しか受け付けないが、自由入力だったため
+ * 誤記が黙って既定値へフォールバックし、入力したつもりの値が効いていなかった。
+ */
+function applyMacroValidation_(sh, lastRow) {
+  const rows = sh.getRange(1, 1, Math.max(lastRow, sh.getLastRow()), 1).getValues();
+  const mk = (list) => SpreadsheetApp.newDataValidation()
+    .requireValueInList(list, true).setAllowInvalid(false)
+    .setHelpText('次のいずれかを選んでください: ' + list.join(' / ')).build();
+  for (let i = 0; i < rows.length; i++) {
+    const k = String(rows[i][0] || '');
+    if (/EPS/.test(k))            sh.getRange(i + 1, 2).setDataValidation(mk(['UP', 'FLAT', 'DOWN']));
+    else if (/決算|sell/i.test(k)) sh.getRange(i + 1, 2).setDataValidation(mk(['YES', 'NO']));
+  }
+}
+
 // 「相場マクロ」入力シートを作成（初回のみ・既定値入り）。
 function setupMacroSheets_() {
   const ss = SpreadsheetApp.getActive();
   let input = ss.getSheetByName(MACRO.INPUT_SHEET);
   if (!input) {
     input = ss.insertSheet(MACRO.INPUT_SHEET);
+    // C列は「最終更新日」。値だけだと更新忘れに気づけないため、鮮度を必ず併記する。
     const seed = [
-      ['項目', '値（東証売残・信用倍率はDLした mtseisan*.xls から自動。NS倍率/VIXも自動。他は手入力）'],
-      ['東証 売残（億円）', 8000],
-      ['信用倍率（日経レバ1570・買残÷売残。取得不可時は手入力）', 1.0],
-      ["日経平均EPSトレンド（自動取得:stock-marketdata・手入力も可）", "FLAT"],
-      ['海外投資家 現物ネット（億円・売越は負）', 0],
-      ['好決算sell-on-news 頻発（YES/NO）', 'NO'],
+      ['項目', '値（東証売残・信用倍率はDLした mtseisan*.xls から自動。NS倍率/VIXも自動。他は手入力）', '最終更新日'],
+      ['東証 売残（億円）', 8000, ''],
+      ['信用倍率（日経レバ1570・買残÷売残。取得不可時は手入力）', 1.0, ''],
+      ["日経平均EPSトレンド（自動取得:stock-marketdata・手入力も可）", "FLAT", ''],
+      ['海外投資家 現物ネット（億円・売越は負）', 0, ''],
+      ['好決算sell-on-news 頻発（YES/NO）', 'NO', ''],
     ];
-    input.getRange(1, 1, seed.length, 2).setValues(seed);
-    try { styleSheet_(input, 2, '#141a33', '#eef1fb'); autoFit_(input, 2); } catch (e) {}
+    input.getRange(1, 1, seed.length, 3).setValues(seed);
+    try { styleSheet_(input, 3, '#141a33', '#eef1fb'); autoFit_(input, 3); } catch (e) {}
     input.setColumnWidth(1, 300);
+    input.getRange(2, 3, seed.length - 1, 1).setNumberFormat('yyyy/MM/dd');
+    applyMacroValidation_(input, seed.length);
     input.setTabColor('#8e44ad');
   }
   return { input };

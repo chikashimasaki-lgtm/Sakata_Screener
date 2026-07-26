@@ -37,6 +37,18 @@ const SK = {
   // Yahoo が 429（レート制限）や 5xx を返したときの再試行回数と初回待ち時間（指数バックオフ）
   FETCH_RETRY: 2,
   FETCH_BACKOFF_MS: 1500,
+  // 「大陽線/大陰線」とみなす実体の大きさ（直近平均実体の何倍か）。
+  // 1.0（＝平均以上）だと半数が該当してしまうため、はっきり大きいものだけを拾う。
+  BIG_BODY_MULT: 1.3,
+  // 毛抜き天井/底で「ほぼ同値」とみなす許容幅（ATRの何倍か）
+  TWEEZER_ATR: 0.15,
+  // MACDのGC/DC判定に必要な最低バー数。EMA26は先頭値シードのため収束に時間がかかり、
+  // 30本ではヒストグラムの符号が約12%の確率で誤る（60本で約1%、90本でほぼ0%）。
+  MACD_MIN_BARS: 60,
+  // 三山/三川の両肩の高さ許容差。5%は両肩の差として広く、形が崩れたものまで拾っていた。
+  HS_TOL: 0.03,
+  // 山と山の最低間隔（バー数）。隣接した極値の寄せ集めを「三山」と呼ばないため。
+  HS_MIN_GAP: 4,
 };
 
 // 実績スコアリング設定（バックテスト学習・自動修正）
@@ -489,6 +501,36 @@ function parseYahooBars_(res) {
 }
 
 /**
+ * 直近の平均実体。判定対象のバー自身を基準に含めると「平均より大きい」が自己言及になり、
+ * さらに基準が単純平均なので約半数が「大陽線」と判定されていた。
+ * 末尾 exclude 本（＝いま判定しているバー）を除いた区間で測る。
+ */
+function avgBody_(bars, lookback, exclude) {
+  const end = Math.max(0, bars.length - exclude);
+  const start = Math.max(0, end - lookback);
+  let sum = 0, cnt = 0;
+  for (let i = start; i < end; i++) { sum += Math.abs(bars[i].c - bars[i].o); cnt++; }
+  return cnt ? sum / cnt : 0;
+}
+
+/**
+ * 平均トゥルーレンジ（ATR）。末尾 exclude 本を除いた区間で測る。
+ * 「ほぼ同値」の判定を固定％にすると、値がさ株では常に成立し低位株では永久に成立しない。
+ * 値動きの実寸を基準にするため ATR を使う。
+ */
+function atr_(bars, lookback, exclude) {
+  const end = Math.max(0, bars.length - exclude);
+  const start = Math.max(1, end - lookback);
+  let sum = 0, cnt = 0;
+  for (let i = start; i < end; i++) {
+    const p = bars[i - 1], b = bars[i];
+    sum += Math.max(b.h - b.l, Math.abs(b.h - p.c), Math.abs(b.l - p.c));
+    cnt++;
+  }
+  return cnt ? sum / cnt : 0;
+}
+
+/**
  * 直近の売買代金（終値×出来高）の中央値。出来高が取れない銘柄は null。
  * 平均でなく中央値を使うのは、1日だけの大口約定で薄商いの銘柄が通過するのを避けるため。
  */
@@ -685,11 +727,13 @@ function detectSakata_(bars) {
 
   // 赤三兵: 直近3本が陽線・終値切り上げ・始値切り上げ（上昇転換/継続）
   if (bull(A) && bull(B) && bull(C) && A.c > B.c && B.c > C.c && A.o > B.o && B.o > C.o) {
-    sig.push({ name: '赤三兵', dir: '買い' });
-    // 先詰まり赤三兵: 3本目の実体が縮み上ヒゲが長い＝失速・買われ過ぎ警戒（売り）
+    // 先詰まり赤三兵: 3本目の実体が縮み上ヒゲが長い＝失速・買われ過ぎ警戒（売り）。
+    // これは赤三兵の一形態であって、同時に「買い」と「売り」が成立するわけではない。
+    // 以前は両方を積んでいたため行が「混在」になり、地合い係数(regimeFactor_)も
+    // 1倍のまま無効化されて順位に反映されなくなっていた。失速形なら売りだけを採る。
     const bodyA = A.c - A.o, upWickA = A.h - A.c;
-    if (bodyA < (B.c - B.o) && upWickA > bodyA)
-      sig.push({ name: '先詰まり赤三兵(警戒)', dir: '売り' });
+    if (bodyA < (B.c - B.o) && upWickA > bodyA) sig.push({ name: '先詰まり赤三兵(警戒)', dir: '売り' });
+    else sig.push({ name: '赤三兵', dir: '買い' });
   }
 
   // 三羽烏(黒三兵): 直近3本が陰線・終値切り下げ・始値切り下げ（下落転換/継続）
@@ -709,11 +753,15 @@ function detectSakata_(bars) {
   }
 
   // 上げ三法: E長陽 → D,C,B が E の値幅内で調整 → A が E 高値を上抜けの陽線（上昇継続）
-  if (bull(E) && [D, C, B].every(x => x.h <= E.h && x.l >= E.l) && bull(A) && A.c > E.h)
+  // 下げ三法: E長陰 → D,C,B が E の値幅内 → A が E 安値を下抜けの陰線（下落継続）
+  // 起点Eは「長い」陽線/陰線であることが定義だが、以前は bull(E)/bear(E) しか見ておらず、
+  // 単に5本のインサイド調整であれば点灯していた（READMEの説明とも食い違っていた）。
+  const avgBodyE = avgBody_(bars, 10, 5);
+  const eBig = avgBodyE > 0 && Math.abs(E.c - E.o) >= avgBodyE * SK.BIG_BODY_MULT;
+  if (eBig && bull(E) && [D, C, B].every(x => x.h <= E.h && x.l >= E.l) && bull(A) && A.c > E.h)
     sig.push({ name: '上げ三法', dir: '買い' });
 
-  // 下げ三法: E長陰 → D,C,B が E の値幅内 → A が E 安値を下抜けの陰線（下落継続）
-  if (bear(E) && [D, C, B].every(x => x.h <= E.h && x.l >= E.l) && bear(A) && A.c < E.l)
+  if (eBig && bear(E) && [D, C, B].every(x => x.h <= E.h && x.l >= E.l) && bear(A) && A.c < E.l)
     sig.push({ name: '下げ三法', dir: '売り' });
 
   // 上放れ二羽烏: C陽線 → 窓を開けて陰線B → 陰線Aが陰線Bを包むが窓は埋めない（天井・売り）
@@ -730,11 +778,16 @@ function detectSakata_(bars) {
   detectReversalPairs_(bars).forEach(s => sig.push(s));
 
   // MACD(12,26,9) ゴールデン/デッドクロス（直近バーでのクロス）
-  const mac = macdSeries_(bars.map(b => b.c), 12, 26, 9);
-  const mN = mac.macd[n - 1], sN = mac.signal[n - 1], mP = mac.macd[n - 2], sP = mac.signal[n - 2];
-  if (mN != null && sN != null && mP != null && sP != null) {
-    if (mP <= sP && mN > sN) sig.push({ name: 'MACDゴールデンクロス', dir: '買い' });
-    if (mP >= sP && mN < sN) sig.push({ name: 'MACDデッドクロス', dir: '売り' });
+  // EMAは先頭値をシードにするため、バー数が少ないとEMA26がほぼ初日終値のままになり、
+  // 意味のないクロスが出る。macd[0]は常に0で null にならないので、
+  // null チェックだけでは弾けない。必要バー数を明示的に要求する。
+  if (n >= SK.MACD_MIN_BARS) {
+    const mac = macdSeries_(bars.map(b => b.c), 12, 26, 9);
+    const mN = mac.macd[n - 1], sN = mac.signal[n - 1], mP = mac.macd[n - 2], sP = mac.signal[n - 2];
+    if (mN != null && sN != null && mP != null && sP != null) {
+      if (mP <= sP && mN > sN) sig.push({ name: 'MACDゴールデンクロス', dir: '買い' });
+      if (mP >= sP && mN < sN) sig.push({ name: 'MACDデッドクロス', dir: '売り' });
+    }
   }
 
   return sig;
@@ -756,11 +809,11 @@ function detectReversalPairs_(bars) {
   const mid  = b => (b.o + b.c) / 2;
   const uBody = b => Math.max(b.o, b.c), lBody = b => Math.min(b.o, b.c);
 
-  // 平均実体（大陽線/大陰線の基準）
-  let avg = 0; const m = Math.min(10, n - 1);
-  for (let i = n - 1 - m; i < n - 1; i++) avg += body(bars[i]);
-  avg /= (m || 1);
-  const bBig = body(B) >= avg;   // 前日は大きめの実体
+  // 大陽線/大陰線の基準。判定対象のA・Bを除いた直近10本の平均実体に倍率をかける。
+  // 以前は基準の算定区間にB自身を含み、しかも倍率なしの単純平均だったため、
+  // 約半数のバーが「大きめの実体」と判定され、かぶせ線・はらみ線が量産されていた。
+  const avg = avgBody_(bars, 10, 2);
+  const bBig = avg > 0 && body(B) >= avg * SK.BIG_BODY_MULT;
 
   // かぶせ線（売り）
   if (bBig && bull(B) && bear(A) && A.o > B.c && A.c < mid(B) && A.c > B.o)
@@ -782,7 +835,10 @@ function detectReversalPairs_(bars) {
   if (bBig && inside && bull(B)) out.push({ name: 'はらみ線(弱気)', dir: '売り' });
 
   // 毛抜き天井/底: 高値/安値がほぼ同値
-  const eq = (x, y) => Math.abs(x - y) <= (Math.abs(y) || 1) * 0.002;
+  // 以前は固定0.2%だったため、300円株では1ティック未満で永久に不点灯、
+  // 10000円株では20ティック幅が「同値」となり常時点灯していた。ATR基準にする。
+  const tol = atr_(bars, 14, 2) * SK.TWEEZER_ATR || (Math.abs(A.c) || 1) * 0.002;
+  const eq = (x, y) => Math.abs(x - y) <= tol;
   if (bull(B) && bear(A) && eq(A.h, B.h)) out.push({ name: '毛抜き天井', dir: '売り' });
   if (bear(B) && bull(A) && eq(A.l, B.l)) out.push({ name: '毛抜き底', dir: '買い' });
 
@@ -804,13 +860,10 @@ function detectStars_(bars) {
   const mid   = b => (b.o + b.c) / 2;      // 実体中心
   const bull  = b => b.c > b.o, bear = b => b.c < b.o;
 
-  // 直近10本の平均実体（中日前の「長大線」判定の基準）
-  const m = Math.min(10, n);
-  let avg = 0;
-  for (let i = n - m; i < n; i++) avg += body(bars[i]);
-  avg /= (m || 1);
-
-  const cBig  = body(C) >= avg;                     // 中日前は長大線
+  // 「長大線」判定の基準。判定対象のA・B・Cを除いた直近10本の平均実体に倍率をかける。
+  // 以前は算定区間にA・B・C自身を含み倍率も無かったため、基準が甘くなっていた。
+  const avg = avgBody_(bars, 10, 3);
+  const cBig  = avg > 0 && body(C) >= avg * SK.BIG_BODY_MULT;   // 中日前は長大線
   const bStar = body(B) <= body(C) * 0.5;           // 中央は小さな実体（星／コマ）
   const bDoji = body(B) <= (B.h - B.l) * 0.1;       // ほぼ同事線（寄引同値）
   // 明星は「窓を開けて放れる」形が本質なので、データ欠損で日付が飛んでいる区間では判定しない
@@ -840,7 +893,10 @@ function findExtrema_(vals, w, isPeak) {
     let ok = true;
     for (let k = i - w; k <= i + w; k++) {
       if (k === i) continue;
-      if (isPeak ? vals[k] > vals[i] : vals[k] < vals[i]) { ok = false; break; }
+      // 同値を「厳密により大きい／小さい」で比較しているため、同じ高値が並ぶと
+      // 隣り合うバーが両方ピークとして拾われる。左側は同値も不可として1つに絞る。
+      const tie = vals[k] === vals[i];
+      if (isPeak ? (vals[k] > vals[i] || (tie && k < i)) : (vals[k] < vals[i] || (tie && k < i))) { ok = false; break; }
     }
     if (ok) idx.push(i);
   }
@@ -854,11 +910,15 @@ function detectHeadShoulders_(bars, rsi) {
   if (n < 25) return out;
   const highs = bars.map(b => b.h), lows = bars.map(b => b.l);
   const close = bars[n - 1].c;
-  const W = 3, TOL = 0.05;  // 両肩の高さ許容差 5%
+  // 両肩の高さ許容差。5%は両肩の差として広すぎ、形として成立していないものまで拾っていた。
+  const W = 3, TOL = SK.HS_TOL;
+  // 三山/三川は「山が3つ並んでいる」ことが形の要件で、隣接した極値の寄せ集めではない。
+  // 山と山の間に最低限の間隔を要求する。
+  const spaced = (a, b, c) => (b - a) >= SK.HS_MIN_GAP && (c - b) >= SK.HS_MIN_GAP;
 
   // 三山(三尊天井): 直近ピーク3つ 左肩<頭>右肩、両肩が近い、ネックライン割れ
   const pk = findExtrema_(highs, W, true);
-  if (pk.length >= 3) {
+  if (pk.length >= 3 && spaced.apply(null, pk.slice(-3))) {
     const [a, b, c] = pk.slice(-3);
     const ha = highs[a], hb = highs[b], hc = highs[c];
     if (hb > ha && hb > hc && Math.abs(ha - hc) / hb < TOL) {
@@ -880,7 +940,7 @@ function detectHeadShoulders_(bars, rsi) {
   }
   // 三川(逆三尊): 直近トラフ3つ 左肩>頭<右肩、両肩が近い、ネックライン上抜け
   const tr = findExtrema_(lows, W, false);
-  if (tr.length >= 3) {
+  if (tr.length >= 3 && spaced.apply(null, tr.slice(-3))) {
     const [a, b, c] = tr.slice(-3);
     const la = lows[a], lb = lows[b], lc = lows[c];
     if (lb < la && lb < lc && Math.abs(la - lc) / Math.abs(lb || 1) < TOL) {

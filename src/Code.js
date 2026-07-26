@@ -2,8 +2,10 @@
 //  酒田五法 シグナル・スクリーナー
 //  ---------------------------------------------------------------------------
 //  株価API（Yahoo Finance 日足）から多銘柄をスキャンし、酒田五法のシグナルが
-//  点灯した銘柄を一覧化する。GitHub Pages 表示用の JSON も出力する。
+//  点灯した銘柄を一覧化する。UI はスプレッドシートのみ（公開ページ・JSON出力は廃止）。
 //  ※ 投資助言ではなく、シグナル抽出の補助ツール。
+//  ※ シグナルの重みは静的（SIGNAL_WEIGHT_）。「パターン成績」の集計値は参考表示のみで
+//    順位付けには使わない（統計的裏付けを欠くため。suggestWeight_ のコメント参照）。
 //
 //  実装パターン: 赤三兵 / 三羽烏(黒三兵) / 三空踏み上げ / 三空叩き込み /
 //               上げ三法 / 下げ三法 / 三山(三尊天井) / 三川(逆三尊) /
@@ -27,6 +29,11 @@ const SK = {
   // 直近 LIQ_DAYS 日の売買代金（終値×出来高）中央値が LIQ_MIN_TURNOVER 未満なら走査対象外。
   LIQ_DAYS: 20,
   LIQ_MIN_TURNOVER: 50 * 1000 * 1000,   // 5,000万円/日
+  // 強さ★の絶対しきい値（重み合計×地合い係数のスコアに対して適用）。
+  // 相対順位だと「全銘柄が弱い日でも上位1/3が必ず★★★になる」ため絶対値で切る。
+  // 重みは1〜3（SIGNAL_WEIGHT_）なので、★★★=強いパターン1つ＋確認、★★=強いパターン1つ相当。
+  STAR3: 5,
+  STAR2: 3,
 };
 
 // 実績スコアリング設定（バックテスト学習・自動修正）
@@ -42,9 +49,9 @@ function onOpen() {
     .addSeparator()
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行',            'scanSignals')
-    .addItem('実績バックテスト（重みを自動学習）', 'backtestWeights')
+    .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights')
     .addItem('相場マクロ/急落サインを更新', 'updateMarketMacro')
-    .addItem('自動実行を設定（走査:平日18時/保有確認:毎時/実績学習:月次）', 'installDailyScanTrigger')
+    .addItem('自動実行を設定（走査:平日18時/保有確認:毎時）', 'installDailyScanTrigger')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
     .addItem('走査の進捗リセット',           'resetScanQueue')
@@ -197,9 +204,10 @@ function installDailyScanTrigger() {
   ScriptApp.newTrigger('updateMarketMacro').timeBased().everyDays(1).atHour(17).create();    // 相場マクロ/急落サイン・地合い更新（走査の前）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
   ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();            // 購入ポートフォリオ確認（毎時）
-  ScriptApp.newTrigger('scheduledBacktest').timeBased().onMonthDay(1).atHour(20).create();  // 実績を月次で自動学習し直す（自動修正）
-  SpreadsheetApp.getActive().toast('自動実行を設定しました（走査:平日18時 / 保有確認:毎時 / 実績学習:毎月1日）', '酒田五法', 6);
-  Logger.log('トリガー設定: scheduledScan(平日18時) / scheduledHeldCheck(毎時) / scheduledBacktest(毎月1日)');
+  // 月次の自動学習トリガーは設定しない。集計結果を順位付けに使わなくなったため、
+  // 全銘柄分のYahoo取得を毎月自動で走らせる必要がない（必要ならメニューから手動実行する）。
+  SpreadsheetApp.getActive().toast('自動実行を設定しました（走査:平日18時 / 保有確認:毎時）', '酒田五法', 6);
+  Logger.log('トリガー設定: scheduledScan(平日18時) / scheduledHeldCheck(毎時) / updateMarketMacro(17時)');
 }
 
 // 平日18時に発火。全銘柄の株価取得＋シグナル走査（重い処理・1日1回）。
@@ -227,22 +235,19 @@ function finalizeSignals_(sig) {
   if (sig.getLastRow() < 2) return;
   const n = sig.getLastRow() - 1;
 
-  // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き）。実績DB(過去6ヶ月バックテスト)があれば実績スコアで。
-  const statsMap = readStatsSheet_();
+  // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き）。重みは静的（SIGNAL_WEIGHT_）。
   const regime = getMarketRegime_();   // 信用需給の地合い（MarketMacro.js）。買い/売りスコアに反映。
   const data = sig.getRange(2, 1, n, 9).getValues();
-  // 強さ = 実績重み合計 × 地合い係数（row[6]=方向 買い/売り。地合いで順位が動く）
-  const scoreOf = row => signalStrength_(row[7], statsMap) * regimeFactor_(regime, row[6]);
+  // 強さ = 静的重み合計 × 地合い係数（row[6]=方向 買い/売り。地合いで順位が動く）
+  const scoreOf = row => signalStrength_(row[7]) * regimeFactor_(regime, row[6]);
   data.sort((a, b) => scoreOf(b) - scoreOf(a));
 
-  // 強さ★は「相対順位」で付与（上位1/3=★★★, 中位=★★, 下位=★）。
-  // 実績スコア(平均騰落率%)と静的重み(1〜3)は尺度が違うため、絶対しきい値ではなく順位で分布させる。
+  // 強さ★は絶対しきい値で付与する。以前は相対順位（上位1/3=★★★）だったため、
+  // 全銘柄が弱いシグナルしか出ていない日でも必ず★★★が並び、強さを誤認させていた。
   const scores = data.map(scoreOf);
-  const asc = scores.slice().sort((a, b) => a - b);
-  const t1 = asc[Math.floor(n / 3)], t2 = asc[Math.floor(n * 2 / 3)];
   data.forEach((row, i) => {
     const s = scores[i];
-    row[1] = s >= t2 ? '★★★' : s >= t1 ? '★★' : '★';    // 方向(7列目)を矢印付きバッジに整形
+    row[1] = s >= SK.STAR3 ? '★★★' : s >= SK.STAR2 ? '★★' : '★';    // 方向(7列目)を矢印付きバッジに整形
     const d = String(row[6] || '');
     row[6] = d === '買い' ? '▲ 買い' : d === '売り' ? '▼ 売り' : d === '混在' ? '◆ 混在' : d;
   });
@@ -479,22 +484,34 @@ function parseSignalNames_(cellText) {
   return String(cellText || '').split('\n').map(s => s.replace(/^・/, '').trim()).filter(Boolean);
 }
 
-// 推奨重み(成績シートH列)：実績が十分あれば勝率で3段階、不足なら静的重みで代替
+/**
+ * 成績シートに出す「参考重み」。**順位付けには使わない**（下の patternPoints_ を参照）。
+ *
+ * 以前はこの値をそのままスコアに使っていたが、次の理由で統計的な裏付けを欠くため取りやめた：
+ *  - 評価が生の騰落率のみで、ベンチマーク（日経平均等）を控除していない。上昇相場では
+ *    買いパターンが軒並み高勝率と出るだけで、パターン固有の優位性を測れていない。
+ *  - BT_MIN_SAMPLE=20 に対し勝率60%/50%で3段階に切っているが、n=20 の勝率の標準誤差は
+ *    約11ptあり、60%と50%は統計的に区別できない。有意性検定も行っていない。
+ *  - 連日判定のため同一シグナルが複数日に重複計上され、実効サンプル数が水増しされている。
+ *  - 約定を当日終値と仮定しているが、走査は18時（終値確定後）なので実際には翌日寄付。
+ *    手数料・スプレッドも未考慮。
+ * 集計値そのものは傾向を眺める材料として残すが、スコアには反映しない。
+ */
 function suggestWeight_(name, n, wins) {
   if (!n || n < BT_MIN_SAMPLE) return SIGNAL_WEIGHT_[name] || 1;
   const win = wins / n * 100;
   return win >= 60 ? 3 : win >= 50 ? 2 : 1;
 }
 
-// パターン1つの点数 = 推奨重み(H列)
-function patternPoints_(name, statsMap) {
-  const s = statsMap && statsMap[name];
-  return suggestWeight_(name, s ? s.n : 0, s ? s.wins : 0);
+// パターン1つの点数 = 静的重み（SIGNAL_WEIGHT_）。
+// バックテストの学習結果は上記の理由により順位付けへ反映しない。
+function patternPoints_(name) {
+  return SIGNAL_WEIGHT_[name] || 1;
 }
 
-// 傾向の強さ = 各シグナルの推奨重み(H列)の合計
-function signalStrength_(cellText, statsMap) {
-  return parseSignalNames_(cellText).reduce((sum, name) => sum + patternPoints_(name, statsMap), 0);
+// 傾向の強さ = 各シグナルの静的重みの合計
+function signalStrength_(cellText) {
+  return parseSignalNames_(cellText).reduce((sum, name) => sum + patternPoints_(name), 0);
 }
 
 function signalExplain_(names) {
@@ -865,28 +882,20 @@ function createUsageSheet() {
 //  実績スコアリング：過去6ヶ月バックテスト → パターン成績DB（重みを自動学習・自動修正）
 // ============================================================================
 
-// パターン成績シートを map に読み込む: name -> {dir, n, wins, retSum}
-function readStatsSheet_() {
-  const sh = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.STATS);
-  const map = {};
-  if (!sh || sh.getLastRow() < 2) return map;
-  // 列: パターン, 方向, 件数, 勝ち, リターン合計, 勝率%, 期待リターン%, 推奨重み
-  const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 5).getValues();
-  rows.forEach(r => {
-    const name = String(r[0] || '').trim();
-    if (name) map[name] = { dir: r[1] || '', n: Number(r[2]) || 0, wins: Number(r[3]) || 0, retSum: Number(r[4]) || 0 };
-  });
-  return map;
-}
-
-// map をパターン成績シートへ書き出す（勝率・期待リターン・推奨重みを再計算、期待リターン降順）
+// map をパターン成績シートへ書き出す（勝率・期待リターン・参考重みを再計算、期待リターン降順）
+// ※ 集計結果はシグナルの順位付けには使わない（suggestWeight_ のコメント参照）。
 function writeStatsSheet_(map) {
   const ss = SpreadsheetApp.getActive();
   let sh = ss.getSheetByName(SK.SHEETS.STATS);
   if (!sh) sh = ss.insertSheet(SK.SHEETS.STATS);
   const old = sh.getFilter(); if (old) old.remove();
   sh.clear();
-  const header = ['パターン', '方向', '件数', '勝ち', '騰落率合計', '勝率%', '平均騰落率%', '推奨重み', '先読み日'];
+  // 1行目は但し書き。この集計は順位付けに使っていないことを、シートを見た人が必ず目にする位置に置く。
+  const CAVEAT = '⚠ 参考値です。シグナルの順位付けには使っていません。'
+    + '（生の騰落率のみでベンチマーク未控除／件数' + BT_MIN_SAMPLE + '件では勝率60%と50%を統計的に区別できない'
+    + '／同一シグナルが連日重複計上される／約定を当日終値と仮定＝実際は翌日寄付、手数料未考慮）';
+  sh.getRange(1, 1).setValue(CAVEAT);
+  const header = ['パターン', '方向', '件数', '勝ち', '騰落率合計', '勝率%', '平均騰落率%', '参考重み', '先読み日'];
   const rows = Object.keys(map).map(name => {
     const s = map[name], nn = s.n || 0;
     const win = nn ? s.wins / nn * 100 : 0;
@@ -896,13 +905,23 @@ function writeStatsSheet_(map) {
             Math.round((s.retSum || 0) * 10000) / 10000, Math.round(win * 10) / 10, Math.round(exp * 100) / 100, suggest, signalHorizon_(name)];
   });
   rows.sort((a, b) => b[6] - a[6]);
-  sh.getRange(1, 1, 1, header.length).setValues([header]);
+  sh.getRange(2, 1, 1, header.length).setValues([header]);
   if (rows.length) {
-    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    sh.getRange(2, 6, rows.length, 1).setNumberFormat('0.0');
-    sh.getRange(2, 7, rows.length, 1).setNumberFormat('0.00');
+    sh.getRange(3, 1, rows.length, header.length).setValues(rows);
+    sh.getRange(3, 6, rows.length, 1).setNumberFormat('0.0');
+    sh.getRange(3, 7, rows.length, 1).setNumberFormat('0.00');
   }
+  // styleSheet_（共有モジュール）は「1行目=ヘッダー」を前提にしているため、
+  // 但し書きを1行目に置いた分は呼び出し後に上書きして整える。共有側は変更しない。
   styleSheet_(sh, header.length, '#141a33', '#eef1fb');
+  sh.getRange(1, 1, 1, header.length).merge()
+    .setBackground('#fff4f4').setFontColor('#b00020').setFontWeight('bold')
+    .setHorizontalAlignment('left').setVerticalAlignment('middle').setWrap(true);
+  sh.getRange(2, 1, 1, header.length)
+    .setBackground('#141a33').setFontColor('#ffffff').setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  sh.setFrozenRows(2);
+  sh.setRowHeight(1, 44);
   autoFit_(sh, header.length);
   sh.setTabColor('#4a90d9');
 }
@@ -986,8 +1005,10 @@ function clearBtResume_() {
   clearTriggersFor_('backtestWeights');   // 共通モジュール TriggerUtils.js
 }
 
-// 平日18時台に月次で自動学習し直す（＝実績の自動修正）。営業日のみ。
+// パターン成績の集計をトリガーから回す場合の入口（営業日のみ）。
+// 既定では installDailyScanTrigger はこれを登録しない（集計値を順位付けに使わないため）。
+// 既存プロジェクトに残っている旧トリガーが発火しても安全に動くよう関数自体は残す。
 function scheduledBacktest() {
-  if (!isBusinessDay_(new Date())) { Logger.log('休場日のためバックテストをスキップ'); return; }
+  if (!isBusinessDay_(new Date())) { Logger.log('休場日のため成績集計をスキップ'); return; }
   backtestWeights();
 }

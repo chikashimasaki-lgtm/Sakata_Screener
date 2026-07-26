@@ -34,6 +34,9 @@ const SK = {
   // 重みは1〜3（SIGNAL_WEIGHT_）なので、★★★=強いパターン1つ＋確認、★★=強いパターン1つ相当。
   STAR3: 5,
   STAR2: 3,
+  // Yahoo が 429（レート制限）や 5xx を返したときの再試行回数と初回待ち時間（指数バックオフ）
+  FETCH_RETRY: 2,
+  FETCH_BACKOFF_MS: 1500,
 };
 
 // 実績スコアリング設定（バックテスト学習・自動修正）
@@ -119,39 +122,56 @@ function fetchPrimeUniverse() {
 function scanSignals() {
   // 自動再開トリガーと手動実行が重なった場合の二重追記を防ぐ（多重実行排他）
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(1000)) { Logger.log('別の走査が進行中のためスキップ'); return; }
+  if (!lock.tryLock(1000)) {
+    // 以前はログだけで黙って return しており、定期走査が再開処理とぶつかると
+    // その日の走査が実行されないまま気づかれなかった。次回に持ち越す。
+    Logger.log('別の走査が進行中のためスキップ（90秒後に再試行）');
+    clearResumeTriggers_();
+    ScriptApp.newTrigger('scanSignals').timeBased().after(90 * 1000).create();
+    return;
+  }
 
   const ss  = SpreadsheetApp.getActive();
   const uni = ss.getSheetByName(SK.SHEETS.UNIVERSE);
   const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
   if (!uni || uni.getLastRow() < 2) throw new Error('「銘柄」シートにコードを入れてください');
 
+  // 進捗は「銘柄シートの何行目まで処理したか」だけを持つ。
+  // 以前はキュー配列そのものをJSONでScriptPropertiesに保存していたが、
+  // プライム約1600銘柄では30KBを超え、1値あたり9KBの上限で setProperty が例外になり、
+  // 走査が中断したうえ自動再開もできなくなっていた。カーソルなら数バイトで済む。
   const props = PropertiesService.getScriptProperties();
-  let queue = JSON.parse(props.getProperty('SK_QUEUE') || 'null');
-  if (!queue) {
-    // 新規走査: 銘柄リストからキューを作り、シグナルシートを初期化
-    const rows = uni.getRange(2, 1, uni.getLastRow() - 1, 2).getValues().filter(r => r[0]);
-    queue = rows.map(r => [String(r[0]).trim(), r[1] || '']);
+  const universe = uni.getRange(2, 1, uni.getLastRow() - 1, 2).getValues()
+    .filter(r => r[0]).map(r => [String(r[0]).trim(), r[1] || '']);
+  const total = universe.length;
+  let cursor = Number(props.getProperty('SK_CURSOR') || 0);
+  let failed = Number(props.getProperty('SK_FAILED') || 0);
+
+  if (!cursor) {
+    // 新規走査: シグナルシートを初期化
     const oldFilter = sig.getFilter(); if (oldFilter) oldFilter.remove();
     sig.clear();
     sig.getRange(1, 1, 1, 10).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '信用倍率']]);
+    failed = 0;
   }
 
   const start = Date.now();
-  const buffer = [];
-  while (queue.length > 0) {
+  while (cursor < total) {
     if (Date.now() - start > SK.TIME_BUDGET_MS) break;
-    const slice = queue.splice(0, SK.BATCH);
+    const slice = universe.slice(cursor, cursor + SK.BATCH);
     const reqs = slice.map(([code]) => ({
       url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(code) +
            '.T?range=' + SK.YAHOO_RANGE + '&interval=1d',
       headers: { 'User-Agent': 'Mozilla/5.0' },
       muteHttpExceptions: true,
     }));
-    let resps;
-    try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { queue.unshift.apply(queue, slice); break; }
+    const resps = fetchAllWithRetry_(reqs);
+    if (!resps) break;   // ネットワークごと落ちている。カーソルは進めず次回に持ち越す。
+
+    const buffer = [];
     resps.forEach((res, i) => {
       const [code, name] = slice[i];
+      if (!res || res.getResponseCode() !== 200) { failed++; return; }  // 取得失敗を数える
       const bars = parseYahooBars_(res);
       if (bars.length < 5) return;
       if (!isLiquidEnough_(bars)) return;   // 薄商い銘柄は気配だけの窓を拾うため除外
@@ -167,27 +187,85 @@ function scanSignals() {
         code, name, last.c, dir, names.map(s => '・' + s).join('\n'), signalExplain_(names),
       ]);
     });
+
+    // バッチごとに「書き込み → カーソル確定」の順で確定させる。
+    // 以前は全バッチ終了後にまとめて書いていたため、最後のバッチ中に6分制限で強制終了すると
+    // 未書込のbufferと処理済みの分がまとめて失われ、再実行で重複追記が起きていた。
+    if (buffer.length) sig.getRange(sig.getLastRow() + 1, 1, buffer.length, 9).setValues(buffer);
+    cursor += slice.length;
+    props.setProperty('SK_CURSOR', String(cursor));
+    props.setProperty('SK_FAILED', String(failed));
+    writeScanStatus_(sig, cursor, total, failed);
     Utilities.sleep(200);
   }
 
-  if (buffer.length) sig.getRange(sig.getLastRow() + 1, 1, buffer.length, 9).setValues(buffer);
-
   clearResumeTriggers_();
-  if (queue.length > 0) {
-    props.setProperty('SK_QUEUE', JSON.stringify(queue));
+  if (cursor < total) {
     ScriptApp.newTrigger('scanSignals').timeBased().after(90 * 1000).create();
-    Logger.log('一時停止: 残り ' + queue.length + '銘柄。90秒後に自動再開。');
-    ss.toast('残り ' + queue.length + '銘柄。自動再開します', '酒田五法', 5);
+    Logger.log('一時停止: ' + cursor + '/' + total + '銘柄。90秒後に自動再開。');
+    ss.toast(cursor + '/' + total + '銘柄まで完了。90秒後に自動再開します', '酒田五法', 8);
   } else {
-    props.deleteProperty('SK_QUEUE');
+    props.deleteProperty('SK_CURSOR');
+    props.deleteProperty('SK_FAILED');
     finalizeSignals_(sig);
-    Logger.log('走査完了: シグナル ' + Math.max(sig.getLastRow() - 1, 0) + '件');
-    ss.toast('走査完了: ' + Math.max(sig.getLastRow() - 1, 0) + '件のシグナル', '酒田五法', 6);
+    const hit = Math.max(sig.getLastRow() - 1, 0);
+    writeScanStatus_(sig, total, total, failed);
+    Logger.log('走査完了: シグナル ' + hit + '件 / 取得失敗 ' + failed + '件');
+    // 取得失敗は「シグナル0件」と紛らわしいので必ず件数を出す。
+    ss.toast('走査完了: ' + hit + '件のシグナル'
+      + (failed ? '（' + failed + '銘柄は取得できず未判定）' : ''), '酒田五法', 8);
   }
 }
 
+/**
+ * Yahoo へのバッチ取得。429/503 は一時的なことが多いので、失敗分だけ指数バックオフで再試行する。
+ * 以前は非200を黙って捨てていたため「シグナル0件」と「取得失敗」が区別できなかった。
+ * 戻り値は reqs と同じ並びのレスポンス配列。ネットワークごと落ちている場合のみ null。
+ */
+function fetchAllWithRetry_(reqs) {
+  let resps;
+  try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { Logger.log('fetchAll失敗: ' + e.message); return null; }
+
+  for (let attempt = 1; attempt <= SK.FETCH_RETRY; attempt++) {
+    // 再試行する価値のあるもの（429 レート制限 / 5xx 一時障害）だけ拾う
+    const retryIdx = [];
+    resps.forEach((r, i) => {
+      const c = r ? r.getResponseCode() : 0;
+      if (c === 429 || c >= 500) retryIdx.push(i);
+    });
+    if (!retryIdx.length) break;
+    Utilities.sleep(SK.FETCH_BACKOFF_MS * Math.pow(2, attempt - 1));
+    let again;
+    try { again = UrlFetchApp.fetchAll(retryIdx.map(i => reqs[i])); }
+    catch (e) { Logger.log('再試行失敗: ' + e.message); break; }
+    retryIdx.forEach((origIdx, k) => { resps[origIdx] = again[k]; });
+  }
+  return resps;
+}
+
+/**
+ * 走査の進捗をシグナルシート右上に常設表示する。
+ * トーストは5〜8秒で消え、90秒の再開待ちの間は何も出ないため「今どうなっているのか」が
+ * 分からなかった。シートに書けば、開き直しても状態が見える。
+ */
+function writeScanStatus_(sig, done, total, failed) {
+  try {
+    const finished = done >= total;
+    const stamp = Utilities.formatDate(new Date(), 'JST', 'MM/dd HH:mm');
+    const msg = finished
+      ? '走査完了 ' + stamp + '時点（' + total + '銘柄' + (failed ? ' / 取得失敗' + failed + '件' : '') + '）'
+      : '走査中 ' + done + '/' + total + '（' + Math.floor(done / total * 100) + '%）'
+        + (failed ? ' / 取得失敗' + failed + '件' : '') + ' … 最終更新 ' + stamp;
+    sig.getRange(1, 11).setValue(msg)
+      .setFontColor(finished ? '#1a7f37' : '#b26a00').setFontWeight('bold');
+  } catch (e) { /* 進捗表示は失敗しても走査自体は続ける */ }
+}
+
 function resetScanQueue() {
-  PropertiesService.getScriptProperties().deleteProperty('SK_QUEUE');
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('SK_CURSOR');
+  props.deleteProperty('SK_FAILED');
+  props.deleteProperty('SK_QUEUE');   // 旧方式の残骸があれば併せて掃除
   clearResumeTriggers_();
   SpreadsheetApp.getActive().toast('走査の進捗をリセットしました', '酒田五法', 5);
 }
@@ -198,8 +276,11 @@ function clearResumeTriggers_() {
 
 // ---- 定期実行（平日18時・土日祝／年末年始はスキップ） ----
 function installDailyScanTrigger() {
+  // 定期トリガーに加え、走査/集計の「自動再開」トリガーも掃除する。
+  // 以前は再開トリガーが対象外で、中断状態のまま残った再開トリガーが後から発火していた。
   ScriptApp.getProjectTriggers()
-    .filter(t => ['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest', 'updateMarketMacro'].includes(t.getHandlerFunction()))
+    .filter(t => ['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest', 'updateMarketMacro',
+                  'scanSignals', 'backtestWeights'].includes(t.getHandlerFunction()))
     .forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('updateMarketMacro').timeBased().everyDays(1).atHour(17).create();    // 相場マクロ/急落サイン・地合い更新（走査の前）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
@@ -287,17 +368,26 @@ function finalizeSignals_(sig) {
   sig.getRange(2, 1, n, 10).setBackground(null);
 
   // 保有銘柄: 保有列に○、行を淡い赤でハイライト
+  // 以前は保有銘柄1件ごとに setBackground を呼んでいたため、保有数に比例してAPI呼び出しが
+  // 増えていた。背景色の二次元配列を組み立てて一度に流し込む。
   try {
     const held = getSbiHeldCodes_();
-    const marks = [];
+    const marks = [], bgs = [];
+    const rowBg = c => new Array(10).fill(c);
     for (let i = 0; i < n; i++) {
       const code = to4_(String(data[i][3] || '').trim()).toUpperCase();
       const isHeld = held.has(code);
       marks.push([isHeld ? '○' : '']);
-      if (isHeld) sig.getRange(2 + i, 1, 1, 10).setBackground('#fbe3e3');
+      bgs.push(rowBg(isHeld ? '#fbe3e3' : null));
     }
+    sig.getRange(2, 1, n, 10).setBackgrounds(bgs);
     sig.getRange(2, 1, n, 1).setValues(marks).setFontColor('#c0392b').setFontWeight('bold');
-  } catch (e) { Logger.log('SBI保有ハイライト失敗: ' + e.message); }
+  } catch (e) {
+    // 参照元スプレッドシートの権限切れ等で落ちることがある。以前はログのみで、
+    // ハイライトが消えた理由が利用者に伝わらなかった。
+    Logger.log('SBI保有ハイライト失敗: ' + e.message);
+    SpreadsheetApp.getActive().toast('保有銘柄のハイライトを取得できませんでした: ' + e.message, '酒田五法', 8);
+  }
 
   // 方向の色分け（最後に適用し、方向セルは常に方向色を優先）買い=緑/売り=赤/混在=橙
   const dirCells = sig.getRange(2, 7, n, 1).getValues();
@@ -935,27 +1025,33 @@ function backtestWeights() {
   const uni = ss.getSheetByName(SK.SHEETS.UNIVERSE);
   if (!uni || uni.getLastRow() < 2) throw new Error('「銘柄」シートにコードを入れてください');
 
+  // 進捗はカーソル（処理済み銘柄数）のみを保存する。集計途中の acc も件数分しか増えないため
+  // 9KB上限には収まるが、キュー配列は銘柄数に比例して膨らむのでカーソル方式に統一する。
   const props = PropertiesService.getScriptProperties();
-  let queue = JSON.parse(props.getProperty('BT_QUEUE') || 'null');
-  let acc   = JSON.parse(props.getProperty('BT_ACC')   || 'null');
-  if (!queue) {
-    queue = uni.getRange(2, 1, uni.getLastRow() - 1, 1).getValues().map(r => String(r[0]).trim()).filter(Boolean);
+  const universe = uni.getRange(2, 1, uni.getLastRow() - 1, 1).getValues()
+    .map(r => String(r[0]).trim()).filter(Boolean);
+  const total = universe.length;
+  let cursor = Number(props.getProperty('BT_CURSOR') || 0);
+  let acc    = JSON.parse(props.getProperty('BT_ACC') || 'null');
+  if (!cursor || !acc) {
+    cursor = 0;
     acc = {};   // name -> [n, wins, retSum]
-    ss.toast('バックテスト開始（自動再開で完走します）', '酒田五法', 5);
+    ss.toast('パターン成績の集計を開始（自動再開で完走します）', '酒田五法', 5);
   }
 
   const start = Date.now();
-  while (queue.length > 0) {
+  while (cursor < total) {
     if (Date.now() - start > SK.TIME_BUDGET_MS) break;
-    const slice = queue.splice(0, SK.BATCH);
+    const slice = universe.slice(cursor, cursor + SK.BATCH);
     const reqs = slice.map(code => ({
       url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(code) +
            '.T?range=' + SK.YAHOO_RANGE + '&interval=1d',
       headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true,
     }));
-    let resps;
-    try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { queue.unshift.apply(queue, slice); break; }
+    const resps = fetchAllWithRetry_(reqs);
+    if (!resps) break;   // ネットワークごと落ちている。カーソルは進めず次回に持ち越す。
     resps.forEach(res => {
+      if (!res || res.getResponseCode() !== 200) return;
       const bars = parseYahooBars_(res);
       const last = bars.length - 1;
       if (bars.length < BT_MIN_HISTORY + BT_FORWARD + 1) return;
@@ -975,29 +1071,29 @@ function backtestWeights() {
         });
       }
     });
+    // バッチ単位でカーソルと集計値を確定させる（6分制限で強制終了しても取りこぼさない）
+    cursor += slice.length;
+    props.setProperty('BT_CURSOR', String(cursor));
+    props.setProperty('BT_ACC', JSON.stringify(acc));
     Utilities.sleep(150);
   }
 
   clearBtResume_();
-  if (queue.length > 0) {
-    props.setProperty('BT_QUEUE', JSON.stringify(queue));
-    props.setProperty('BT_ACC',   JSON.stringify(acc));
+  if (cursor < total) {
     ScriptApp.newTrigger('backtestWeights').timeBased().after(90 * 1000).create();
-    Logger.log('バックテスト一時停止: 残り ' + queue.length + '銘柄。90秒後に自動再開。');
-    ss.toast('BT残り ' + queue.length + '銘柄。自動再開します', '酒田五法', 5);
+    Logger.log('成績集計 一時停止: ' + cursor + '/' + total + '銘柄。90秒後に自動再開。');
+    ss.toast('成績集計 ' + cursor + '/' + total + '銘柄。自動再開します', '酒田五法', 8);
   } else {
     const map = {};
     Object.keys(acc).forEach(name => {
       const a = acc[name];
       map[name] = { dir: SIGNAL_DIR_[name] || '', n: a[0], wins: a[1], retSum: a[2] };
     });
-    writeStatsSheet_(map);                                    // 成績DBを自動更新＝重みを自動修正
-    props.deleteProperty('BT_QUEUE'); props.deleteProperty('BT_ACC');
-    Logger.log('バックテスト完了: ' + Object.keys(map).length + 'パターン。成績DBを更新（自動修正）。');
-    ss.toast('バックテスト完了。パターン成績を更新しました', '酒田五法', 6);
-    // 最新の実績スコアをシグナルシートへ即反映
-    const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
-    if (sig && sig.getLastRow() >= 2) finalizeSignals_(sig);
+    writeStatsSheet_(map);
+    props.deleteProperty('BT_CURSOR'); props.deleteProperty('BT_ACC');
+    props.deleteProperty('BT_QUEUE');   // 旧方式の残骸があれば掃除
+    Logger.log('成績集計 完了: ' + Object.keys(map).length + 'パターン（参考値。順位付けには未使用）');
+    ss.toast('パターン成績を更新しました（参考値・順位には未使用）', '酒田五法', 6);
   }
 }
 

@@ -166,9 +166,13 @@ function fetchYahooJpMarginRatios_(codes) {
     var reqs = slice.map(function (c) {
       return { url: 'https://finance.yahoo.co.jp/quote/' + c + '.T', headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true };
     });
-    var resps; try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { continue; }
+    var resps;
+    try { resps = UrlFetchApp.fetchAll(reqs); }
+    catch (e) { Logger.log('信用倍率の取得に失敗（' + slice.length + '銘柄スキップ）: ' + e.message); continue; }
     resps.forEach(function (res, j) {
-      try { if (res.getResponseCode() === 200) { var r = parseYahooJpMarginRatio_(res.getContentText()); if (r != null) map[slice[j]] = r; } } catch (e) {}
+      try {
+        if (res.getResponseCode() === 200) { var r = parseYahooJpMarginRatio_(res.getContentText()); if (r != null) map[slice[j]] = r; }
+      } catch (e) { Logger.log('信用倍率の解析に失敗 (' + slice[j] + '): ' + e.message); }
     });
     Utilities.sleep(150);
   }
@@ -401,13 +405,18 @@ function parseTseMarginGrid_(grid) {
 function writeMacroInputValues_(pairs) {   // pairs: [{ re, value }]
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(MACRO.INPUT_SHEET); if (!sh) sh = setupMacroSheets_().input;
-  var vals = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2).getValues();
+  var rows = Math.max(sh.getLastRow(), 1);
+  var vals = sh.getRange(1, 1, rows, 2).getValues();
+  // 該当行ごとに setValue を呼ばず、B列全体を組み立てて一度に書き戻す（API呼び出しを1回にする）
+  var out = vals.map(function (r) { return [r[1]]; });
+  var changed = false;
   for (var i = 0; i < vals.length; i++) {
     var k = String(vals[i][0] || '');
     for (var j = 0; j < pairs.length; j++) {
-      if (pairs[j].value != null && pairs[j].re.test(k)) { sh.getRange(i + 1, 2).setValue(pairs[j].value); break; }
+      if (pairs[j].value != null && pairs[j].re.test(k)) { out[i] = [pairs[j].value]; changed = true; break; }
     }
   }
+  if (changed) sh.getRange(1, 2, rows, 1).setValues(out);
 }
 
 // 「相場マクロ」シート（A列=項目 / B列=値）から手入力値を読む。無ければ作成。

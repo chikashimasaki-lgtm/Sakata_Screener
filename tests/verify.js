@@ -36,7 +36,10 @@ const EXPORTS = [
   'marginRegime_', 'regimeFactor_', 'nsRatioTrend_', 'vixMacdSignal_', 'checkMarketConditions_',
   'parseTseMarginGrid_', 'parseNikkeiEpsHtml_', 'selloffFrequency_', 'macroValueLabel_',
 ];
+// 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ を呼ぶため。
 const M = new Function(...Object.keys(sandbox), `
+${read('FetchRetry.js')}
+${read('ConfirmUi.js')}
 ${read('Code.js')}
 ${read('MarketMacro.js')}
 return { ${EXPORTS.join(', ')} };

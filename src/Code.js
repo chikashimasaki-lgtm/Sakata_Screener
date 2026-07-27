@@ -51,6 +51,9 @@ const SK = {
   HS_MIN_GAP: 4,
 };
 
+// 共通モジュール ConfirmUi.js がトーストの見出しに使うプロジェクト名
+const APP_NAME_ = '酒田五法';
+
 // 実績スコアリング設定（バックテスト学習・自動修正）
 // バックテスト対象期間 = 過去6ヶ月（SK.YAHOO_RANGE '6mo'）
 const BT_FORWARD     = 3;    // 先読み営業日数（発生から3営業日後の騰落率で的中/リターンを評価）
@@ -73,22 +76,8 @@ function onOpen() {
     .addToUi();
 }
 
-/**
- * 取り返しのつかない操作の前に確認を取る。
- * トリガー起動では getUi() が使えないため、その場合は確認を求めず続行する
- * （定期実行の妨げにしない）。
- * @return {boolean} 続行してよければ true
- */
-function confirmDestructive_(title, message) {
-  let ui;
-  try { ui = SpreadsheetApp.getUi(); } catch (e) { return true; }   // トリガー実行時
-  const res = ui.alert(title, message, ui.ButtonSet.YES_NO);
-  if (res !== ui.Button.YES) {
-    SpreadsheetApp.getActive().toast('操作をキャンセルしました', '酒田五法', 4);
-    return false;
-  }
-  return true;
-}
+// 破壊的操作の確認 confirmDestructive_() の本体は共通モジュール ConfirmUi.js
+// （gas-shared/modules/ConfirmUi.js の symlink）。トーストに出す名前は APP_NAME_ を見る。
 
 function setup() {
   const ss = SpreadsheetApp.getActive();
@@ -134,7 +123,10 @@ function fetchPrimeUniverse() {
   do {
     let url = 'https://api.jquants.com/v2/equities/master';
     if (pagination) url += '?pagination_key=' + encodeURIComponent(pagination);
-    const res = UrlFetchApp.fetch(url, { headers: { 'x-api-key': key }, muteHttpExceptions: true });
+    // 429/5xx は共通モジュール FetchRetry.js が指数バックオフで再試行する。
+    // ここで即 throw すると、それまでに集めたページごと捨てて最初からやり直しになる。
+    const res = fetchWithRetry_(url, { headers: { 'x-api-key': key }, muteHttpExceptions: true },
+      { retry: SK.FETCH_RETRY, backoffMs: SK.FETCH_BACKOFF_MS, label: 'equities/master' });
     if (res.getResponseCode() !== 200) throw new Error('equities/master 失敗: ' + res.getContentText().slice(0, 200));
     const j = JSON.parse(res.getContentText());
     (j.data || []).forEach(x => { if (x.Mkt === '0111' || x.MktNm === 'プライム') collect.push([to4_(x.Code), x.CoName || '']); });

@@ -333,7 +333,9 @@ function jqGet_(path, params, key) {
   var url = q ? base + '?' + q : base, out = [], pg = null;
   do {
     var u = pg ? url + (url.indexOf('?') >= 0 ? '&' : '?') + 'pagination_key=' + encodeURIComponent(pg) : url;
-    var res = UrlFetchApp.fetch(u, { headers: { 'x-api-key': key }, muteHttpExceptions: true });
+    // 429/5xx は共通モジュール FetchRetry.js が指数バックオフで再試行する
+    var res = fetchWithRetry_(u, { headers: { 'x-api-key': key }, muteHttpExceptions: true },
+      { retry: SK.FETCH_RETRY, backoffMs: SK.FETCH_BACKOFF_MS, label: 'J-Quants ' + path });
     if (res.getResponseCode() !== 200) { Logger.log('J-Quants ' + path + ' 失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200)); return null; }
     var j = JSON.parse(res.getContentText());
     var arr = j.trades_spec || j.data;
@@ -348,8 +350,13 @@ function jqGet_(path, params, key) {
 function fetchIndexCloses_(symbol) {
   const url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(symbol) +
     '?range=' + MACRO.YAHOO_RANGE + '&interval=1d';
-  const res = UrlFetchApp.fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true });
-  return parseYahooBars_(res).map(b => b.c);
+  // Yahooは429を返すことがある。ここで空配列になると NS倍率が FLAT・VIXが NONE となり、
+  // 急落サインが「条件を満たさなかった」のか「取れなかった」のか区別できないまま消える。
+  const res = fetchWithRetry_(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true },
+    { retry: SK.FETCH_RETRY, backoffMs: SK.FETCH_BACKOFF_MS, label: 'Yahoo ' + symbol });
+  const closes = parseYahooBars_(res).map(b => b.c);
+  if (!closes.length) Logger.log('⚠ ' + symbol + ' の終値を取得できませんでした（HTTP ' + res.getResponseCode() + '）');
+  return closes;
 }
 
 // JPX週次「信用取引現在高」(.xls) を取り込む。JPXはボット遮断(403)でGAS直取得不可のため、

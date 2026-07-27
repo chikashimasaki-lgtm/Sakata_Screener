@@ -84,7 +84,7 @@ function confirmDestructive_(title, message) {
   try { ui = SpreadsheetApp.getUi(); } catch (e) { return true; }   // トリガー実行時
   const res = ui.alert(title, message, ui.ButtonSet.YES_NO);
   if (res !== ui.Button.YES) {
-    SpreadsheetApp.getActive().toast('操作をキャンセルしました', '酒田五法', 4);
+    try { SpreadsheetApp.getActive().toast('操作をキャンセルしました', '酒田五法', 4); } catch (_) {}
     return false;
   }
   return true;

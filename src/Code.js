@@ -1162,7 +1162,14 @@ function writeStatsSheet_(map) {
 // 過去6ヶ月バックテスト（時間分割・自動再開）。各パターンの N日後リターン実績を集計し成績DBを自動更新。
 function backtestWeights() {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(1000)) { Logger.log('別の処理が進行中のためスキップ'); return; }
+  if (!lock.tryLock(1000)) {
+    // 以前はログだけで黙って return しており、自動再開トリガーが scanSignals 等と衝突すると
+    // 集計が再開されないまま気づかれなかった（scanSignals の同種不具合と同じ構造）。次回に持ち越す。
+    Logger.log('別の処理が進行中のためスキップ（90秒後に再試行）');
+    clearBtResume_();
+    ScriptApp.newTrigger('backtestWeights').timeBased().after(90 * 1000).create();
+    return;
+  }
 
   const ss  = SpreadsheetApp.getActive();
   const uni = ss.getSheetByName(SK.SHEETS.UNIVERSE);

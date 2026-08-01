@@ -190,7 +190,7 @@ function scanSignals() {
     }
     const oldFilter = sig.getFilter(); if (oldFilter) oldFilter.remove();
     sig.clear();
-    sig.getRange(1, 1, 1, 10).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '信用倍率']]);
+    sig.getRange(1, 1, 1, 11).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '信用倍率', '決算発表']]);
     failed = 0;
   }
 
@@ -253,6 +253,7 @@ function scanSignals() {
     // 取得失敗は「シグナル0件」と紛らわしいので必ず件数を出す。
     ss.toast('走査完了: ' + hit + '件のシグナル'
       + (failed ? '（' + failed + '銘柄は取得できず未判定）' : ''), '酒田五法', 8);
+    sendTopBuySignalsEmail_(sig);   // 強さ★★★・買いだけを走査完了直後にメール通知
   }
 }
 
@@ -295,7 +296,8 @@ function writeScanStatus_(sig, done, total, failed) {
       ? '走査完了 ' + stamp + '時点（' + total + '銘柄' + (failed ? ' / 取得失敗' + failed + '件' : '') + '）'
       : '走査中 ' + done + '/' + total + '（' + Math.floor(done / total * 100) + '%）'
         + (failed ? ' / 取得失敗' + failed + '件' : '') + ' … 最終更新 ' + stamp;
-    sig.getRange(1, 11).setValue(msg)
+    // 12列目（L1）に置く。11列目（K1）は決算発表フラグ列のヘッダーになったため使えない。
+    sig.getRange(1, 12).setValue(msg)
       .setFontColor(finished ? '#1a7f37' : '#b26a00').setFontWeight('bold');
   } catch (e) { /* 進捗表示は失敗しても走査自体は続ける */ }
 }
@@ -389,6 +391,16 @@ function finalizeSignals_(sig) {
   sig.setColumnWidth(10, 96);
   sig.getRange(2, 10, n, 1).setNumberFormat('0.00').setHorizontalAlignment('center').setVerticalAlignment('middle');
 
+  // 決算発表予定（11列目）。J-Quants /fins/announcement は「翌営業日分」しか返せない仕様のため、
+  // 「あと何日か」ではなく「明日発表予定かどうか」のフラグにしている（fetchTomorrowAnnouncementCodes_）。
+  const tomorrowAnnouncements = fetchTomorrowAnnouncementCodes_();
+  sig.getRange(2, 11, n, 1).setValues(data.map(row => {
+    const c = to4_(String(row[3] || '').trim());
+    return [tomorrowAnnouncements && tomorrowAnnouncements[c] ? '明日発表予定' : ''];
+  }));
+  sig.setColumnWidth(11, 110);
+  sig.getRange(2, 11, n, 1).setHorizontalAlignment('center').setVerticalAlignment('middle');
+
   // コード(4列目)を TradingView 日足チャートへのハイパーリンクに。
   // 個人のチャートレイアウトIDはスクリプトプロパティ TRADINGVIEW_LAYOUT_ID で差し替えられる。
   // 未設定ならレイアウト指定なしの汎用チャートを開く。
@@ -402,7 +414,7 @@ function finalizeSignals_(sig) {
   }));
 
   // 全体スタイル: 濃紺ヘッダ＋淡色の行帯＋ヘッダ固定
-  styleSheet_(sig, 10, '#141a33', '#eef1fb');
+  styleSheet_(sig, 11, '#141a33', '#eef1fb');
   autoFit_(sig, 7);                                          // 保有〜方向まで内容にフィット
   sig.setColumnWidth(8, 210);                                // シグナル（箇条書き・折返し）
   sig.getRange(2, 8, n, 1).setWrap(true).setVerticalAlignment('top');
@@ -416,7 +428,7 @@ function finalizeSignals_(sig) {
   sig.getRange(2, 2, n, 1).setFontColor('#e8a200').setFontWeight('bold');                    // 強さ=金
 
   // 明示背景をいったんリセット（売却済み銘柄のハイライトを残さないため）
-  sig.getRange(2, 1, n, 10).setBackground(null);
+  sig.getRange(2, 1, n, 11).setBackground(null);
 
   // 保有銘柄: 保有列に○を立てる（行のハイライトは条件付き書式が○を見て行う）
   try {
@@ -441,8 +453,34 @@ function finalizeSignals_(sig) {
 
   // フィルタを張り直し（保有=○ で絞り込み可能に）
   const old = sig.getFilter(); if (old) old.remove();
-  sig.getRange(1, 1, n + 1, 10).createFilter();
+  sig.getRange(1, 1, n + 1, 11).createFilter();
   sig.setTabColor('#e0567a');
+}
+
+// 強さ★★★・方向「買い」のシグナルだけを抜き出し、簡潔な日次メールで通知する。
+// finalizeSignals_ が完了した直後（走査完了時）に呼ぶ。該当が無い日は送らない
+// （Asset_Status_Notifyのstockドロップ通知と同じ「該当がある時だけ送る」方針）。
+// コード(4列目)は finalizeSignals_ が TradingView への HYPERLINK 数式に置き換え済みだが、
+// getValues() は数式ではなく表示値（HYPERLINKの第2引数＝コード文字列）を返すため、
+// ここでは素のコード文字列として読める。
+function sendTopBuySignalsEmail_(sig) {
+  try {
+    if (sig.getLastRow() < 2) return;
+    const n = sig.getLastRow() - 1;
+    const rows = sig.getRange(2, 1, n, 9).getValues();   // 保有〜解説（1〜9列）
+    const top = rows.filter(r => r[1] === '★★★' && String(r[6]).indexOf('買い') !== -1);
+    if (!top.length) { Logger.log('★★★買いシグナル無し。メール送信スキップ'); return; }
+
+    const subject = `酒田五法_★3買い_${top.length}件`;
+    const body = top.map(r =>
+      `${r[3]}_${r[4]}_${r[5]}_${String(r[7]).replace(/\n/g, '/')}`   // コード_銘柄名_終値_シグナル名
+    ).join('\n');
+
+    MailApp.sendEmail(Session.getActiveUser().getEmail(), subject, body);
+    Logger.log('★★★買いシグナルメールを送信しました（' + top.length + '件）');
+  } catch (e) {
+    Logger.log('sendTopBuySignalsEmail_でエラー: ' + e.message);
+  }
 }
 
 /**
@@ -451,7 +489,7 @@ function finalizeSignals_(sig) {
  */
 function applySignalFormatRules_(sig, n) {
   const dir = sig.getRange(2, 7, n, 1);
-  const all = sig.getRange(2, 1, n, 10);
+  const all = sig.getRange(2, 1, n, 11);
   const textRule = (range, text, bg, fc) =>
     SpreadsheetApp.newConditionalFormatRule()
       .whenTextContains(text).setBackground(bg).setFontColor(fc).setBold(true)

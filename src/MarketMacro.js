@@ -309,6 +309,26 @@ function fetchEarningsSelloff_() {
   return { alert: alert, frac: st.frac, drops: st.drops, total: st.total };
 }
 
+// 翌営業日に決算発表が予定されている銘柄コードの集合を J-Quants /fins/announcement から取得。
+// このエンドポイントは「翌営業日分のみ」を返す仕様で、日付範囲を指定した先読みはできない
+// （公式ドキュメント確認済み。フリープランでも利用可）。そのため「あと何日か」は出せず、
+// 「明日発表予定かどうか」の1日限定フラグとしてのみ使う。取得不可はnull。
+function fetchTomorrowAnnouncementCodes_() {
+  var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
+  if (!key) { Logger.log('決算発表予定: JQUANTS_API_KEY 未設定'); return null; }
+  var rows;
+  try { rows = jqGet_('fins/announcement', {}, key); }
+  catch (e) { Logger.log('決算発表予定の取得に失敗: ' + e.message); return null; }
+  if (!rows) return null;
+  var set = {};
+  rows.forEach(function (r) {
+    var code = to4_(String(r.Code || r.LocalCode || '').trim());
+    if (code) set[code] = true;
+  });
+  Logger.log('決算発表予定（翌営業日）: ' + Object.keys(set).length + '銘柄');
+  return set;
+}
+
 // リターン配列から、-dropPct 以下の急落の件数・総数・割合を返す（純ロジック）。
 function selloffFrequency_(reactions, dropPct) {
   var total = 0, drops = 0;

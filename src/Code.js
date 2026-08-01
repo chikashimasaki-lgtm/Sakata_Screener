@@ -377,11 +377,14 @@ function finalizeSignals_(sig) {
   });
   sig.getRange(2, 1, n, 9).setValues(data);
 
-  // 信用倍率(合計)を Yahoo Finance Japan から結合（10列目）。点灯銘柄のみ取得。取得不可は空欄。
-  const marginMap = fetchYahooJpMarginRatios_(data.map(row => row[3]));
+  // 信用倍率(合計)を Yahoo Finance Japan から結合（10列目）。点灯銘柄のみ取得。
+  // 取得不可のときは空欄ではなく失敗理由を表示する（Stackdriverを見なくても原因が分かるように）。
+  const marginErrors = {};
+  const marginMap = fetchYahooJpMarginRatios_(data.map(row => row[3]), marginErrors);
   sig.getRange(2, 10, n, 1).setValues(data.map(row => {
     const c = to4_(String(row[3] || '').trim());
-    return [marginMap[c] != null ? marginMap[c] : ''];
+    if (marginMap[c] != null) return [marginMap[c]];
+    return [marginErrors[c] || ''];
   }));
   sig.setColumnWidth(10, 96);
   sig.getRange(2, 10, n, 1).setNumberFormat('0.00').setHorizontalAlignment('center').setVerticalAlignment('middle');

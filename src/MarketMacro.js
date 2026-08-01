@@ -182,15 +182,15 @@ function pickForeignFlow_(rows) {
 // 買残÷売残(株数)。1570は空売りが積むと倍率<1.0になり得る＝ショートカバー燃料の指標。
 // 市場全体の信用倍率は常に買残>>売残で約9倍固定のため、動画の「信用倍率<1.0」判定には1570を使う。
 function fetch1570MarginRatio_() {
-  var errors = [];
+  var errors = {};
   var m = fetchYahooJpMarginRatios_(['1570'], errors);
-  return (m['1570'] != null) ? { ratio: m['1570'], date: '' } : { error: errors[0] || '信用倍率(1570)の取得に失敗' };
+  return (m['1570'] != null) ? { ratio: m['1570'], date: '' } : { error: errors['1570'] || '信用倍率(1570)の取得に失敗' };
 }
 
 // Yahoo Finance Japan の各銘柄ページから信用倍率(合計)を取得し code→倍率 マップを返す。
 // J-Quantsの信用残がプラン外/空のときの代替。制度/一般の内訳は無く合計倍率のみ。
 // 点灯銘柄など少数を渡す想定（fetchAllでバッチ）。取得不可の銘柄は欠落。
-// errorsOut を渡すと、取得できなかった銘柄の失敗理由（自由文）を末尾に積む（呼び出し元が任意で使う）。
+// errorsOut を渡すと、取得できなかった銘柄ごとに { code: 失敗理由 } を書き込む（呼び出し元が任意で使う）。
 function fetchYahooJpMarginRatios_(codes, errorsOut) {
   var map = {};
   var uniq = Array.from(new Set((codes || []).map(function (c) { return to4_(String(c).trim()); }).filter(Boolean)));
@@ -203,7 +203,7 @@ function fetchYahooJpMarginRatios_(codes, errorsOut) {
     try { resps = UrlFetchApp.fetchAll(reqs); }
     catch (e) {
       Logger.log('信用倍率の取得に失敗（' + slice.length + '銘柄スキップ）: ' + e.message);
-      if (errorsOut) errorsOut.push('HTTP取得失敗: ' + e.message);
+      if (errorsOut) slice.forEach(function (c) { errorsOut[c] = 'HTTP取得失敗: ' + e.message; });
       continue;
     }
     resps.forEach(function (res, j) {
@@ -211,13 +211,13 @@ function fetchYahooJpMarginRatios_(codes, errorsOut) {
         if (res.getResponseCode() === 200) {
           var r = parseYahooJpMarginRatio_(res.getContentText());
           if (r != null) map[slice[j]] = r;
-          else if (errorsOut) errorsOut.push('解析失敗（ページ構造が変わった可能性）');
+          else if (errorsOut) errorsOut[slice[j]] = '解析失敗（ページ構造が変わった可能性）';
         } else if (errorsOut) {
-          errorsOut.push('HTTP ' + res.getResponseCode());
+          errorsOut[slice[j]] = 'HTTP ' + res.getResponseCode();
         }
       } catch (e) {
         Logger.log('信用倍率の解析に失敗 (' + slice[j] + '): ' + e.message);
-        if (errorsOut) errorsOut.push(e.message);
+        if (errorsOut) errorsOut[slice[j]] = e.message;
       }
     });
     Utilities.sleep(150);

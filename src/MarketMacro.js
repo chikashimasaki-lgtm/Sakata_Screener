@@ -159,10 +159,12 @@ function parseNikkeiEpsHtml_(html) {
 // ForeignersBalanceValue（買-売, 単位=千円）を億円換算。売り越しなら負。取得不可は null。
 function fetchForeignFlow_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
-  if (!key) { Logger.log('海外投資家: JQUANTS_API_KEY 未設定（手入力にフォールバック）'); return null; }
+  if (!key) { Logger.log('海外投資家: JQUANTS_API_KEY 未設定（手入力にフォールバック）'); return { error: 'JQUANTS_API_KEY未設定' }; }
   var from = Utilities.formatDate(new Date(Date.now() - 90 * 86400000), 'Asia/Tokyo', 'yyyy-MM-dd');
   var rows = jqGet_('markets/trades_spec', { from: from }, key);
-  return pickForeignFlow_(rows);
+  var r = pickForeignFlow_(rows);
+  if (!r) return { error: 'J-Quants取得失敗またはデータなし' };
+  return r;
 }
 
 // trades_spec 応答から、最新週の東証プライム（無ければ最新週の任意）海外投資家ネットを億円で返す。
@@ -180,14 +182,16 @@ function pickForeignFlow_(rows) {
 // 買残÷売残(株数)。1570は空売りが積むと倍率<1.0になり得る＝ショートカバー燃料の指標。
 // 市場全体の信用倍率は常に買残>>売残で約9倍固定のため、動画の「信用倍率<1.0」判定には1570を使う。
 function fetch1570MarginRatio_() {
-  var m = fetchYahooJpMarginRatios_(['1570']);
-  return (m['1570'] != null) ? { ratio: m['1570'], date: '' } : null;
+  var errors = {};
+  var m = fetchYahooJpMarginRatios_(['1570'], errors);
+  return (m['1570'] != null) ? { ratio: m['1570'], date: '' } : { error: errors['1570'] || '信用倍率(1570)の取得に失敗' };
 }
 
 // Yahoo Finance Japan の各銘柄ページから信用倍率(合計)を取得し code→倍率 マップを返す。
 // J-Quantsの信用残がプラン外/空のときの代替。制度/一般の内訳は無く合計倍率のみ。
 // 点灯銘柄など少数を渡す想定（fetchAllでバッチ）。取得不可の銘柄は欠落。
-function fetchYahooJpMarginRatios_(codes) {
+// errorsOut を渡すと、取得できなかった銘柄ごとに { code: 失敗理由 } を書き込む（呼び出し元が任意で使う）。
+function fetchYahooJpMarginRatios_(codes, errorsOut) {
   var map = {};
   var uniq = Array.from(new Set((codes || []).map(function (c) { return to4_(String(c).trim()); }).filter(Boolean)));
   for (var i = 0; i < uniq.length; i += 25) {
@@ -197,11 +201,24 @@ function fetchYahooJpMarginRatios_(codes) {
     });
     var resps;
     try { resps = UrlFetchApp.fetchAll(reqs); }
-    catch (e) { Logger.log('信用倍率の取得に失敗（' + slice.length + '銘柄スキップ）: ' + e.message); continue; }
+    catch (e) {
+      Logger.log('信用倍率の取得に失敗（' + slice.length + '銘柄スキップ）: ' + e.message);
+      if (errorsOut) slice.forEach(function (c) { errorsOut[c] = 'HTTP取得失敗: ' + e.message; });
+      continue;
+    }
     resps.forEach(function (res, j) {
       try {
-        if (res.getResponseCode() === 200) { var r = parseYahooJpMarginRatio_(res.getContentText()); if (r != null) map[slice[j]] = r; }
-      } catch (e) { Logger.log('信用倍率の解析に失敗 (' + slice[j] + '): ' + e.message); }
+        if (res.getResponseCode() === 200) {
+          var r = parseYahooJpMarginRatio_(res.getContentText());
+          if (r != null) map[slice[j]] = r;
+          else if (errorsOut) errorsOut[slice[j]] = '解析失敗（ページ構造が変わった可能性）';
+        } else if (errorsOut) {
+          errorsOut[slice[j]] = 'HTTP ' + res.getResponseCode();
+        }
+      } catch (e) {
+        Logger.log('信用倍率の解析に失敗 (' + slice[j] + '): ' + e.message);
+        if (errorsOut) errorsOut[slice[j]] = e.message;
+      }
     });
     Utilities.sleep(150);
   }
@@ -246,12 +263,12 @@ function fetchStandardizedMarginMap_() {
 // 好決算プロキシ=黒字(Profit>0)、急落=翌営業日リターン<=-DROP_PCT。取得不可/サンプル不足は null。
 function fetchEarningsSelloff_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
-  if (!key) { Logger.log('好決算sell-on-news: JQUANTS_API_KEY 未設定'); return null; }
+  if (!key) { Logger.log('好決算sell-on-news: JQUANTS_API_KEY 未設定'); return { error: 'JQUANTS_API_KEY未設定' }; }
   var C = MACRO.EARN;
   var today = new Date();
   var stmts = jqGet_('fins/statements',
     { from: fmtDate_(new Date(today.getTime() - (C.WINDOW_DAYS + 10) * 86400000)), to: fmtDate_(today) }, key);
-  if (!stmts || !stmts.length) { Logger.log('好決算: 対象決算なし（プラン遅延の可能性）'); return null; }
+  if (!stmts || !stmts.length) { Logger.log('好決算: 対象決算なし（プラン遅延の可能性）'); return { error: '対象決算なし（プラン遅延の可能性）' }; }
 
   var events = [];   // { code, date }（黒字の実績決算）
   stmts.forEach(function (s) {
@@ -262,7 +279,7 @@ function fetchEarningsSelloff_() {
     var d = String(s.DisclosedDate || '').slice(0, 10);
     if (code && /^\d{4}-\d{2}-\d{2}$/.test(d)) events.push({ code: code, date: d });
   });
-  if (events.length < C.MIN_SAMPLE) { Logger.log('好決算: サンプル不足 ' + events.length + '件'); return null; }
+  if (events.length < C.MIN_SAMPLE) { Logger.log('好決算: サンプル不足 ' + events.length + '件'); return { error: 'サンプル不足 ' + events.length + '件' }; }
 
   // 必要期間の日次終値を date→{code:adjClose} で取得
   var ds = events.map(function (e) { return e.date; }).sort();
@@ -270,7 +287,7 @@ function fetchEarningsSelloff_() {
     fmtDate_(new Date(parseDate_(ds[0]).getTime() - 4 * 86400000)),
     fmtDate_(new Date(parseDate_(ds[ds.length - 1]).getTime() + 5 * 86400000)), key);
   var dates = Object.keys(priceMap).sort();
-  if (!dates.length) { Logger.log('好決算: 価格取得不可'); return null; }
+  if (!dates.length) { Logger.log('好決算: 価格取得不可'); return { error: '価格取得不可' }; }
 
   var reactions = [];
   events.forEach(function (ev) {
@@ -285,7 +302,7 @@ function fetchEarningsSelloff_() {
   });
 
   var st = selloffFrequency_(reactions, C.DROP_PCT);
-  if (st.total < C.MIN_SAMPLE) { Logger.log('好決算: 価格照合後サンプル不足 ' + st.total); return null; }
+  if (st.total < C.MIN_SAMPLE) { Logger.log('好決算: 価格照合後サンプル不足 ' + st.total); return { error: '価格照合後サンプル不足 ' + st.total }; }
   var alert = st.frac >= C.FREQ;
   Logger.log('好決算sell-on-news: ' + st.drops + '/' + st.total + '銘柄が翌日' + (C.DROP_PCT * 100) + '%超下落 (率' +
     (st.frac * 100).toFixed(0) + '%, 閾値' + (C.FREQ * 100) + '%) → ' + (alert ? 'YES(頻発)' : 'NO'));
@@ -458,7 +475,11 @@ function parseTseMarginGrid_(grid) {
 }
 
 // 「相場マクロ」入力シートの指定ラベル行(B列)に値を書き戻す（取込値の可視化・永続化）。
-function writeMacroInputValues_(pairs) {   // pairs: [{ re, value }]
+// pairs: [{ re, value }]（自動取得できた値。B列とC列(今日の日付)を上書き）
+//     または [{ re, errorNote }]（自動取得に失敗。B列（手入力値）は残し、C列だけ失敗理由の文字列にする。
+//     C列が Date でなくなるので readMacroInputSheet_ の age() は今まで通り「日付未記入」扱いになり、
+//     急落サイン側の判定ロジックへの影響は無い＝Stackdriverを見なくても失敗理由がシート上で分かるようにするだけ）。
+function writeMacroInputValues_(pairs) {
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(MACRO.INPUT_SHEET); if (!sh) sh = setupMacroSheets_().input;
   var rows = Math.max(sh.getLastRow(), 1);
@@ -471,9 +492,14 @@ function writeMacroInputValues_(pairs) {   // pairs: [{ re, value }]
   for (var i = 0; i < vals.length; i++) {
     var k = String(vals[i][0] || '');
     for (var j = 0; j < pairs.length; j++) {
-      if (pairs[j].value != null && pairs[j].re.test(k)) {
+      if (!pairs[j].re.test(k)) continue;
+      if (pairs[j].value != null) {
         out[i] = [pairs[j].value];
         stamps[i] = [today];   // 自動取得できた項目は更新日も一緒に打つ
+        changed = true; break;
+      }
+      if (pairs[j].errorNote) {
+        stamps[i] = [pairs[j].errorNote];
         changed = true; break;
       }
     }
@@ -541,24 +567,29 @@ function updateMarketMacro() {
   } catch (e) { /* 営業日判定が使えない環境でも更新自体は続行する */ }
 
   const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls（売残億円）を自動取込
-  const r1570 = fetch1570MarginRatio_();                       // 信用倍率は日経レバ1570（<1.0になり得る）
-  const marginRatio = r1570 ? r1570.ratio : null;              // 1570のみ。取得不可時は手入力値を使う（東証全体9.21は使わない）
+  const r1570 = fetch1570MarginRatio_();                       // 信用倍率は日経レバ1570（<1.0になり得る）。取得不可時は { error }
+  const marginRatio = (r1570 && r1570.ratio != null) ? r1570.ratio : null;   // 取得不可時は手入力値を使う（東証全体9.21は使わない）
   const eps = fetchNikkeiEps_();                               // 日経EPS(加重平均)トレンドを自動取得
-  const flow = fetchForeignFlow_();                            // 海外投資家 現物ネット（J-Quants）
-  const earn = fetchEarningsSelloff_();                        // 好決算sell-on-news 頻発（J-Quants）
+  const flow = fetchForeignFlow_();                            // 海外投資家 現物ネット（J-Quants）。取得不可時は { error }
+  const earn = fetchEarningsSelloff_();                        // 好決算sell-on-news 頻発（J-Quants）。取得不可時は { error }
   var writes = [];
   if (tse) writes.push({ re: /売残.*億|売残高/, value: tse.sellOku });
+  // 自動取得できなければ、値（B列）は前回の手入力値のまま残し、C列にだけ失敗理由を書く
+  // （Stackdriverを見なくてもシート上で原因が分かるようにする。判定ロジック側は変更していない）。
   if (marginRatio != null) writes.push({ re: /信用倍率/, value: marginRatio });
+  else if (r1570 && r1570.error) writes.push({ re: /信用倍率/, errorNote: r1570.error });
   if (eps) writes.push({ re: /EPS/, value: eps.trend });
-  if (flow) writes.push({ re: /海外/, value: flow.netOku });
-  if (earn) writes.push({ re: /決算|sell/i, value: earn.alert ? 'YES' : 'NO' });
+  if (flow && flow.netOku != null) writes.push({ re: /海外/, value: flow.netOku });
+  else if (flow && flow.error) writes.push({ re: /海外/, errorNote: flow.error });
+  if (earn && earn.alert != null) writes.push({ re: /決算|sell/i, value: earn.alert ? 'YES' : 'NO' });
+  else if (earn && earn.error) writes.push({ re: /決算|sell/i, errorNote: earn.error });
   if (writes.length) writeMacroInputValues_(writes);
   const manual = readMacroInputSheet_();                       // 取込値を書き戻した後に読む
   if (tse) manual.sell_margin_oku = tse.sellOku;
   if (marginRatio != null) manual.margin_ratio = marginRatio;
   if (eps) manual.nikkei_eps_trend = eps.trend;
-  if (flow) manual.foreign_net_oku = flow.netOku;
-  if (earn) manual.earnings_selloff = earn.alert ? 'YES' : 'NO';
+  if (flow && flow.netOku != null) manual.foreign_net_oku = flow.netOku;
+  if (earn && earn.alert != null) manual.earnings_selloff = earn.alert ? 'YES' : 'NO';
 
   let ns = 'FLAT', vix = 'NONE';
   try {
@@ -577,16 +608,16 @@ function updateMarketMacro() {
   PropertiesService.getScriptProperties().setProperty(MACRO.REGIME_PROP, regime);
   Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix +
     ' ・東証売残=' + (tse ? tse.sellOku + '億' : '未取込') +
-    ' ・信用倍率(1570)=' + (r1570 ? r1570.ratio + '(' + r1570.date + ')' : '取得不可→手入力') +
+    ' ・信用倍率(1570)=' + (marginRatio != null ? marginRatio + '(' + r1570.date + ')' : (r1570 && r1570.error ? '取得失敗:' + r1570.error : '手入力')) +
     ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力') +
-    ' ・海外投資家=' + (flow ? flow.netOku + '億(' + flow.week + ')' : '手入力') +
-    ' ・好決算sell=' + (earn ? (earn.alert ? 'YES' : 'NO') + '(' + earn.drops + '/' + earn.total + ')' : '手入力'));
+    ' ・海外投資家=' + ((flow && flow.netOku != null) ? flow.netOku + '億(' + flow.week + ')' : (flow && flow.error ? '取得失敗:' + flow.error : '手入力')) +
+    ' ・好決算sell=' + ((earn && earn.alert != null) ? (earn.alert ? 'YES' : 'NO') + '(' + earn.drops + '/' + earn.total + ')' : (earn && earn.error ? '取得失敗:' + earn.error : '手入力')));
   // 入力の欠損・古さは、判定結果(N/7)だけ見ていると気づけない。必ず表に出す。
   const stale = (manual.stale || []).slice(0, 4);
   try {
     SpreadsheetApp.getActive().toast(
       (tse ? '東証売残' + tse.sellOku + '億' : '⚠ mtseisan未取込') +
-      '・倍率' + (r1570 ? r1570.ratio + '(1570)' : '手入力') +
+      '・倍率' + (marginRatio != null ? marginRatio + '(1570)' : '手入力') +
       ' ・急落' + lit + '/7 ・地合い' + regime +
       (stale.length ? '\n⚠ 古い入力: ' + stale.join('、') : ''), '相場マクロ', stale.length ? 15 : 8);
   } catch (e) { Logger.log('トースト表示に失敗: ' + e.message); }

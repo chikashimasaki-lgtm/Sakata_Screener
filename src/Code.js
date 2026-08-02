@@ -69,6 +69,7 @@ function onOpen() {
     .addItem('シグナル走査/続行',            'scanSignals')
     .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights')
     .addItem('相場マクロ/急落サインを更新', 'updateMarketMacro')
+    .addItem('決算カレンダーを更新',        'updateEarningsCalendar')
     .addItem('自動実行を設定（走査:平日18時/保有確認:毎時）', 'installDailyScanTrigger')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
@@ -327,14 +328,15 @@ function installDailyScanTrigger() {
   // 定期トリガーに加え、走査/集計の「自動再開」トリガーも掃除する。
   // 以前は再開トリガーが対象外で、中断状態のまま残った再開トリガーが後から発火していた。
   clearTriggersFor_(['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest', 'updateMarketMacro',
-                     'scanSignals', 'backtestWeights']);   // 共通モジュール TriggerUtils.js
+                     'updateEarningsCalendar', 'scanSignals', 'backtestWeights']);   // 共通モジュール TriggerUtils.js
   ScriptApp.newTrigger('updateMarketMacro').timeBased().everyDays(1).atHour(17).create();    // 相場マクロ/急落サイン・地合い更新（走査の前）
+  ScriptApp.newTrigger('updateEarningsCalendar').timeBased().everyDays(1).atHour(17).create(); // 決算カレンダー更新（EDINETDB_API_KEY未設定なら早期return）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
   ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();            // 購入ポートフォリオ確認（毎時）
   // 月次の自動学習トリガーは設定しない。集計結果を順位付けに使わなくなったため、
   // 全銘柄分のYahoo取得を毎月自動で走らせる必要がない（必要ならメニューから手動実行する）。
   SpreadsheetApp.getActive().toast('自動実行を設定しました（走査:平日18時 / 保有確認:毎時）', '酒田五法', 6);
-  Logger.log('トリガー設定: scheduledScan(平日18時) / scheduledHeldCheck(毎時) / updateMarketMacro(17時)');
+  Logger.log('トリガー設定: scheduledScan(平日18時) / scheduledHeldCheck(毎時) / updateMarketMacro(17時) / updateEarningsCalendar(17時)');
 }
 
 // 平日18時に発火。全銘柄の株価取得＋シグナル走査（重い処理・1日1回）。

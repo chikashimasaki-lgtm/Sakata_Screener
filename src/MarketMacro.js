@@ -14,12 +14,16 @@
 const MACRO = {
   INPUT_SHEET: '相場マクロ',
   ALERT_SHEET: '急落サイン',
+  CALENDAR_SHEET: '決算カレンダー',
   REGIME_PROP: 'SK_MARGIN_REGIME',
   NS_WINDOW:   20,      // NS倍率トレンド判定窓（営業日）
   YAHOO_RANGE: '6mo',
   // 好決算sell-on-news(条件7): 直近WINDOW_DAYS営業日の黒字決算のうち翌日DROP_PCT超下落の
   // 割合がFREQ以上で点灯。MIN_SAMPLE未満は判定しない（手入力にフォールバック）。
   EARN: { WINDOW_DAYS: 14, DROP_PCT: 0.03, FREQ: 0.35, MIN_SAMPLE: 10 },
+  // 決算カレンダー: J-Quants fins/announcement は「翌営業日分のみ」で先読みできないため、
+  // edinetdb.jp /v1/calendar（from/to範囲指定可）で数日先までの発表予定日を取得する。
+  CALENDAR_LOOKAHEAD_DAYS: 14,
   // 手入力項目がこの日数を超えて更新されていなければ「古い」とみなして警告する。
   // 値だけ見ていると更新忘れに気づけず、数か月前の需給で地合いを判定してしまうため。
   STALE_DAYS: 10,
@@ -383,6 +387,47 @@ function jqGet_(path, params, key) {
   return out;
 }
 
+// edinetdb.jp の GET（X-API-Key・limit/offsetページング・data配列抽出）。失敗時 null。
+// J-Quants(jqGet_)と違いページネーションキーではなくoffset加算方式（同APIのlimit既定500/最大2000）。
+function edinetGet_(path, params, key) {
+  var base = 'https://edinetdb.jp/v1/' + path;
+  var p = Object.assign({ limit: 2000 }, params || {});
+  var offset = 0, out = [], guard = 0;
+  do {
+    var q = Object.assign({}, p, { offset: offset });
+    var qs = Object.keys(q).filter(function (k) { return q[k] != null; })
+      .map(function (k) { return k + '=' + encodeURIComponent(q[k]); }).join('&');
+    var u = qs ? base + '?' + qs : base;
+    var res = fetchWithRetry_(u, { headers: { 'X-API-Key': key }, muteHttpExceptions: true },
+      { retry: SK.FETCH_RETRY, backoffMs: SK.FETCH_BACKOFF_MS, label: 'edinetdb ' + path });
+    if (res.getResponseCode() !== 200) { Logger.log('edinetdb ' + path + ' 失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200)); return null; }
+    var j = JSON.parse(res.getContentText());
+    var arr = j.data || j.results;
+    if (!arr) { for (var k in j) { if (Array.isArray(j[k])) { arr = j[k]; break; } } }
+    arr = arr || [];
+    out = out.concat(arr);
+    offset += arr.length;
+    guard++;
+  } while (arr.length === p.limit && guard < 20);   // 20ページ(既定4万件)で強制打ち切り。無限ループ防止の安全弁
+  return out;
+}
+
+// 決算発表カレンダーを edinetdb.jp /v1/calendar から取得（今日〜CALENDAR_LOOKAHEAD_DAYS日先）。
+// J-Quants fins/announcement と違い日付範囲の先読みができる（MarketMacro.js:312 のコメント参照）。
+// キー未設定/取得失敗時は null（→呼び元でシートに未取込である旨を出す）。
+function fetchEarningsCalendarRows_() {
+  var key = PropertiesService.getScriptProperties().getProperty('EDINETDB_API_KEY');
+  if (!key) { Logger.log('決算カレンダー: EDINETDB_API_KEY 未設定'); return null; }
+  var today = new Date(), to = new Date(today.getTime() + MACRO.CALENDAR_LOOKAHEAD_DAYS * 86400000);
+  var rows;
+  try {
+    rows = edinetGet_('calendar', {
+      from: fmtDate_(today), to: fmtDate_(to), market: 'prime', status: 'all', sort: 'date', order: 'asc',
+    }, key);
+  } catch (e) { Logger.log('決算カレンダーの取得に失敗: ' + e.message); return null; }
+  return rows;
+}
+
 // Yahoo チャートAPIから指数の終値配列を取得（^N225 / ^GSPC / ^VIX 等）。parseYahooBars_(Code.js) 流用。
 function fetchIndexCloses_(symbol) {
   const url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(symbol) +
@@ -669,6 +714,31 @@ function macroValueLabel_(v) {
   return dict[s] || s;
 }
 
+// edinetdb.jp の dateStatus（confirmed/estimated）を日本語化。未知値はそのまま返す。
+function calendarStatusLabel_(status) {
+  if (status == null || status === '') return '';
+  const dict = { confirmed: '確定', estimated: '予測' };
+  return dict[String(status)] || String(status);
+}
+
+// edinetdb.jp /v1/calendar の行配列を「銘柄」シートのコード集合で絞り込み、発表予定日の昇順で返す。
+// rows の各要素は { code|Code, name, date|announcementDate, dateStatus, marketCap } を想定。
+// HTTP呼び出しから分離した純ロジック（tests/verify.js でネットワーク無しに検証するため）。
+function filterCalendarToUniverse_(rows, universeCodes) {
+  const set = {};
+  (universeCodes || []).forEach(c => { if (c) set[String(c).trim()] = true; });
+  const out = (rows || [])
+    .map(r => ({
+      code: to4_(String(r.code || r.Code || '').trim()),
+      date: r.date || r.announcementDate || '',
+      dateStatus: r.dateStatus || r.status || '',
+      marketCap: r.marketCap != null ? r.marketCap : null,
+    }))
+    .filter(r => r.code && r.date && set[r.code]);
+  out.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+  return out;
+}
+
 function writeAlertSheet_(conds, lit, data) {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(MACRO.ALERT_SHEET) || ss.insertSheet(MACRO.ALERT_SHEET);
@@ -695,6 +765,60 @@ function writeAlertSheet_(conds, lit, data) {
   sh.getRange(1, 1, grid.length, width).setValues(grid);
   try { styleSheet_(sh, width, '#7a1f2b', '#fbeef0'); autoFit_(sh, width); } catch (e) {}
   sh.setTabColor('#c0392b');
+}
+
+// 「決算カレンダー」シートを作成/更新。entries は filterCalendarToUniverse_ の返り値、
+// nameMap は「銘柄」シートのコード→銘柄名。note があれば0件時に理由として1行だけ出す
+// （未取込を黙って空シートにすると「対象銘柄に決算が無い」のか「取得自体に失敗した」のか区別できない）。
+function writeEarningsCalendarSheet_(entries, nameMap, note) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(MACRO.CALENDAR_SHEET) || ss.insertSheet(MACRO.CALENDAR_SHEET);
+  sh.clear();
+  const header = ['コード', '銘柄名', '発表予定日', '確度', '時価総額（百万円）'];
+  const rows = (entries || []).map(e => [
+    e.code, (nameMap && nameMap[e.code]) || '', e.date, calendarStatusLabel_(e.dateStatus),
+    e.marketCap != null ? e.marketCap : '',
+  ]);
+  const grid = [header].concat(rows.length ? rows : [[note || '対象銘柄の決算発表予定は見つかりませんでした', '', '', '', '']]);
+  const width = header.length;
+  sh.getRange(1, 1, grid.length, width).setValues(grid);
+  try { styleSheet_(sh, width, '#1a4d7a', '#eaf3fb'); autoFit_(sh, width); } catch (e) {}
+  sh.setTabColor('#2e75b6');
+}
+
+// メニュー本体：edinetdb.jp から向こう CALENDAR_LOOKAHEAD_DAYS 日分の決算発表予定を取得し、
+// 「銘柄」シートの対象コードに絞って「決算カレンダー」シートへ出力する。
+// EDINETDB_API_KEY 未設定でも他の機能に影響しないよう早期returnする（任意機能）。
+function updateEarningsCalendar() {
+  try {
+    if (!isBusinessDay_(new Date()) && !isUserTriggered_()) {
+      Logger.log('休場日のため決算カレンダーの更新をスキップ');
+      return;
+    }
+  } catch (e) { /* 営業日判定が使えない環境でも更新自体は続行する */ }
+
+  const key = PropertiesService.getScriptProperties().getProperty('EDINETDB_API_KEY');
+  if (!key) { Logger.log('決算カレンダー: EDINETDB_API_KEY 未設定のためスキップ'); return; }
+
+  const ss = SpreadsheetApp.getActive();
+  const uni = ss.getSheetByName(SK.SHEETS.UNIVERSE);
+  if (!uni || uni.getLastRow() < 2) { Logger.log('決算カレンダー: 「銘柄」シートが空のためスキップ'); return; }
+  const universe = uni.getRange(2, 1, uni.getLastRow() - 1, 2).getValues()
+    .filter(r => r[0]).map(r => [to4_(String(r[0]).trim()), r[1] || '']);
+  const codes = universe.map(r => r[0]);
+  const nameMap = {};
+  universe.forEach(r => { nameMap[r[0]] = r[1]; });
+
+  const rows = fetchEarningsCalendarRows_();
+  if (rows === null) {
+    writeEarningsCalendarSheet_([], nameMap, '⚠ edinetdb.jp からの取得に失敗しました（詳細はログを参照）');
+    try { ss.toast('決算カレンダー: 取得失敗（ログ参照）', '酒田五法', 8); } catch (e) {}
+    return;
+  }
+  const entries = filterCalendarToUniverse_(rows, codes);
+  writeEarningsCalendarSheet_(entries, nameMap, null);
+  Logger.log('決算カレンダー更新: 対象' + codes.length + '銘柄中 ' + entries.length + '件ヒット');
+  try { ss.toast('決算カレンダー: ' + entries.length + '件（対象' + codes.length + '銘柄）', '酒田五法', 6); } catch (e) {}
 }
 
 /**

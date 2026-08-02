@@ -35,11 +35,13 @@ const EXPORTS = [
   'signalStrength_', 'parseSignalNames_', 'suggestWeight_', 'patternPoints_',
   'marginRegime_', 'regimeFactor_', 'nsRatioTrend_', 'vixMacdSignal_', 'checkMarketConditions_',
   'parseTseMarginGrid_', 'parseNikkeiEpsHtml_', 'selloffFrequency_', 'macroValueLabel_',
+  'filterCalendarToUniverse_', 'calendarStatusLabel_',
 ];
-// 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ を呼ぶため。
+// 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ / to4_ を呼ぶため。
 const M = new Function(...Object.keys(sandbox), `
 ${read('FetchRetry.js')}
 ${read('ConfirmUi.js')}
+${read('StockCode.js')}
 ${read('Code.js')}
 ${read('MarketMacro.js')}
 return { ${EXPORTS.join(', ')} };
@@ -446,6 +448,31 @@ console.log('\n【11】決算後の急落頻度・表示ラベル');
   eq(M.macroValueLabel_('GOLDEN_CROSS'), 'ゴールデンクロス', '内部表現を日本語ラベルにする');
   eq(M.macroValueLabel_(''), '', '空は空のまま');
   eq(M.macroValueLabel_(1234), '1234', '辞書に無い値はそのまま文字列化');
+}
+{
+  eq(M.calendarStatusLabel_('confirmed'), '確定', 'confirmed→確定');
+  eq(M.calendarStatusLabel_('estimated'), '予測', 'estimated→予測');
+  eq(M.calendarStatusLabel_(''), '', '空は空のまま');
+  eq(M.calendarStatusLabel_('unknown'), 'unknown', '辞書に無い値はそのまま返す');
+}
+
+console.log('\n【12】決算カレンダー — 対象銘柄への絞り込み・日付ソート');
+{
+  const rows = [
+    { code: '9999', date: '2026-08-10', dateStatus: 'estimated', marketCap: 500 },   // 対象外コード
+    { Code: '72030', date: '2026-08-05', dateStatus: 'confirmed', marketCap: 30000 }, // J-Quants形式5桁→to4_で7203化
+    { code: '6758', date: '2026-08-01', dateStatus: 'confirmed', marketCap: 15000 },
+  ];
+  const out = M.filterCalendarToUniverse_(rows, ['7203', '6758']);
+  eq(out.length, 2, '対象銘柄(7203/6758)の2件のみ残る');
+  eq(out[0].code, '6758', '日付昇順で先頭は8/1の6758');
+  eq(out[1].code, '7203', '次が8/5の7203（5桁コードもto4_で正規化）');
+  eq(out[1].dateStatus, 'confirmed', 'dateStatusを保持する');
+
+  eq(M.filterCalendarToUniverse_([], ['7203']), [], '行が空なら空配列');
+  eq(M.filterCalendarToUniverse_(null, ['7203']), [], 'rowsがnullでも例外にならず空配列');
+  eq(M.filterCalendarToUniverse_([{ code: '7203', date: '', dateStatus: 'confirmed' }], ['7203']),
+    [], '発表日が空の行は除外する');
 }
 
 console.log('\n' + '─'.repeat(62));

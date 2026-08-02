@@ -70,6 +70,7 @@ function onOpen() {
     .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights')
     .addItem('相場マクロ/急落サインを更新', 'updateMarketMacro')
     .addItem('決算カレンダーを更新',        'updateEarningsCalendar')
+    .addItem('決算発表列だけ更新（シグナル）', 'refreshSignalEarningsColumn')
     .addItem('自動実行を設定（走査:平日18時/保有確認:毎時）', 'installDailyScanTrigger')
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
@@ -360,6 +361,35 @@ function scheduledHeldCheck() {
 }
 
 // 列構成: 1保有 2強さ 3日付 4コード 5銘柄名 6終値 7方向 8シグナル 9解説
+// 「シグナル」シートの11列目（決算発表）を書く。EDINETDB_API_KEY設定時は edinetdb.jp の
+// 決算カレンダーから発表(予定)日＋確度を表示（例: "2026-08-05(確定)"）。未設定/取得失敗時は
+// J-Quants /equities/earnings-calendar（「翌営業日分」しか返せない仕様）の「明日発表予定」フラグにフォールバック。
+// finalizeSignals_（走査完了時）とメニュー「決算発表列だけ更新」の両方から呼ぶ共通処理。
+function writeSignalEarningsColumn_(sig, n) {
+  const codes = sig.getRange(2, 4, n, 1).getValues().map(r => to4_(String(r[0] || '').trim()));
+  const calRows = fetchEarningsCalendarRows_();
+  const calMap = calRows ? calendarMapFromEntries_(filterCalendarToUniverse_(calRows, codes)) : null;
+  Logger.log('決算発表列: API生取得 ' + (calRows ? calRows.length : 'null(未設定/失敗)') +
+    '件 / 対象' + codes.length + '銘柄中 ' + (calMap ? Object.keys(calMap).length : 0) + '件マッチ');
+  const tomorrowAnnouncements = fetchTomorrowAnnouncementCodes_();
+  sig.getRange(2, 11, n, 1).setValues(codes.map(c => {
+    if (calMap && calMap[c]) return [calMap[c].date + '(' + calendarStatusLabel_(calMap[c].dateStatus) + ')'];
+    return [tomorrowAnnouncements && tomorrowAnnouncements[c] ? '明日発表予定' : ''];
+  }));
+}
+
+// メニュー用：全銘柄の再走査（Yahoo取得）をせず、既存の「シグナル」シートの決算発表列だけ更新する。
+// フル走査は時間がかかる（1578銘柄で複数回の自動再開）ため、決算カレンダー側だけ確認・再取得したい
+// ときに使う。
+function refreshSignalEarningsColumn() {
+  const ss = SpreadsheetApp.getActive();
+  const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
+  if (!sig || sig.getLastRow() < 2) { ss.toast('「シグナル」シートが空です。先に走査してください', '酒田五法', 6); return; }
+  const n = sig.getLastRow() - 1;
+  writeSignalEarningsColumn_(sig, n);
+  ss.toast('決算発表列（K列）を更新しました（' + n + '銘柄・詳細はログ参照）', '酒田五法', 6);
+}
+
 function finalizeSignals_(sig) {
   if (sig.getLastRow() < 2) return;
   const n = sig.getLastRow() - 1;
@@ -394,18 +424,8 @@ function finalizeSignals_(sig) {
   sig.setColumnWidth(10, 96);
   sig.getRange(2, 10, n, 1).setNumberFormat('0.00').setHorizontalAlignment('center').setVerticalAlignment('middle');
 
-  // 決算発表予定（11列目）。EDINETDB_API_KEY設定時は edinetdb.jp の決算カレンダーから
-  // 発表(予定)日＋確度を表示（例: "2026-08-05(確定)"）。未設定/取得失敗時は、
-  // J-Quants /fins/announcement（「翌営業日分」しか返せない仕様）の「明日発表予定」フラグにフォールバックする。
-  const sheetCodes = data.map(row => to4_(String(row[3] || '').trim())).filter(Boolean);
-  const calRows = fetchEarningsCalendarRows_();
-  const calMap = calRows ? calendarMapFromEntries_(filterCalendarToUniverse_(calRows, sheetCodes)) : null;
-  const tomorrowAnnouncements = fetchTomorrowAnnouncementCodes_();
-  sig.getRange(2, 11, n, 1).setValues(data.map(row => {
-    const c = to4_(String(row[3] || '').trim());
-    if (calMap && calMap[c]) return [calMap[c].date + '(' + calendarStatusLabel_(calMap[c].dateStatus) + ')'];
-    return [tomorrowAnnouncements && tomorrowAnnouncements[c] ? '明日発表予定' : ''];
-  }));
+  // 決算発表予定（11列目）
+  writeSignalEarningsColumn_(sig, n);
   sig.setColumnWidth(11, 110);
   sig.getRange(2, 11, n, 1).setHorizontalAlignment('center').setVerticalAlignment('middle');
 

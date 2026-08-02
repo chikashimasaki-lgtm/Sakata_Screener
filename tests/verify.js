@@ -36,6 +36,7 @@ const EXPORTS = [
   'marginRegime_', 'regimeFactor_', 'nsRatioTrend_', 'vixMacdSignal_', 'checkMarketConditions_',
   'parseTseMarginGrid_', 'parseNikkeiEpsHtml_', 'selloffFrequency_', 'macroValueLabel_',
   'filterCalendarToUniverse_', 'calendarStatusLabel_', 'edinetExtractArray_', 'calendarMapFromEntries_',
+  'pickForeignFlow_', 'extractProfit_',
 ];
 // 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ / to4_ を呼ぶため。
 const M = new Function(...Object.keys(sandbox), `
@@ -501,6 +502,30 @@ console.log('\n【14】calendarMapFromEntries_ — シグナルK列用のコー�
   eq(m['7203'].date, '2026-08-05', '7203は8/5');
   eq(M.calendarMapFromEntries_([]), {}, '空なら空オブジェクト');
   eq(M.calendarMapFromEntries_(null), {}, 'nullでも例外にならず空オブジェクト');
+}
+
+console.log('\n【15】J-Quants V2移行 — pickForeignFlow_ / extractProfit_');
+{
+  // /equities/investor-types（旧 /markets/trades_spec）実測フィールド: EnDate・FrgnBal・Section
+  const rows = [
+    { Section: 'TSE1st', EnDate: '2026-07-10', FrgnBal: 100000 },
+    { Section: 'TSEPrime', EnDate: '2026-07-24', FrgnBal: -222260039 },   // 最新週・売り越し
+    { Section: 'TSEPrime', EnDate: '2026-07-17', FrgnBal: 500000 },
+  ];
+  const r = M.pickForeignFlow_(rows);
+  eq(r.week, '2026-07-24', 'Primeの中で最新週(EnDate)を選ぶ');
+  eq(r.netOku, Math.round(-222260039 / 100000), '千円→億円換算（売り越しは負）');
+  eq(M.pickForeignFlow_([]), null, '空配列はnull');
+  eq(M.pickForeignFlow_([{ Section: 'TSEPrime', EnDate: '2026-07-24' }]), null, 'FrgnBal欠損はnull');
+}
+{
+  // /fins/details（旧 /fins/statements）実測: FSオブジェクトの中に会計基準別のキーで純利益が入る
+  eq(M.extractProfit_({ 'Profit (loss) (IFRS)': '48314000000.0', 'Profit (loss) attributable to owners of parent (IFRS)': '40000000000.0' }),
+    48314000000, '親会社帰属分ではなく連結全体のProfit (loss)を優先する');
+  eq(M.extractProfit_({ 'Profit (loss) attributable to owners of parent (IFRS)': '40000000000.0' }),
+    40000000000, '連結全体キーが無ければattributable系でも可');
+  eq(M.extractProfit_({}), NaN, '該当キーが無ければNaN');
+  eq(M.extractProfit_(null), NaN, 'nullでも例外にならずNaN');
 }
 
 console.log('\n' + '─'.repeat(62));

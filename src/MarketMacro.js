@@ -3,7 +3,7 @@
 //  ---------------------------------------------------------------------------
 //  ・自動取得(7条件すべて): NS倍率/VIX MACD(Yahoo ^N225/^GSPC/^VIX)・東証信用売残/倍率
 //    (Driveのmtseisan*.xls)・日経EPS(stock-marketdata.com)・海外投資家 現物ネット
-//    (J-Quants /markets/trades_spec)・好決算sell-on-news(J-Quants fins/statements×prices)。
+//    (J-Quants /equities/investor-types)・好決算sell-on-news(J-Quants fins/details×equities/bars/daily)。
 //    各取得は失敗/サンプル不足/プラン遅延時に「相場マクロ」シートの手入力へフォールバック。
 //  ・7条件の点灯を「急落サイン」シートに N/7 で出力。
 //  ・条件1・2（売残・信用倍率）から地合い(SHORT_COVER/NEUTRAL/SUPPLY_RISK)を算出し、
@@ -21,7 +21,7 @@ const MACRO = {
   // 好決算sell-on-news(条件7): 直近WINDOW_DAYS営業日の黒字決算のうち翌日DROP_PCT超下落の
   // 割合がFREQ以上で点灯。MIN_SAMPLE未満は判定しない（手入力にフォールバック）。
   EARN: { WINDOW_DAYS: 14, DROP_PCT: 0.03, FREQ: 0.35, MIN_SAMPLE: 10 },
-  // 決算カレンダー: J-Quants fins/announcement は「翌営業日分のみ」で先読みできないため、
+  // 決算カレンダー: J-Quants equities/earnings-calendar は「翌営業日分のみ」で先読みできないため、
   // edinetdb.jp /v1/calendar（from/to範囲指定可）で数日先までの発表予定日を取得する。
   CALENDAR_LOOKAHEAD_DAYS: 14,
   // 手入力項目がこの日数を超えて更新されていなければ「古い」とみなして警告する。
@@ -159,30 +159,33 @@ function parseNikkeiEpsHtml_(html) {
   return { eps: latest, date: out[0].date, trend: trend };
 }
 
-// 海外投資家の現物ネット（投資部門別売買状況）を J-Quants /markets/trades_spec から取得。
-// ForeignersBalanceValue（買-売, 単位=千円）を億円換算。売り越しなら負。取得不可は null。
+// 海外投資家の現物ネット（投資部門別売買状況）を J-Quants /equities/investor-types から取得。
+// 2025-12のJ-Quants V2刷新で旧 /markets/trades_spec から改名（フィールド名も変更、単位は千円のまま）。
+// FrgnBal（買-売, 単位=千円）を億円換算。売り越しなら負。取得不可は null。
 function fetchForeignFlow_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
   if (!key) { Logger.log('海外投資家: JQUANTS_API_KEY 未設定（手入力にフォールバック）'); return { error: 'JQUANTS_API_KEY未設定' }; }
   var from = Utilities.formatDate(new Date(Date.now() - 90 * 86400000), 'Asia/Tokyo', 'yyyy-MM-dd');
-  var rows = jqGet_('markets/trades_spec', { from: from }, key);
+  var rows = jqGet_('equities/investor-types', { from: from }, key);
+  Logger.log('海外投資家: API生取得 ' + (rows ? rows.length : 'null') +
+    '件' + (rows && rows.length ? ' / サンプル1件目=' + JSON.stringify(rows[0]).slice(0, 300) : ''));
   var r = pickForeignFlow_(rows);
   if (!r) return { error: 'J-Quants取得失敗またはデータなし' };
   return r;
 }
 
-// trades_spec 応答から、最新週の東証プライム（無ければ最新週の任意）海外投資家ネットを億円で返す。
+// investor-types 応答から、最新週の東証プライム（無ければ最新週の任意）海外投資家ネットを億円で返す。
 function pickForeignFlow_(rows) {
   if (!rows || !rows.length) return null;
   var prime = rows.filter(function (x) { return /Prime/i.test(x.Section || ''); });
   var pool = (prime.length ? prime : rows).slice();
-  pool.sort(function (a, b) { return (a.EndDate < b.EndDate) ? 1 : (a.EndDate > b.EndDate ? -1 : 0); });  // 最新週
+  pool.sort(function (a, b) { return (a.EnDate < b.EnDate) ? 1 : (a.EnDate > b.EnDate ? -1 : 0); });  // 最新週
   var r = pool[0];
-  if (!r || r.ForeignersBalanceValue == null) return null;
-  return { netOku: Math.round(Number(r.ForeignersBalanceValue) / 100000), week: r.EndDate, section: r.Section };  // 千円→億円
+  if (!r || r.FrgnBal == null) return null;
+  return { netOku: Math.round(Number(r.FrgnBal) / 100000), week: r.EnDate, section: r.Section };  // 千円→億円
 }
 
-// 日経レバ(1570)の信用倍率を J-Quants /markets/weekly_margin_interest から取得。
+// 日経レバ(1570)の信用倍率を Yahoo Finance Japan から取得（J-Quantsではない。コメントが古かった）。
 // 買残÷売残(株数)。1570は空売りが積むと倍率<1.0になり得る＝ショートカバー燃料の指標。
 // 市場全体の信用倍率は常に買残>>売残で約9倍固定のため、動画の「信用倍率<1.0」判定には1570を使う。
 function fetch1570MarginRatio_() {
@@ -238,19 +241,20 @@ function parseYahooJpMarginRatio_(html) {
   return null;
 }
 
-// 全銘柄の「制度信用倍率」(制度買残÷制度売残) を J-Quants weekly_margin_interest から取得。
+// 全銘柄の「制度信用倍率」(制度買残÷制度売残) を J-Quants /markets/margin-interest から取得。
+// 2025-12のJ-Quants V2刷新で旧 /markets/weekly_margin_interest から改名（フィールド名も変更）。
 // 直近の週次データを1回で取り、code(4桁)→倍率 のマップを返す（銘柄別に個別APIは呼ばない）。
-// finalizeSignals_(Code.js) がシグナル一覧の各行に結合する。取得不可/キー無は {} を返す。
+// ※現状どこからも呼ばれていない未使用関数（将来シグナル一覧へ結合する想定で残置）。
 function fetchStandardizedMarginMap_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
   if (!key) { Logger.log('制度信用倍率: JQUANTS_API_KEY 未設定'); return {}; }
   var from = fmtDate_(new Date(Date.now() - 130 * 86400000));   // フリープランの約12週遅延をカバー
-  var rows = jqGet_('markets/weekly_margin_interest', { from: from }, key);
+  var rows = jqGet_('markets/margin-interest', { from: from }, key);
   if (!rows || !rows.length) { Logger.log('制度信用倍率: データなし（プラン外/遅延の可能性）'); return {}; }
   var latest = {};   // code -> { date, ratio }（最新週のみ採用）
   rows.forEach(function (r) {
     var code = to4_(String(r.Code || ''));
-    var lng = Number(r.LongStandardizedMarginOutstanding), sht = Number(r.ShortStandardizedMarginOutstanding);
+    var lng = Number(r.LongStdVol), sht = Number(r.ShrtStdVol);
     if (!code || !isFinite(lng) || !isFinite(sht) || sht <= 0) return;
     var d = String(r.Date || '');
     if (!latest[code] || d > latest[code].date) latest[code] = { date: d, ratio: Math.round(lng / sht * 100) / 100 };
@@ -261,26 +265,40 @@ function fetchStandardizedMarginMap_() {
   return map;
 }
 
+// FS（財務諸表）オブジェクトから当期純利益(連結)を取り出す。会計基準(IFRS/日本基準/米国基準)で
+// キー名の接尾辞が変わる（例:"Profit (loss) (IFRS)"）ため、"Profit (loss)"で始まり
+// 親会社帰属分(attributable)ではないキーを優先して探す。見つからなければattributable系でも可とする。
+function extractProfit_(fs) {
+  if (!fs || typeof fs !== 'object') return NaN;
+  var keys = Object.keys(fs);
+  var k = keys.find(function (x) { return /^Profit \(loss\)/i.test(x) && !/attributable/i.test(x); }) ||
+          keys.find(function (x) { return /^Profit \(loss\)/i.test(x); });
+  return k ? Number(fs[k]) : NaN;
+}
+
 // 好決算sell-on-news の頻発を J-Quants で自動判定（条件7）。
 // 直近 WINDOW 営業日に黒字の実績決算を発表した銘柄のうち、決算後（翌営業日）に DROP_PCT 超
 // 下落した割合が FREQ 以上なら「頻発」= 点灯。単位・閾値は MACRO.EARN。
 // 好決算プロキシ=黒字(Profit>0)、急落=翌営業日リターン<=-DROP_PCT。取得不可/サンプル不足は null。
+// エンドポイントは /fins/details（2025-12のJ-Quants V2刷新で旧 /fins/statements から改名）。
 function fetchEarningsSelloff_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
   if (!key) { Logger.log('好決算sell-on-news: JQUANTS_API_KEY 未設定'); return { error: 'JQUANTS_API_KEY未設定' }; }
   var C = MACRO.EARN;
   var today = new Date();
-  var stmts = jqGet_('fins/statements',
+  var stmts = jqGet_('fins/details',
     { from: fmtDate_(new Date(today.getTime() - (C.WINDOW_DAYS + 10) * 86400000)), to: fmtDate_(today) }, key);
+  Logger.log('好決算sell-on-news: API生取得 ' + (stmts ? stmts.length : 'null') +
+    '件' + (stmts && stmts.length ? ' / サンプル1件目=' + JSON.stringify(stmts[0]).slice(0, 300) : ''));
   if (!stmts || !stmts.length) { Logger.log('好決算: 対象決算なし（プラン遅延の可能性）'); return { error: '対象決算なし（プラン遅延の可能性）' }; }
 
   var events = [];   // { code, date }（黒字の実績決算）
   stmts.forEach(function (s) {
-    if (!/FinancialStatements/i.test(String(s.TypeOfDocument || ''))) return;   // 実績決算のみ（予想修正等は除外）
-    var profit = Number(s.Profit);
-    if (!isFinite(profit) || profit <= 0) return;                              // 黒字（好決算プロキシ）
-    var code = to4_(String(s.LocalCode || s.Code || ''));
-    var d = String(s.DisclosedDate || '').slice(0, 10);
+    if (!/FinancialStatements/i.test(String(s.DocType || ''))) return;   // 実績決算のみ（予想修正等は除外）
+    var profit = extractProfit_(s.FS);
+    if (!isFinite(profit) || profit <= 0) return;                       // 黒字（好決算プロキシ）
+    var code = to4_(String(s.Code || ''));
+    var d = String(s.DiscDate || '').slice(0, 10);
     if (code && /^\d{4}-\d{2}-\d{2}$/.test(d)) events.push({ code: code, date: d });
   });
   if (events.length < C.MIN_SAMPLE) { Logger.log('好決算: サンプル不足 ' + events.length + '件'); return { error: 'サンプル不足 ' + events.length + '件' }; }
@@ -313,7 +331,8 @@ function fetchEarningsSelloff_() {
   return { alert: alert, frac: st.frac, drops: st.drops, total: st.total };
 }
 
-// 翌営業日に決算発表が予定されている銘柄コードの集合を J-Quants /fins/announcement から取得。
+// 翌営業日に決算発表が予定されている銘柄コードの集合を J-Quants /equities/earnings-calendar から取得。
+// 2025-12のJ-Quants V2刷新で旧 /fins/announcement から改名（パスのみ変更、フィールド名は同じ）。
 // このエンドポイントは「翌営業日分のみ」を返す仕様で、日付範囲を指定した先読みはできない
 // （公式ドキュメント確認済み。フリープランでも利用可）。そのため「あと何日か」は出せず、
 // 「明日発表予定かどうか」の1日限定フラグとしてのみ使う。取得不可はnull。
@@ -321,7 +340,7 @@ function fetchTomorrowAnnouncementCodes_() {
   var key = PropertiesService.getScriptProperties().getProperty('JQUANTS_API_KEY');
   if (!key) { Logger.log('決算発表予定: JQUANTS_API_KEY 未設定'); return null; }
   var rows;
-  try { rows = jqGet_('fins/announcement', {}, key); }
+  try { rows = jqGet_('equities/earnings-calendar', {}, key); }
   catch (e) { Logger.log('決算発表予定の取得に失敗: ' + e.message); return null; }
   if (!rows) return null;
   var set = {};
@@ -340,19 +359,20 @@ function selloffFrequency_(reactions, dropPct) {
   return { total: total, drops: drops, frac: total ? drops / total : 0 };
 }
 
-// 期間内の各営業日について /prices/daily_quotes を取得し date→{code:adjClose} を返す。
+// 期間内の各営業日について /equities/bars/daily を取得し date→{code:adjClose} を返す。
+// 2025-12のJ-Quants V2刷新で旧 /prices/daily_quotes から改名（フィールド名も変更）。
 function fetchPricesByDateRange_(fromStr, toStr, key) {
   var map = {}, d = parseDate_(fromStr), end = parseDate_(toStr);
   while (d <= end) {
     var dow = d.getDay();
     if (dow !== 0 && dow !== 6) {   // 土日は取得しない（呼び出し削減）
       var ds = fmtDate_(d);
-      var rows = jqGet_('prices/daily_quotes', { date: ds }, key);
+      var rows = jqGet_('equities/bars/daily', { date: ds }, key);
       if (rows && rows.length) {
         var m = {};
         rows.forEach(function (r) {
           var c = to4_(String(r.Code || ''));
-          var px = Number(r.AdjustmentClose != null ? r.AdjustmentClose : r.Close);
+          var px = Number(r.AdjC != null ? r.AdjC : r.C);
           if (c && isFinite(px)) m[c] = px;
         });
         if (Object.keys(m).length) map[ds] = m;
@@ -379,7 +399,7 @@ function jqGet_(path, params, key) {
       { retry: SK.FETCH_RETRY, backoffMs: SK.FETCH_BACKOFF_MS, label: 'J-Quants ' + path });
     if (res.getResponseCode() !== 200) { Logger.log('J-Quants ' + path + ' 失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200)); return null; }
     var j = JSON.parse(res.getContentText());
-    var arr = j.trades_spec || j.data;
+    var arr = j.data;
     if (!arr) { for (var k in j) { if (Array.isArray(j[k])) { arr = j[k]; break; } } }   // 配列プロパティを拾う
     out = out.concat(arr || []);
     pg = j.pagination_key || null;
@@ -428,7 +448,7 @@ function edinetExtractArray_(j) {
 }
 
 // 決算発表カレンダーを edinetdb.jp /v1/calendar から取得（今日〜CALENDAR_LOOKAHEAD_DAYS日先）。
-// J-Quants fins/announcement と違い日付範囲の先読みができる（MarketMacro.js:312 のコメント参照）。
+// J-Quants equities/earnings-calendar と違い日付範囲の先読みができる（fetchTomorrowAnnouncementCodes_のコメント参照）。
 // キー未設定/取得失敗時は null（→呼び元でシートに未取込である旨を出す）。
 function fetchEarningsCalendarRows_() {
   var key = PropertiesService.getScriptProperties().getProperty('EDINETDB_API_KEY');

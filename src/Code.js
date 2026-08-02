@@ -254,6 +254,7 @@ function scanSignals() {
     ss.toast('走査完了: ' + hit + '件のシグナル'
       + (failed ? '（' + failed + '銘柄は取得できず未判定）' : ''), '酒田五法', 8);
     sendTopBuySignalsEmail_(sig);   // 強さ★★★・買いだけを走査完了直後にメール通知
+    sendHeldStockDirectionEmail_(sig);   // 保有銘柄の方向を走査完了直後にメール通知
   }
 }
 
@@ -436,9 +437,15 @@ function finalizeSignals_(sig) {
     const marks = [];
     for (let i = 0; i < n; i++) {
       const code = to4_(String(data[i][3] || '').trim()).toUpperCase();
-      marks.push([held.has(code) ? '○' : '']);
+      marks.push([held.codes.has(code) ? '○' : '']);
     }
     sig.getRange(2, 1, n, 1).setValues(marks).setFontColor('#c0392b').setFontWeight('bold');
+    // 未設定・アクセス不可のときは例外を投げないため、ここで明示的に知らせる
+    // （以前は0件のまま静かに終わり、「なぜか保有マークが出ない」原因が分からなかった）。
+    if (held.reason) {
+      Logger.log('保有ハイライトが機能していません: ' + held.reason);
+      SpreadsheetApp.getActive().toast('保有ハイライトが機能していません: ' + held.reason, '酒田五法', 10);
+    }
   } catch (e) {
     // 参照元スプレッドシートの権限切れ等で落ちることがある。以前はログのみで、
     // ハイライトが消えた理由が利用者に伝わらなかった。
@@ -483,6 +490,29 @@ function sendTopBuySignalsEmail_(sig) {
   }
 }
 
+// 保有銘柄のうち、今回のシグナル一覧に載った銘柄の方向をすべて通知する（★の絞り込みなし）。
+// finalizeSignals_ が完了した直後に呼ぶ。該当が無い日は送らない。
+// 保有マーク自体が機能していないと該当0件になる点に注意（getSbiHeldCodes_のreasonで原因が分かる）。
+function sendHeldStockDirectionEmail_(sig) {
+  try {
+    if (sig.getLastRow() < 2) return;
+    const n = sig.getLastRow() - 1;
+    const rows = sig.getRange(2, 1, n, 9).getValues();   // 保有〜解説（1〜9列）
+    const held = rows.filter(r => r[0] === '○');
+    if (!held.length) { Logger.log('保有銘柄のシグナル無し。メール送信スキップ'); return; }
+
+    const subject = `酒田五法_保有銘柄シグナル_${held.length}件`;
+    const body = held.map(r =>
+      `${r[3]}_${r[4]}_${String(r[6]).trim()}_${String(r[7]).replace(/\n/g, '/')}`   // コード_銘柄名_方向_シグナル名
+    ).join('\n');
+
+    MailApp.sendEmail(Session.getActiveUser().getEmail(), subject, body);
+    Logger.log('保有銘柄シグナルメールを送信しました（' + held.length + '件）');
+  } catch (e) {
+    Logger.log('sendHeldStockDirectionEmail_でエラー: ' + e.message);
+  }
+}
+
 /**
  * シグナルシートの色分けを条件付き書式で設定する（値に追従するので並べ替えに強い）。
  * 方向列: 買い=緑 / 売り=赤 / 混在=橙、保有行: 淡赤。
@@ -509,6 +539,10 @@ function applySignalFormatRules_(sig, n) {
 
 // SBI証券の保有銘柄コードを参照元スプレッドシート（Asset_Status）から収集する。
 // 「SBI証券（日本株）」「SBI証券（日本株信用）」の「銘柄コード」列から4桁の証券コードを抽出。
+// 戻り値は { codes: Set, reason: string|null }。reason は「未設定」「アクセス不可」等、
+// 保有ハイライトが機能していない理由（0件そのものは異常ではないので reason は null のまま）。
+// 以前は例外時しか呼び出し元に伝わらず、未設定で常に0件になっているだけの状態が
+// ユーザーからは「なぜか保有マークが出ない」としか見えなかった。
 function getSbiHeldCodes_() {
   // 参照先スプレッドシートIDはスクリプトプロパティ ASSET_STATUS_SS_ID に置く。
   // 個人の資産管理シートのIDを公開リポジトリのソースに直接書かないため。
@@ -519,11 +553,14 @@ function getSbiHeldCodes_() {
   const set = new Set();
   if (!SBI_SS_ID) {
     Logger.log('ASSET_STATUS_SS_ID が未設定のため保有ハイライトをスキップ');
-    return set;
+    return { codes: set, reason: 'ASSET_STATUS_SS_ID未設定' };
   }
   let ss;
   try { ss = SpreadsheetApp.openById(SBI_SS_ID); }
-  catch (e) { Logger.log('SBIスプレッドシートを開けません: ' + e.message); return set; }
+  catch (e) {
+    Logger.log('SBIスプレッドシートを開けません: ' + e.message);
+    return { codes: set, reason: 'スプレッドシートを開けません: ' + e.message };
+  }
   SHEET_NAMES.forEach(name => {
     const sh = ss.getSheetByName(name);
     if (!sh || sh.getLastRow() < 1) return;
@@ -547,7 +584,7 @@ function getSbiHeldCodes_() {
     }
   });
   Logger.log('SBI保有銘柄コード: ' + set.size + '件');
-  return set;
+  return { codes: set, reason: null };
 }
 
 // ============================================================================

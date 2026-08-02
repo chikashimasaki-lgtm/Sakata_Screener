@@ -392,7 +392,7 @@ function jqGet_(path, params, key) {
 function edinetGet_(path, params, key) {
   var base = 'https://edinetdb.jp/v1/' + path;
   var p = Object.assign({ limit: 2000 }, params || {});
-  var offset = 0, out = [], guard = 0;
+  var offset = 0, out = [], guard = 0, pageLen = 0;
   do {
     var q = Object.assign({}, p, { offset: offset });
     var qs = Object.keys(q).filter(function (k) { return q[k] != null; })
@@ -402,14 +402,29 @@ function edinetGet_(path, params, key) {
       { retry: SK.FETCH_RETRY, backoffMs: SK.FETCH_BACKOFF_MS, label: 'edinetdb ' + path });
     if (res.getResponseCode() !== 200) { Logger.log('edinetdb ' + path + ' 失敗(' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200)); return null; }
     var j = JSON.parse(res.getContentText());
-    var arr = j.data || j.results;
-    if (!arr) { for (var k in j) { if (Array.isArray(j[k])) { arr = j[k]; break; } } }
-    arr = arr || [];
+    var arr = edinetExtractArray_(j);
+    pageLen = arr.length;
     out = out.concat(arr);
-    offset += arr.length;
+    offset += pageLen;
     guard++;
-  } while (arr.length === p.limit && guard < 20);   // 20ページ(既定4万件)で強制打ち切り。無限ループ防止の安全弁
+  } while (pageLen === p.limit && guard < 20);   // 20ページ(既定4万件)で強制打ち切り。無限ループ防止の安全弁
   return out;
+}
+
+// edinetdb.jp のレスポンス配列本体を探す。実測では /v1/calendar が {"data":{"calendar":[...]}} という
+// 1階層ネスト（"data"自体は配列でなくオブジェクト）で返ってきた（J-Quantsの{"data":[...]}とは形が違う）。
+// 直下に配列プロパティが無ければ、直下の各オブジェクトの中も1階層だけ探す。
+function edinetExtractArray_(j) {
+  if (Array.isArray(j)) return j;
+  if (!j || typeof j !== 'object') return [];
+  for (var k in j) { if (Array.isArray(j[k])) return j[k]; }
+  for (var k2 in j) {
+    var v = j[k2];
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      for (var k3 in v) { if (Array.isArray(v[k3])) return v[k3]; }
+    }
+  }
+  return [];
 }
 
 // 決算発表カレンダーを edinetdb.jp /v1/calendar から取得（今日〜CALENDAR_LOOKAHEAD_DAYS日先）。
@@ -729,14 +744,24 @@ function filterCalendarToUniverse_(rows, universeCodes) {
   (universeCodes || []).forEach(c => { if (c) set[String(c).trim()] = true; });
   const out = (rows || [])
     .map(r => ({
-      code: to4_(String(r.code || r.Code || '').trim()),
-      date: r.date || r.announcementDate || '',
+      // 実測: 証券コードは secCode。日付は確定時 announcementDate、未確定時は
+      // announcementDate が null で estimatedAnnouncementDate に入る（dateStatusで判別）。
+      code: to4_(String(r.secCode || r.code || r.Code || '').trim()),
+      date: r.announcementDate || r.estimatedAnnouncementDate || r.date || '',
       dateStatus: r.dateStatus || r.status || '',
       marketCap: r.marketCap != null ? r.marketCap : null,
     }))
     .filter(r => r.code && r.date && set[r.code]);
   out.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
   return out;
+}
+
+// filterCalendarToUniverse_ の返り値（日付昇順）を コード→直近1件 のマップにする。
+// 同一コードが複数期（Q1/Q2等）で返ることがあるため、先頭に出た＝最も近い日付のものを採用する。
+function calendarMapFromEntries_(entries) {
+  const m = {};
+  (entries || []).forEach(e => { if (e.code && !m[e.code]) m[e.code] = e; });
+  return m;
 }
 
 function writeAlertSheet_(conds, lit, data) {
@@ -815,6 +840,10 @@ function updateEarningsCalendar() {
     try { ss.toast('決算カレンダー: 取得失敗（ログ参照）', '酒田五法', 8); } catch (e) {}
     return;
   }
+  // 0件ヒット時は「API自体が0件」なのか「フィールド名の想定違いで絞り込みが空振り」なのか
+  // シート上では区別できないため、生取得件数とサンプル行を必ずログに残す。
+  Logger.log('決算カレンダー: API生取得 ' + rows.length + '件' +
+    (rows.length ? ' / サンプル1件目=' + JSON.stringify(rows[0]).slice(0, 300) : ''));
   const entries = filterCalendarToUniverse_(rows, codes);
   writeEarningsCalendarSheet_(entries, nameMap, null);
   Logger.log('決算カレンダー更新: 対象' + codes.length + '銘柄中 ' + entries.length + '件ヒット');

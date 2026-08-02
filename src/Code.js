@@ -394,11 +394,16 @@ function finalizeSignals_(sig) {
   sig.setColumnWidth(10, 96);
   sig.getRange(2, 10, n, 1).setNumberFormat('0.00').setHorizontalAlignment('center').setVerticalAlignment('middle');
 
-  // 決算発表予定（11列目）。J-Quants /fins/announcement は「翌営業日分」しか返せない仕様のため、
-  // 「あと何日か」ではなく「明日発表予定かどうか」のフラグにしている（fetchTomorrowAnnouncementCodes_）。
+  // 決算発表予定（11列目）。EDINETDB_API_KEY設定時は edinetdb.jp の決算カレンダーから
+  // 発表(予定)日＋確度を表示（例: "2026-08-05(確定)"）。未設定/取得失敗時は、
+  // J-Quants /fins/announcement（「翌営業日分」しか返せない仕様）の「明日発表予定」フラグにフォールバックする。
+  const sheetCodes = data.map(row => to4_(String(row[3] || '').trim())).filter(Boolean);
+  const calRows = fetchEarningsCalendarRows_();
+  const calMap = calRows ? calendarMapFromEntries_(filterCalendarToUniverse_(calRows, sheetCodes)) : null;
   const tomorrowAnnouncements = fetchTomorrowAnnouncementCodes_();
   sig.getRange(2, 11, n, 1).setValues(data.map(row => {
     const c = to4_(String(row[3] || '').trim());
+    if (calMap && calMap[c]) return [calMap[c].date + '(' + calendarStatusLabel_(calMap[c].dateStatus) + ')'];
     return [tomorrowAnnouncements && tomorrowAnnouncements[c] ? '明日発表予定' : ''];
   }));
   sig.setColumnWidth(11, 110);

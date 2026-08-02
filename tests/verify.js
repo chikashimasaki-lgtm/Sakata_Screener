@@ -35,7 +35,7 @@ const EXPORTS = [
   'signalStrength_', 'parseSignalNames_', 'suggestWeight_', 'patternPoints_',
   'marginRegime_', 'regimeFactor_', 'nsRatioTrend_', 'vixMacdSignal_', 'checkMarketConditions_',
   'parseTseMarginGrid_', 'parseNikkeiEpsHtml_', 'selloffFrequency_', 'macroValueLabel_',
-  'filterCalendarToUniverse_', 'calendarStatusLabel_',
+  'filterCalendarToUniverse_', 'calendarStatusLabel_', 'edinetExtractArray_', 'calendarMapFromEntries_',
 ];
 // 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ / to4_ を呼ぶため。
 const M = new Function(...Object.keys(sandbox), `
@@ -458,21 +458,49 @@ console.log('\n【11】決算後の急落頻度・表示ラベル');
 
 console.log('\n【12】決算カレンダー — 対象銘柄への絞り込み・日付ソート');
 {
+  // edinetdb.jp /v1/calendar の実測フィールド名（secCode／announcementDate／estimatedAnnouncementDate）
   const rows = [
-    { code: '9999', date: '2026-08-10', dateStatus: 'estimated', marketCap: 500 },   // 対象外コード
-    { Code: '72030', date: '2026-08-05', dateStatus: 'confirmed', marketCap: 30000 }, // J-Quants形式5桁→to4_で7203化
-    { code: '6758', date: '2026-08-01', dateStatus: 'confirmed', marketCap: 15000 },
+    { secCode: '9999', announcementDate: '2026-08-10', dateStatus: 'confirmed', marketCap: 500 },   // 対象外コード
+    { secCode: '72030', announcementDate: '2026-08-05', dateStatus: 'confirmed', marketCap: 30000 }, // 5桁→to4_で7203化
+    { secCode: '6758', announcementDate: null, estimatedAnnouncementDate: '2026-08-01', dateStatus: 'estimated', marketCap: 15000 },
   ];
   const out = M.filterCalendarToUniverse_(rows, ['7203', '6758']);
   eq(out.length, 2, '対象銘柄(7203/6758)の2件のみ残る');
-  eq(out[0].code, '6758', '日付昇順で先頭は8/1の6758');
+  eq(out[0].code, '6758', '日付昇順で先頭は8/1の6758（estimatedAnnouncementDateから採る）');
   eq(out[1].code, '7203', '次が8/5の7203（5桁コードもto4_で正規化）');
-  eq(out[1].dateStatus, 'confirmed', 'dateStatusを保持する');
+  eq(out[0].dateStatus, 'estimated', 'dateStatusを保持する');
+  eq(out[1].date, '2026-08-05', 'confirmed時はannouncementDateを採る');
 
   eq(M.filterCalendarToUniverse_([], ['7203']), [], '行が空なら空配列');
   eq(M.filterCalendarToUniverse_(null, ['7203']), [], 'rowsがnullでも例外にならず空配列');
-  eq(M.filterCalendarToUniverse_([{ code: '7203', date: '', dateStatus: 'confirmed' }], ['7203']),
-    [], '発表日が空の行は除外する');
+  eq(M.filterCalendarToUniverse_([{ secCode: '7203', dateStatus: 'confirmed' }], ['7203']),
+    [], '発表日(announcementDate/estimatedAnnouncementDateとも無し)の行は除外する');
+}
+
+console.log('\n【13】edinetExtractArray_ — レスポンス配列本体の抽出');
+{
+  // 実測: /v1/calendar は {"data":{"calendar":[...]}}（"data"自体は配列でなくオブジェクト）で返る
+  eq(M.edinetExtractArray_({ data: { calendar: [{ a: 1 }, { a: 2 }] } }), [{ a: 1 }, { a: 2 }],
+    '{data:{calendar:[...]}} の1階層ネストから配列を取り出す');
+  eq(M.edinetExtractArray_({ data: [{ a: 1 }] }), [{ a: 1 }], '{data:[...]} のように直下が配列でもそのまま取れる');
+  eq(M.edinetExtractArray_([{ a: 1 }]), [{ a: 1 }], 'レスポンス自体が配列ならそのまま');
+  eq(M.edinetExtractArray_({}), [], '配列が見つからなければ空配列');
+  eq(M.edinetExtractArray_(null), [], 'nullでも例外にならず空配列');
+}
+
+console.log('\n【14】calendarMapFromEntries_ — シグナルK列用のコード→直近1件マップ');
+{
+  const entries = [
+    { code: '6758', date: '2026-08-01', dateStatus: 'confirmed' },
+    { code: '7203', date: '2026-08-05', dateStatus: 'estimated' },
+    { code: '6758', date: '2026-11-10', dateStatus: 'estimated' },   // 同一コード2件目（Q2等）は無視
+  ];
+  const m = M.calendarMapFromEntries_(entries);
+  eq(Object.keys(m).length, 2, 'コードは2件（重複は先頭=直近日のみ採用）');
+  eq(m['6758'].date, '2026-08-01', '6758は先頭（直近）の8/1を採る。11/10は無視');
+  eq(m['7203'].date, '2026-08-05', '7203は8/5');
+  eq(M.calendarMapFromEntries_([]), {}, '空なら空オブジェクト');
+  eq(M.calendarMapFromEntries_(null), {}, 'nullでも例外にならず空オブジェクト');
 }
 
 console.log('\n' + '─'.repeat(62));

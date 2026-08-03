@@ -24,6 +24,11 @@ const sandbox = {
   ScriptApp: { getProjectTriggers: () => [], newTrigger: () => {}, deleteTrigger: () => {} },
   Session: { getEffectiveUser: () => ({ getEmail: () => 'test@example.com' }) },
   DriveApp: {}, MailApp: { sendEmail: () => {} },
+  GmailApp: {
+    getUserLabelByName: () => null,
+    createLabel: () => ({ addLabel: () => {} }),
+    search: () => [],
+  },
 };
 
 const read = f => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8');

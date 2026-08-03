@@ -512,6 +512,7 @@ function sendTopBuySignalsEmail_(sig) {
 
     MailApp.sendEmail(Session.getActiveUser().getEmail(), subject, body);
     Logger.log('★★★買いシグナルメールを送信しました（' + top.length + '件）');
+    labelAndArchiveSentMail_(subject);
   } catch (e) {
     Logger.log('sendTopBuySignalsEmail_でエラー: ' + e.message);
   }
@@ -535,8 +536,33 @@ function sendHeldStockDirectionEmail_(sig) {
 
     MailApp.sendEmail(Session.getActiveUser().getEmail(), subject, body);
     Logger.log('保有銘柄シグナルメールを送信しました（' + held.length + '件）');
+    labelAndArchiveSentMail_(subject);
   } catch (e) {
     Logger.log('sendHeldStockDirectionEmail_でエラー: ' + e.message);
+  }
+}
+
+// 酒田五法の通知メール（★3買い・保有銘柄シグナル）に付けるラベル。
+// 受信トレイに残さず、後で累計損益を振り返るときにこのラベルで一覧できるようにする。
+const SAKATA_PROFIT_LABEL_ = '利益累計';
+
+/**
+ * 直前に送った酒田五法の通知メールへ SAKATA_PROFIT_LABEL_ を付けて受信トレイからアーカイブする。
+ * 送信直後（MailApp.sendEmail の直後）に呼ぶ想定。件名でスレッドを特定するため、
+ * 送信からラベル付けまでの間にGmail側の検索インデックスが追いつくよう少し待つ。
+ * ここで失敗してもメール送信自体は既に成功しているので、ログに残すだけで通知は止めない。
+ */
+function labelAndArchiveSentMail_(subject) {
+  try {
+    Utilities.sleep(2000);
+    const label = GmailApp.getUserLabelByName(SAKATA_PROFIT_LABEL_) || GmailApp.createLabel(SAKATA_PROFIT_LABEL_);
+    const threads = GmailApp.search('subject:"' + subject + '" newer_than:1d');
+    threads.forEach(t => { t.addLabel(label); t.moveToArchive(); });
+    if (threads.length) Logger.log(`「${SAKATA_PROFIT_LABEL_}」ラベルを付けてアーカイブしました（${threads.length}スレッド）`);
+  } catch (e) {
+    // GmailAppは新しい権限（gmail.modify相当）を要求するため、pushだけしてまだ再認証していない
+    // 場合はここで例外になる。その場合もメール本体は届いているので実害は無い。
+    Logger.log('酒田五法メールのラベル付け/アーカイブに失敗（メール送信自体は成功しています）: ' + e.message);
   }
 }
 

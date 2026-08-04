@@ -491,55 +491,55 @@ function finalizeSignals_(sig) {
   sig.setTabColor('#e0567a');
 }
 
-// 強さ★★★・方向「買い」のシグナルだけを抜き出し、簡潔な日次メールで通知する。
-// finalizeSignals_ が完了した直後（走査完了時）に呼ぶ。該当が無い日は送らない
+// sendTopBuySignalsEmail_ / sendHeldStockDirectionEmail_ 共通の骨格
+// （行フィルタ→件名/本文生成→送信→ログ→アーカイブ）をまとめたヘルパー。
+// finalizeSignals_ が完了した直後に呼ぶ。該当が無い日は送らない
 // （Asset_Status_Notifyのstockドロップ通知と同じ「該当がある時だけ送る」方針）。
 // コード(4列目)は finalizeSignals_ が TradingView への HYPERLINK 数式に置き換え済みだが、
 // getValues() は数式ではなく表示値（HYPERLINKの第2引数＝コード文字列）を返すため、
 // ここでは素のコード文字列として読める。
-function sendTopBuySignalsEmail_(sig) {
+function sendSignalEmail_(sig, opts) {
   try {
     if (sig.getLastRow() < 2) return;
     const n = sig.getLastRow() - 1;
     const rows = sig.getRange(2, 1, n, 9).getValues();   // 保有〜解説（1〜9列）
-    const top = rows.filter(r => r[1] === '★★★' && String(r[6]).indexOf('買い') !== -1);
-    if (!top.length) { Logger.log('★★★買いシグナル無し。メール送信スキップ'); return; }
+    const matched = rows.filter(opts.filterFn);
+    if (!matched.length) { Logger.log(opts.emptyLogMsg); return; }
 
-    const subject = `酒田五法_★3買い_${top.length}件`;
-    const body = top.map(r =>
-      `${r[3]}_${r[4]}_${r[5]}_${String(r[7]).replace(/\n/g, '/')}`   // コード_銘柄名_終値_シグナル名
-    ).join('\n');
+    const subject = opts.subjectFn(matched.length);
+    const body = matched.map(opts.rowFn).join('\n');
 
     MailApp.sendEmail(Session.getActiveUser().getEmail(), subject, body);
-    Logger.log('★★★買いシグナルメールを送信しました（' + top.length + '件）');
+    Logger.log(opts.successLogMsgFn(matched.length));
     labelAndArchiveSentMail_(subject);
   } catch (e) {
-    Logger.log('sendTopBuySignalsEmail_でエラー: ' + e.message);
+    Logger.log(opts.errLogPrefix + 'でエラー: ' + e.message);
   }
 }
 
+// 強さ★★★・方向「買い」のシグナルだけを抜き出し、簡潔な日次メールで通知する。
+function sendTopBuySignalsEmail_(sig) {
+  sendSignalEmail_(sig, {
+    filterFn: r => r[1] === '★★★' && String(r[6]).indexOf('買い') !== -1,
+    subjectFn: count => `酒田五法_★3買い_${count}件`,
+    rowFn: r => `${r[3]}_${r[4]}_${r[5]}_${String(r[7]).replace(/\n/g, '/')}`,   // コード_銘柄名_終値_シグナル名
+    emptyLogMsg: '★★★買いシグナル無し。メール送信スキップ',
+    successLogMsgFn: count => '★★★買いシグナルメールを送信しました（' + count + '件）',
+    errLogPrefix: 'sendTopBuySignalsEmail_',
+  });
+}
+
 // 保有銘柄のうち、今回のシグナル一覧に載った銘柄の方向をすべて通知する（★の絞り込みなし）。
-// finalizeSignals_ が完了した直後に呼ぶ。該当が無い日は送らない。
 // 保有マーク自体が機能していないと該当0件になる点に注意（getSbiHeldCodes_のreasonで原因が分かる）。
 function sendHeldStockDirectionEmail_(sig) {
-  try {
-    if (sig.getLastRow() < 2) return;
-    const n = sig.getLastRow() - 1;
-    const rows = sig.getRange(2, 1, n, 9).getValues();   // 保有〜解説（1〜9列）
-    const held = rows.filter(r => r[0] === '○');
-    if (!held.length) { Logger.log('保有銘柄のシグナル無し。メール送信スキップ'); return; }
-
-    const subject = `酒田五法_保有銘柄シグナル_${held.length}件`;
-    const body = held.map(r =>
-      `${r[3]}_${r[4]}_${String(r[6]).trim()}_${String(r[7]).replace(/\n/g, '/')}`   // コード_銘柄名_方向_シグナル名
-    ).join('\n');
-
-    MailApp.sendEmail(Session.getActiveUser().getEmail(), subject, body);
-    Logger.log('保有銘柄シグナルメールを送信しました（' + held.length + '件）');
-    labelAndArchiveSentMail_(subject);
-  } catch (e) {
-    Logger.log('sendHeldStockDirectionEmail_でエラー: ' + e.message);
-  }
+  sendSignalEmail_(sig, {
+    filterFn: r => r[0] === '○',
+    subjectFn: count => `酒田五法_保有銘柄シグナル_${count}件`,
+    rowFn: r => `${r[3]}_${r[4]}_${String(r[6]).trim()}_${String(r[7]).replace(/\n/g, '/')}`,   // コード_銘柄名_方向_シグナル名
+    emptyLogMsg: '保有銘柄のシグナル無し。メール送信スキップ',
+    successLogMsgFn: count => '保有銘柄シグナルメールを送信しました（' + count + '件）',
+    errLogPrefix: 'sendHeldStockDirectionEmail_',
+  });
 }
 
 // 酒田五法の通知メール（★3買い・保有銘柄シグナル）に付けるラベル。

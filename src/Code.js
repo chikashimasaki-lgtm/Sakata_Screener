@@ -509,7 +509,7 @@ function sendSignalEmail_(sig, opts) {
     const subject = opts.subjectFn(matched.length);
     const body = matched.map(opts.rowFn).join('\n');
 
-    MailApp.sendEmail(Session.getActiveUser().getEmail(), subject, body);
+    sendMail_(subject, body, Session.getActiveUser().getEmail());
     Logger.log(opts.successLogMsgFn(matched.length));
     labelAndArchiveSentMail_(subject);
   } catch (e) {
@@ -548,7 +548,7 @@ const SAKATA_PROFIT_LABEL_ = '利益累計';
 
 /**
  * 直前に送った酒田五法の通知メールへ SAKATA_PROFIT_LABEL_ を付けて受信トレイからアーカイブする。
- * 送信直後（MailApp.sendEmail の直後）に呼ぶ想定。件名でスレッドを特定するため、
+ * 送信直後（sendMail_ の直後）に呼ぶ想定。件名でスレッドを特定するため、
  * 送信からラベル付けまでの間にGmail側の検索インデックスが追いつくよう少し待つ。
  * ここで失敗してもメール送信自体は既に成功しているので、ログに残すだけで通知は止めない。
  */

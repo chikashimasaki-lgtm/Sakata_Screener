@@ -18,7 +18,7 @@
 // ============================================================================
 
 const SK = {
-  SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方', STATS: 'パターン成績', HISTORY: 'シグナル履歴' },
+  SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方', STATS: 'パターン成績', HISTORY: 'シグナル履歴', PLAN: '売買プラン' },
   YAHOO_RANGE: '6mo',
   BATCH: 40,
   TIME_BUDGET_MS: 4.5 * 60 * 1000,
@@ -49,6 +49,31 @@ const SK = {
   HS_TOL: 0.03,
   // 山と山の最低間隔（バー数）。隣接した極値の寄せ集めを「三山」と呼ばないため。
   HS_MIN_GAP: 4,
+  // 売買プラン（ダウ理論ベースの買い・利確・損切り）。詳細は buildOrderPlan_ を参照。
+  ORDER: {
+    // スイング（高値・安値）の確定に要求する左右のバー数。三山/三川と同じ3本。
+    // 右側にも3本要求するので、確定スイングは後から動かない（リペイントしない）。
+    SWING_W: 3,
+    // 利確幅＝損切り幅の何倍か。損切りはダウ理論（押し安値割れ＝上昇トレンド否定）で
+    // 決まるので、利確側だけをこの比率で機械的に置く。
+    RR: 2.0,
+    // 1トレードで許容する損失額（円）。株数はこの額に収まるように逆算する。
+    // スクリプトプロパティ SAKATA_RISK_BUDGET_YEN で上書き可。
+    RISK_BUDGET_YEN: 30000,
+    // 1銘柄あたりの建玉上限（円）。損切り幅が極端に狭いと株数が青天井になるため頭を押さえる。
+    // スクリプトプロパティ SAKATA_MAX_POSITION_YEN で上書き可。
+    MAX_POSITION_YEN: 1000000,
+    // 売買単位。東証は2018年10月に全銘柄100株へ統一済み。
+    LOT: 100,
+    // 損切り幅の下限（ATR14の何倍か）。押し安値が現値のすぐ下にあるとき、
+    // 理論どおりに置くと日中のノイズで確実に狩られるため、最低限の距離を確保する。
+    MIN_STOP_ATR: 0.5,
+    // 逆指値がヒットしたあとに出す指値を、トリガーの何ティック下に置くか。
+    // 成行だと滑るが、トリガーと同値の指値では約定しないことがあるための余裕。
+    STOP_SLIP_TICKS: 2,
+    // 注文の有効期間。押し安値・戻り高値は数日単位で有効なので当日中では取りこぼす。
+    TERM: '今週中',
+  },
 };
 
 // 共通モジュール ConfirmUi.js がトーストの見出しに使うプロジェクト名
@@ -67,6 +92,7 @@ function onOpen() {
     .addSeparator()
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行',            'scanSignals')
+    .addItem('売買プランを作成/更新（★3買い＋保有株）', 'buildPlans')
     .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights')
     .addItem('相場マクロ/急落サインを更新', 'updateMarketMacro')
     .addItem('決算カレンダーを更新',        'updateEarningsCalendar')
@@ -255,8 +281,17 @@ function scanSignals() {
     // 取得失敗は「シグナル0件」と紛らわしいので必ず件数を出す。
     ss.toast('走査完了: ' + hit + '件のシグナル'
       + (failed ? '（' + failed + '銘柄は取得できず未判定）' : ''), '酒田五法', 8);
-    sendTopBuySignalsEmail_(sig);   // 強さ★★★・買いだけを走査完了直後にメール通知
-    sendHeldStockDirectionEmail_(sig);   // 保有銘柄の方向を走査完了直後にメール通知
+    // ★3買い＋保有株のダウ理論ベース売買プラン（買い・利確・損切り・株数）。
+    // ここで落ちても走査結果とメールは残したいので、失敗しても通知は続ける。
+    let plans = {};
+    try {
+      plans = buildPlansFromSignals_(sig);
+    } catch (e) {
+      Logger.log('売買プランの作成に失敗（シグナル一覧は正常）: ' + e.message);
+      ss.toast('売買プランを作成できませんでした: ' + e.message, '酒田五法', 8);
+    }
+    sendTopBuySignalsEmail_(sig, plans);   // 強さ★★★・買いだけを走査完了直後にメール通知
+    sendHeldStockDirectionEmail_(sig, plans);   // 保有銘柄の方向を走査完了直後にメール通知
   }
 }
 
@@ -431,14 +466,10 @@ function finalizeSignals_(sig) {
 
   // コード(4列目)を TradingView 日足チャートへのハイパーリンクに。
   // 個人のチャートレイアウトIDはスクリプトプロパティ TRADINGVIEW_LAYOUT_ID で差し替えられる。
-  // 未設定ならレイアウト指定なしの汎用チャートを開く。
-  const TV = PropertiesService.getScriptProperties().getProperty('TRADINGVIEW_LAYOUT_ID') || '';
-  const tvUrl = code => TV
-    ? `https://jp.tradingview.com/chart/${TV}/?symbol=TSE:${code}&interval=D`
-    : `https://jp.tradingview.com/chart/?symbol=TSE:${code}&interval=D`;
+  // 未設定ならレイアウト指定なしの汎用チャートを開く（tvChartUrl_）。
   sig.getRange(2, 4, n, 1).setFormulas(data.map(row => {
     const code = to4_(String(row[3] || '').trim()).toUpperCase();
-    return [code ? `=HYPERLINK("${tvUrl(code)}","${code}")` : ''];
+    return [code ? `=HYPERLINK("${tvChartUrl_(code)}","${code}")` : ''];
   }));
 
   // 全体スタイル: 濃紺ヘッダ＋淡色の行帯＋ヘッダ固定
@@ -518,24 +549,48 @@ function sendSignalEmail_(sig, opts) {
 }
 
 // 強さ★★★・方向「買い」のシグナルだけを抜き出し、簡潔な日次メールで通知する。
-function sendTopBuySignalsEmail_(sig) {
+// plans（コード→売買プラン）があれば、ダウ理論ベースの買い・利確・損切りも1行添える。
+function sendTopBuySignalsEmail_(sig, plans) {
   sendSignalEmail_(sig, {
-    filterFn: r => r[1] === '★★★' && String(r[6]).indexOf('買い') !== -1,
+    filterFn: isTopBuyRow_,
     subjectFn: count => `酒田五法_★3買い_${count}件`,
-    rowFn: r => `${r[3]}_${r[4]}_${r[5]}_${String(r[7]).replace(/\n/g, '/')}`,   // コード_銘柄名_終値_シグナル名
+    // コード_銘柄名_終値_シグナル名（＋売買プラン）
+    rowFn: r => `${r[3]}_${r[4]}_${r[5]}_${String(r[7]).replace(/\n/g, '/')}`
+      + planMailLine_(plans, r[3]),
     emptyLogMsg: '★★★買いシグナル無し。メール送信スキップ',
     successLogMsgFn: count => '★★★買いシグナルメールを送信しました（' + count + '件）',
     errLogPrefix: 'sendTopBuySignalsEmail_',
   });
 }
 
+/**
+ * 「売買プラン」シートと同じ数字をメール本文に1行で添える。
+ * メールだけ見て発注できるようにするのが目的なので、シートと数字がずれてはいけない。
+ * 該当プランが無ければ空文字（行そのものは従来どおり出す）。
+ */
+function planMailLine_(plans, code) {
+  const p = plans && plans[to4_(String(code || '').trim()).toUpperCase()];
+  if (!p) return '';
+  // 保有株に「見送り」は無い（持っている以上、見送るという選択肢が無い）。
+  if (!p.ok) return '\n  └ 売買プラン: ' + (p.held ? '算出不可' : '見送り') + '（' + p.reason + '）';
+  // 保有中の銘柄には新規の買値が無い（返済売の2値だけを出す）。
+  // 空の買値を書くと、いくらで買えばいいのか分からないメールになる。
+  const entry = p.held ? '保有中' : (p.entryType + '買 ' + fmtNum_(p.entry));
+  return '\n  └ ' + entry
+    + ' / 利確 ' + fmtNum_(p.target) + ' / 損切 ' + fmtNum_(p.stop)
+    + (p.shares ? ' / ' + fmtNum_(p.shares) + '株 / 損切り額 ' + fmtNum_(p.lossYen) + '円' : '');
+}
+
 // 保有銘柄のうち、今回のシグナル一覧に載った銘柄の方向をすべて通知する（★の絞り込みなし）。
+// 保有株のプランは返済売の2値（利確・損切り）なので、シグナルが出た日に置き直せる。
 // 保有マーク自体が機能していないと該当0件になる点に注意（getSbiHeldCodes_のreasonで原因が分かる）。
-function sendHeldStockDirectionEmail_(sig) {
+function sendHeldStockDirectionEmail_(sig, plans) {
   sendSignalEmail_(sig, {
     filterFn: r => r[0] === '○',
     subjectFn: count => `酒田五法_保有銘柄シグナル_${count}件`,
-    rowFn: r => `${r[3]}_${r[4]}_${String(r[6]).trim()}_${String(r[7]).replace(/\n/g, '/')}`,   // コード_銘柄名_方向_シグナル名
+    // コード_銘柄名_方向_シグナル名（＋売買プラン＝いま置くべき利確・損切り）
+    rowFn: r => `${r[3]}_${r[4]}_${String(r[6]).trim()}_${String(r[7]).replace(/\n/g, '/')}`
+      + planMailLine_(plans, r[3]),
     emptyLogMsg: '保有銘柄のシグナル無し。メール送信スキップ',
     successLogMsgFn: count => '保有銘柄シグナルメールを送信しました（' + count + '件）',
     errLogPrefix: 'sendHeldStockDirectionEmail_',
@@ -596,6 +651,19 @@ function applySignalFormatRules_(sig, n) {
 // 保有ハイライトが機能していない理由（0件そのものは異常ではないので reason は null のまま）。
 // 以前は例外時しか呼び出し元に伝わらず、未設定で常に0件になっているだけの状態が
 // ユーザーからは「なぜか保有マークが出ない」としか見えなかった。
+// 保有数量・取得単価のヘッダ候補（現物と信用で列名が違う）。見つからなければ数量なしで扱う。
+const HELD_QTY_HEADERS_  = ['保有株数', '株数', '数量', '建株数'];
+const HELD_COST_HEADERS_ = ['取得単価', '平均取得単価', '建単価'];
+
+// 「1,234」「1,234 円」のような表示文字列を数値へ。読めなければ null（0にすると
+// 「株数0」と「株数不明」が区別できなくなり、損切り額を0円と表示してしまう）。
+function toNum_(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  const n = Number(String(v).replace(/[,\s円株]/g, ''));
+  return isFinite(n) ? n : null;
+}
+
 function getSbiHeldCodes_() {
   // 参照先スプレッドシートIDはスクリプトプロパティ ASSET_STATUS_SS_ID に置く。
   // 個人の資産管理シートのIDを公開リポジトリのソースに直接書かないため。
@@ -604,15 +672,25 @@ function getSbiHeldCodes_() {
   const SHEET_NAMES = ['SBI証券（日本株）', 'SBI証券（日本株信用）'];
   const CODE_RE = /^[0-9][0-9A-Z]{3}$/;                            // 4桁の証券コード（例 7203 / 130A）
   const set = new Set();
+  // コード→{shares, cost}。現物と信用の両方に同じ銘柄があれば株数を合算し、
+  // 取得単価は株数で加重平均する（売買プランの損切り額を建玉全体で出すため）。
+  const positions = {};
+  const addPos = (code, shares, cost) => {
+    if (!(shares > 0)) return;
+    const p = positions[code] || (positions[code] = { shares: 0, costSum: 0, costQty: 0, cost: null });
+    p.shares += shares;
+    if (cost > 0) { p.costSum += cost * shares; p.costQty += shares; }
+    p.cost = p.costQty ? p.costSum / p.costQty : null;
+  };
   if (!SBI_SS_ID) {
     Logger.log('ASSET_STATUS_SS_ID が未設定のため保有ハイライトをスキップ');
-    return { codes: set, reason: 'ASSET_STATUS_SS_ID未設定' };
+    return { codes: set, positions: positions, reason: 'ASSET_STATUS_SS_ID未設定' };
   }
   let ss;
   try { ss = SpreadsheetApp.openById(SBI_SS_ID); }
   catch (e) {
     Logger.log('SBIスプレッドシートを開けません: ' + e.message);
-    return { codes: set, reason: 'スプレッドシートを開けません: ' + e.message };
+    return { codes: set, positions: positions, reason: 'スプレッドシートを開けません: ' + e.message };
   }
   SHEET_NAMES.forEach(name => {
     const sh = ss.getSheetByName(name);
@@ -631,13 +709,20 @@ function getSbiHeldCodes_() {
       }));
       return;
     }
+    // 数量・取得単価の列も同じヘッダ行から探す。CSVの列名は現物/信用や年で変わるので、
+    // 見つからなければ数量なし（＝損切り額は未計算）として続行する。
+    const findCol = cands => data[hi].findIndex(v => cands.indexOf(String(v || '').trim()) >= 0);
+    const qi = findCol(HELD_QTY_HEADERS_);
+    const pi = findCol(HELD_COST_HEADERS_);
     for (let r = hi + 1; r < data.length; r++) {
       const s = to4_(String(data[r][ci] || '').trim()).toUpperCase();   // 5桁→4桁に正規化
-      if (CODE_RE.test(s)) set.add(s);
+      if (!CODE_RE.test(s)) continue;
+      set.add(s);
+      if (qi >= 0) addPos(s, toNum_(data[r][qi]), pi >= 0 ? toNum_(data[r][pi]) : null);
     }
   });
-  Logger.log('SBI保有銘柄コード: ' + set.size + '件');
-  return { codes: set, reason: null };
+  Logger.log('SBI保有銘柄コード: ' + set.size + '件（数量取得 ' + Object.keys(positions).length + '件）');
+  return { codes: set, positions: positions, reason: null };
 }
 
 // ============================================================================
@@ -1172,6 +1257,36 @@ function createUsageSheet() {
     ['     （相対順位ではないので、弱いシグナルしか出ていない日は★★★が0件になります）', 'p'],
     ['   ・方向列 … ▲買い(緑)/▼売り(赤)/◆混在(橙)。コードはTradingViewチャートへのリンク', 'p'],
     ['   ・K1セル … 走査の進捗と最終更新時刻を表示（走査中／完了・取得失敗件数）', 'p'],
+    ['5. 走査完了時に「売買プラン」シートが自動生成されます（★3買い＋保有株）', 'p'],
+    ['', 'p'],
+    ['■ 「売買プラン」シート（ダウ理論の買い・利確・損切り）', 'h'],
+    ['日々これ1枚を見れば発注できるように、今日さわる銘柄だけを並べたシートです。', 'p'],
+    ['・区分「★3買い」（緑）… これから建てる銘柄。買い・利確・損切りと株数を出します', 'p'],
+    ['・区分「保有」（橙）… いま持っている全銘柄。買値と株数は実際の建玉で、', 'p'],
+    ['   これから置くべき返済売の2値（利確・損切り）を計算します', 'p'],
+    ['   ※保有銘柄はシグナルが点灯していなくても載ります（損切りの置き直しのため）', 'p'],
+    ['価格の見出しに付いている OCO1/OCO2 は、SBI証券アプリの注文画面の欄名です。', 'p'],
+    ['・損切り（OCO2）… 押し安値の1ティック下。ここを割ると上昇トレンドが否定されるため', 'p'],
+    ['・買い（価格）… 上昇トレンド継続中なら現値の指値。転換がまだ確定していなければ、', 'p'],
+    ['   直近の戻り高値を上抜けた逆指値（＝ダウ理論で転換が確定する水準）。保有行は建値', 'p'],
+    ['・利確（OCO1）… 買い＋損切り幅×2.0（ダウ理論に利確の水準は無いため固定比率）', 'p'],
+    ['・株数 … ★3買いは許容損失（既定3万円）に収まる最大株数を100株単位で。建玉上限は既定100万円', 'p'],
+    ['   ※許容損失と建玉上限はスクリプトプロパティ SAKATA_RISK_BUDGET_YEN / SAKATA_MAX_POSITION_YEN で変更', 'p'],
+    ['・損切り額 … その損切りに当たったときに失う金額。保有行は現在値からの下落分', 'p'],
+    ['・メモ列が「見送り」「算出不可」の行（淡赤）は発注しないでください。理由も同じ列に出ます', 'p'],
+    ['   （価格欄には算出できた水準を参考として出しますが、株数が無いので発注はできません）', 'p'],
+    ['・メニュー「売買プランを作成/更新」で、走査をやり直さずにプランだけ引き直せます', 'p'],
+    ['   （許容損失額を変えたときや、保有銘柄を入れ替えたとき）', 'p'],
+    ['', 'p'],
+    ['■ 通知メール', 'h'],
+    ['走査完了時に2通のメールを自動送信します（該当が無い日は送りません）。', 'p'],
+    ['・酒田五法_★3買い_N件 … ★★★かつ買いのシグナル', 'p'],
+    ['・酒田五法_保有銘柄シグナル_N件 … 保有銘柄に出たシグナル（方向を問わず）', 'p'],
+    ['どちらも各銘柄の下に売買プラン（買い・利確・損切り・株数・損切り額）が1行付きます。', 'p'],
+    ['メールだけ見て発注できるように、「売買プラン」シートと同じ数字を載せています。', 'p'],
+    ['送信後は「利益累計」ラベルを付けて受信トレイからアーカイブします。', 'p'],
+    ['   （後で損益を振り返るときに、このラベルで一覧できるようにするため）', 'p'],
+    ['ここに出る価格は「シグナルの前提が崩れる水準」であって、値上がりの保証ではありません。', 'note'],
     ['', 'p'],
     ['■ 「相場マクロ」シート（地合いの入力）', 'h'],
     ['急落サインの判定材料を入れるシートです。B列が値、C列が最終更新日です。', 'p'],
@@ -1229,7 +1344,8 @@ function createUsageSheet() {
     ['■ 注意', 'h'],
     ['・シグナルは補助情報です。だましもあります。必ず自身で確認してください。', 'note'],
     ['・★は「形の強さ」であって期待収益ではありません。', 'note'],
-    ['・損切り・利確・ポジションサイズ・銘柄分散はこのツールの対象外です。', 'note'],
+    ['・損切り・利確・株数は★3買いと保有株だけ「売買プラン」シートで出します。', 'note'],
+    ['   それ以外の銘柄と、銘柄分散・総リスク量の管理はこのツールの対象外です。', 'note'],
     ['・株価は分割・配当調整済み。売買代金が細い銘柄（直近20日の中央値5,000万円未満）は対象外です。', 'p'],
     ['', 'p'],
     ['■ 用語', 'h'],
@@ -1388,4 +1504,466 @@ function clearBtResume_() {
 function scheduledBacktest() {
   if (!isBusinessDay_(new Date())) { Logger.log('休場日のため成績集計をスキップ'); return; }
   backtestWeights();
+}
+
+// ============================================================================
+//  売買プラン（ダウ理論ベースの 買い / 利確 / 損切り）
+//  ---------------------------------------------------------------------------
+//  ★★★かつ方向「買い」のシグナルと、いま保有している全銘柄を対象に、
+//  ダウ理論の押し安値・戻り高値から 買い・利確・損切り の3価格と株数を出し、
+//  「売買プラン」シート1枚に並べる。価格の見出しには対応するSBI注文画面の欄名
+//  （OCO1/OCO2）を添えてあるので、画面を見ながらそのまま転記できる。
+//
+//  ★3買い … これから建てる銘柄。買い・利確・損切りと、許容損失から逆算した株数。
+//  保有   … すでに建っている銘柄。買値と株数は実際の建玉を出し、
+//           これから置くべき返済売の2値（利確・損切り）を計算する。
+//
+//  なぜダウ理論か:
+//    ダウ理論では上昇トレンドを「高値切り上げ・安値切り上げ」で定義し、
+//    トレンドは明確な転換シグナルが出るまで継続するとみなす。
+//    裏を返すと「直近の押し安値を割った時点で上昇トレンドは否定された」ので、
+//    そこが最も理屈の通った損切り位置になる。利確側にはダウ理論由来の水準が無いため、
+//    損切り幅に対する固定比率（SK.ORDER.RR）で置く。
+//
+//  ※ 出てくる数字は「シグナルの前提が崩れる水準」であって、値上がりの保証ではない。
+// ============================================================================
+
+/**
+ * 東証の呼値（通常銘柄）。
+ * TOPIX100構成銘柄は刻みがさらに細かいが、通常銘柄の刻みは全価格帯で
+ * TOPIX100の刻みの整数倍になっているため、粗い方（通常銘柄）で丸めておけば
+ * どちらの銘柄でも板に乗る値段になる。構成銘柄リストを持たずに済ませるための選択。
+ */
+function tickSize_(price) {
+  const p = Number(price);
+  if (!(p > 0)) return 1;
+  if (p <= 3000) return 1;
+  if (p <= 5000) return 5;
+  if (p <= 30000) return 10;
+  if (p <= 50000) return 50;
+  if (p <= 300000) return 100;
+  if (p <= 500000) return 500;
+  if (p <= 3000000) return 1000;
+  if (p <= 5000000) return 5000;
+  return 10000;
+}
+
+/**
+ * 呼値に丸める。dir='down' なら切り捨て、'up' なら切り上げ。
+ * 買いの指値・利確・損切りは切り捨て、逆指値の買いだけは切り上げる
+ * （切り捨てると狙った水準より手前で発動してしまうため）。
+ */
+function roundToTick_(price, dir) {
+  const t = tickSize_(price);
+  const q = price / t;
+  // 1595.5/0.5 のような割り切れる値が浮動小数で 3190.9999… になり、
+  // 切り捨てで1ティック下にずれるのを防ぐ。
+  const n = dir === 'up' ? Math.ceil(q - 1e-9) : Math.floor(q + 1e-9);
+  return Math.round(n * t * 1e6) / 1e6;
+}
+
+// 値幅制限（JPX）。[基準値段の上限（未満）, 制限値幅]。
+const PRICE_LIMIT_TABLE_ = [
+  [100, 30], [200, 50], [500, 80], [700, 100], [1000, 150], [1500, 300],
+  [2000, 400], [3000, 500], [5000, 700], [7000, 1000], [10000, 1500],
+  [15000, 3000], [20000, 4000], [30000, 5000], [50000, 7000], [70000, 10000],
+  [100000, 15000], [150000, 30000], [200000, 40000], [300000, 50000],
+  [500000, 70000], [700000, 100000], [1000000, 150000], [1500000, 300000],
+  [2000000, 400000], [3000000, 500000], [5000000, 700000], [7000000, 1000000],
+  [10000000, 1500000], [15000000, 3000000], [20000000, 4000000],
+  [30000000, 5000000], [50000000, 7000000],
+];
+
+/**
+ * その日の制限値幅。基準値段は前営業日の終値＝走査に使った最終足の終値。
+ * 大引け後に翌営業日の注文を出す前提なので、最終足の終値がそのまま基準値段になる。
+ * 利確・損切りがこの外に出ていると、その値段では発注自体ができない。
+ */
+function priceLimit_(base) {
+  const b = Number(base);
+  let w = 10000000;
+  for (let i = 0; i < PRICE_LIMIT_TABLE_.length; i++) {
+    if (b < PRICE_LIMIT_TABLE_[i][0]) { w = PRICE_LIMIT_TABLE_[i][1]; break; }
+  }
+  return { low: Math.max(b - w, 1), high: b + w, width: w };
+}
+
+/**
+ * ダウ理論のスイング（確定した高値・安値）と、そこから導かれるトレンド。
+ * findExtrema_ は左右 w 本より高い（低い）足だけを極値とするので、
+ * 右側 w 本が埋まるまで確定しない＝あとから位置が動かない。
+ */
+function dowSwings_(bars, w) {
+  const out = { high: null, low: null, prevHigh: null, prevLow: null,
+                highIdx: null, lowIdx: null, trend: 'レンジ' };
+  if (!bars || bars.length < w * 2 + 3) return out;
+  const highs = bars.map(b => b.h), lows = bars.map(b => b.l);
+  const pk = findExtrema_(highs, w, true);
+  const tr = findExtrema_(lows, w, false);
+  if (pk.length)      { out.highIdx = pk[pk.length - 1]; out.high = highs[out.highIdx]; }
+  if (pk.length >= 2) { out.prevHigh = highs[pk[pk.length - 2]]; }
+  if (tr.length)      { out.lowIdx = tr[tr.length - 1];  out.low  = lows[out.lowIdx]; }
+  if (tr.length >= 2) { out.prevLow  = lows[tr[tr.length - 2]]; }
+  // 高値・安値がそろって切り上がっていれば上昇、そろって切り下がっていれば下降。
+  // 片方だけの切り上げ（切り下げ）はダウ理論ではトレンドと呼ばない。
+  if (out.high != null && out.prevHigh != null && out.low != null && out.prevLow != null) {
+    if (out.high > out.prevHigh && out.low > out.prevLow) out.trend = '上昇';
+    else if (out.high < out.prevHigh && out.low < out.prevLow) out.trend = '下降';
+  }
+  return out;
+}
+
+/**
+ * 押し安値＝「割れたら上昇トレンドが否定される安値」。
+ *
+ * 確定スイング安値そのものではなく、そこから最終足までの最安値を使う。
+ * 確定スイング安値だけを見ると、その後さらに切り下げた足（右側 w 本が
+ * まだ無くスイングと認定できない足）を無視することになり、明けの明星のような
+ * 大底の転換シグナルでは損切りが現値より上に来てしまう。
+ */
+function pullbackLow_(bars, sw) {
+  if (!bars || !bars.length || sw.lowIdx == null) return null;
+  let m = Infinity;
+  for (let i = sw.lowIdx; i < bars.length; i++) m = Math.min(m, bars[i].l);
+  return isFinite(m) ? m : null;
+}
+
+// SK.ORDER にスクリプトプロパティの上書きを反映した設定を返す。
+// 許容損失額と建玉上限は人によって違うので、コードを触らず変えられるようにしている。
+function orderConfig_() {
+  const cfg = {};
+  Object.keys(SK.ORDER).forEach(k => { cfg[k] = SK.ORDER[k]; });
+  try {
+    const p = PropertiesService.getScriptProperties();
+    const num = (key, def) => {
+      const v = Number(p.getProperty(key));
+      return (isFinite(v) && v > 0) ? v : def;
+    };
+    cfg.RISK_BUDGET_YEN  = num('SAKATA_RISK_BUDGET_YEN',  cfg.RISK_BUDGET_YEN);
+    cfg.MAX_POSITION_YEN = num('SAKATA_MAX_POSITION_YEN', cfg.MAX_POSITION_YEN);
+  } catch (e) {
+    Logger.log('売買プランの設定読み込みに失敗（既定値で継続）: ' + e.message);
+  }
+  return cfg;
+}
+
+/**
+ * ダウ理論から 買い・利確・損切り・株数 を計算する。GAS非依存の純関数。
+ *
+ *   損切り  = 押し安値の1ティック下（＝上昇トレンド否定の水準）
+ *             ただし ATR14×MIN_STOP_ATR より近い場合はそこまで広げる
+ *   買い    = 上昇トレンド継続中なら現値の指値（押し目待ち）
+ *             まだトレンド転換が確定していなければ、直近の戻り高値を上抜けた
+ *             ところの逆指値（＝ダウ理論で転換が確定する水準）
+ *   利確    = 基準価格 + 損切り幅 × RR
+ *   株数    = 許容損失額に収まる最大株数（LOT単位・建玉上限で頭打ち）
+ *
+ * pos（{shares, cost}）を渡すと保有株モードになり、買値と株数の逆算は行わない。
+ * すでに建っているのでリスクの起点（basis）は買値ではなく現在値になり、
+ * 出すのは返済売の2値（利確・損切り）だけになる。
+ *
+ * 成立しない場合は ok:false と reason を返す（黙って0を出すと発注してしまうため）。
+ */
+function buildOrderPlan_(bars, cfg, pos) {
+  const c = cfg || orderConfig_();
+  const held = !!pos;   // 保有株モード（新規の買値は出さず、返済売の2値だけを出す）
+  const out = {
+    ok: false, reason: '', notes: [], held: held,
+    close: null, trend: '', pullbackLow: null, swingHigh: null,
+    entryType: '', entry: null, basis: null, target: null, stop: null, stopLimit: null,
+    shares: 0, riskPerShare: 0, lossYen: 0, profitYen: 0, rr: 0,
+    limitLow: null, limitHigh: null,
+  };
+  if (!bars || bars.length < c.SWING_W * 2 + 5) { out.reason = '足が不足（スイングを確定できない）'; return out; }
+
+  const close = bars[bars.length - 1].c;
+  out.close = close;
+  const lim = priceLimit_(close);
+  out.limitLow = lim.low; out.limitHigh = lim.high;
+
+  const sw = dowSwings_(bars, c.SWING_W);
+  out.trend = sw.trend;
+  out.swingHigh = sw.high;
+
+  const pl = pullbackLow_(bars, sw);
+  if (pl == null) { out.reason = '押し安値を特定できない（確定スイング安値なし）'; return out; }
+  out.pullbackLow = pl;
+
+  // --- 買い（基準価格）-----------------------------------------------------
+  // basis は「リスクを測る起点」。新規はこれから建てる買値、保有はいまの値段
+  // （すでに建っているので、これから失いうるのは現在値から損切りまでの下落分）。
+  if (held) {
+    out.entryType = '';
+    out.basis = roundToTick_(close, 'down');
+  } else if (sw.trend === '上昇' || sw.high == null || sw.high <= close) {
+    // 高値・安値とも切り上がっている＝トレンドは継続中。追いかけずに現値の指値で待つ。
+    // 直近の戻り高値を既に上抜けている場合も、上抜けを待つ意味が無いのでこちら。
+    out.entryType = '指値';
+    out.entry = out.basis = roundToTick_(close, 'down');
+  } else {
+    // まだ高値切り上げが確認できていない。戻り高値を上抜けて初めてダウ理論上の
+    // 転換が確定するので、そこに逆指値を置いて「確定してから乗る」。
+    out.entryType = '逆指値';
+    out.entry = out.basis = roundToTick_(sw.high + tickSize_(sw.high), 'up');
+  }
+
+  // 呼値に丸めた結果が0以下になるのは1円未満の異常値のときだけだが、
+  // そのまま進むと株数の計算が0除算でInfinityになり、巨大な株数が出てしまう。
+  if (!(out.basis > 0)) { out.reason = '買値を算定できない（呼値に丸めると0以下）'; return out; }
+
+  // --- 損切り -------------------------------------------------------------
+  let stop = pl - tickSize_(pl);
+  const a = atr_(bars, 14, 0);
+  const minDist = a * c.MIN_STOP_ATR;
+  if (minDist > 0 && (out.basis - stop) < minDist) {
+    stop = out.basis - minDist;
+    out.notes.push('損切り幅をATR14×' + c.MIN_STOP_ATR + 'まで拡大');
+  }
+  stop = roundToTick_(stop, 'down');
+  out.stop = stop;
+
+  const risk = out.basis - stop;
+  if (!(risk > 0)) { out.reason = '押し安値が基準価格以上（損切りをその下に置けない）'; return out; }
+  out.riskPerShare = risk;
+
+  // 逆指値がヒットした後に出す指値。成行だと滑るが、トリガーと同値だと約定しないことがある。
+  out.stopLimit = roundToTick_(stop - tickSize_(stop) * c.STOP_SLIP_TICKS, 'down');
+
+  // --- 利確 ---------------------------------------------------------------
+  out.target = roundToTick_(out.basis + risk * c.RR, 'down');
+  out.rr = Math.round(((out.target - out.basis) / risk) * 100) / 100;
+
+  // --- 株数 ---------------------------------------------------------------
+  if (held) {
+    // 保有株はもう建っているので逆算しない。数量が取れなければ価格だけ出す
+    // （0株として損切り額0円と表示すると、リスクが無いように見えてしまう）。
+    out.shares = (pos.shares > 0) ? pos.shares : 0;
+    if (!out.shares) out.notes.push('保有株数を取得できず損切り額は未計算');
+  } else {
+    const lot = c.LOT;
+    const byRisk = Math.floor(c.RISK_BUDGET_YEN / risk / lot) * lot;
+    const byCap  = Math.floor(c.MAX_POSITION_YEN / out.basis / lot) * lot;
+    const shares = Math.min(byRisk, byCap);
+    if (shares < lot) {
+      // どちらの制約で建てられないのかを書き分ける。まとめて「リスク過大」と出すと、
+      // 実際には値がさ株で建玉上限に当たっているだけのときに損切り幅を疑ってしまう。
+      out.reason = (byCap < lot)
+        ? '建玉上限（' + fmtNum_(c.MAX_POSITION_YEN) + '円）では買値' + fmtNum_(out.basis)
+          + '円の' + lot + '株を建てられない'
+        : 'リスク過大（1株あたり' + fmtNum_(Math.round(risk)) + '円の損切り幅では、'
+          + '許容損失' + fmtNum_(c.RISK_BUDGET_YEN) + '円で' + lot + '株も建てられない）';
+      return out;
+    }
+    if (byCap < byRisk) out.notes.push('建玉上限で株数を抑制');
+    out.shares = shares;
+  }
+  out.lossYen   = out.shares ? Math.round(risk * out.shares) : 0;
+  out.profitYen = out.shares ? Math.round((out.target - out.basis) * out.shares) : 0;
+
+  // 制限値幅の外は、その値段では発注できない（クリップせず注意書きにとどめる。
+  // 勝手に丸めるとダウ理論上の水準と違う数字を出すことになるため）。
+  if (out.target > lim.high) out.notes.push('利確が制限値幅の上限外（当日は発注不可）');
+  if (out.stop   < lim.low)  out.notes.push('損切りが制限値幅の下限外（当日は発注不可）');
+
+  out.ok = true;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+//  シート出力（★3買い＋保有株の1枚）
+// ---------------------------------------------------------------------------
+
+// 「売買プラン」シートの列。日々これ1枚を見れば発注できる粒度に絞る。
+// 価格3つの見出しには対応するSBI注文画面の欄名を添える（転記先を迷わないため）。
+const PLAN_HEADERS_ = [
+  '区分', 'コード', '銘柄名', '現在値', '株数',
+  '買い(価格)', '利確(OCO1)', '損切り(OCO2)', '損切り額', 'シグナル', 'メモ',
+];
+
+// ★★★かつ買いの行か（シグナルシートの1〜9列を受け取る）。メールと売買プランで同じ条件を使う。
+function isTopBuyRow_(r) {
+  return r[1] === '★★★' && String(r[6]).indexOf('買い') !== -1;
+}
+
+// TradingView 日足チャートのURL。個人のレイアウトIDはスクリプトプロパティで差し替え可。
+function tvChartUrl_(code) {
+  const TV = PropertiesService.getScriptProperties().getProperty('TRADINGVIEW_LAYOUT_ID') || '';
+  return TV
+    ? `https://jp.tradingview.com/chart/${TV}/?symbol=TSE:${code}&interval=D`
+    : `https://jp.tradingview.com/chart/?symbol=TSE:${code}&interval=D`;
+}
+
+function fmtNum_(v) {
+  if (v == null || !isFinite(v)) return '';
+  return Number(v).toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
+
+// シグナル列（「・赤三兵\n・切り込み線」）を1行の読み物に。
+function signalText_(cell) {
+  return String(cell || '').replace(/・/g, '').replace(/\n/g, ' / ');
+}
+
+/**
+ * 売買プランの対象を組み立てる。★3買いが先、保有株が後。
+ *
+ * 同じ銘柄が両方に該当したら「保有」1行にまとめる。すでに持っている銘柄で
+ * まずやることは新規建てではなく返済売の置き直しなので、買いプランを併記すると
+ * どちらを実行すべきか迷う。買い増し候補であることはメモに残す。
+ */
+function planTargets_(rows, held) {
+  const codes = held && held.codes ? held.codes : new Set();
+  const positions = (held && held.positions) || {};
+  const byCode = {};
+  rows.forEach(r => { byCode[to4_(String(r[3] || '').trim()).toUpperCase()] = r; });
+
+  const buys = rows.filter(isTopBuyRow_)
+    .map(r => ({ kind: '★3買い', code: to4_(String(r[3] || '').trim()).toUpperCase(),
+                 name: r[4] || '', signal: signalText_(r[7]), pos: null }))
+    .filter(t => t.code && !codes.has(t.code));
+
+  const holds = [];
+  codes.forEach(code => {
+    const r = byCode[code];
+    holds.push({
+      kind: '保有', code: code,
+      name: r ? (r[4] || '') : '',
+      signal: r ? signalText_(r[7]) : '',
+      note: (r && isTopBuyRow_(r)) ? '★3買いシグナルあり（買い増し候補）' : '',
+      pos: positions[code] || { shares: 0, cost: null },
+    });
+  });
+  holds.sort((a, b) => String(a.code).localeCompare(String(b.code)));
+  return buys.concat(holds);
+}
+
+// 1銘柄ぶんのシート行。算出できなかった場合も、そこまでで計算できた価格
+// （買い・利確・損切り）はメモの理由とあわせて出す。株数だけは0にせず空にする
+// （見送りの原因は株数側にあるため、価格まで隠す理由はない）。
+function planRow_(t, p) {
+  const held = t.kind === '保有';
+  const pos = t.pos || {};
+  if (!p || !p.ok) {
+    const why = (p && p.reason) ? p.reason : '株価を取得できず未計算';
+    return [t.kind, t.code, t.name, p ? p.close : '', held ? (pos.shares || '') : '',
+      held ? (pos.cost || '') : (p && p.entry != null ? p.entry : ''),
+      (p && p.target != null) ? p.target : '',
+      (p && p.stop != null) ? p.stop : '',
+      '', t.signal,
+      (held ? '算出不可：' : '見送り：') + why];
+  }
+  const notes = [];
+  if (t.note) notes.push(t.note);
+  // 買い方はトレンドではなく実際の注文種別で書く。トレンド未確定でも戻り高値を
+  // 既に上抜けていれば指値になるので、トレンドだけで文言を決めると実態とずれる。
+  notes.push(held ? '押し安値' + fmtNum_(p.pullbackLow) + '割れで手仕舞い'
+    : p.entryType === '逆指値' ? '転換初動（戻り高値の上抜けを逆指値で待つ）'
+    : p.trend === '上昇' ? '上昇トレンド継続（押し目を指値で待つ）'
+    : '戻り高値を上抜け済み（現値の指値）');
+  p.notes.forEach(n => notes.push(n));
+
+  return [t.kind, t.code, t.name, p.close,
+    p.shares || '',
+    held ? (pos.cost || '') : p.entry,
+    p.target, p.stop, p.lossYen || '', t.signal, notes.join('／')];
+}
+
+/**
+ * 対象銘柄の日足を取り直して売買プランを計算し、「売買プラン」シートへ書き出す。
+ * 戻り値は コード→plan のマップ（★3買いメールが同じ数字を載せるために使う）。
+ *
+ * 走査時の bars を使い回さず取り直しているのは、走査が時間分割・自動再開で
+ * 複数回の実行にまたがるため、最後の実行に全銘柄の bars が残っていないから。
+ * 保有株はそもそもシグナルが点灯しなくても載せるので、いずれにせよ取り直しが要る。
+ */
+function writePlanSheet_(targets) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(SK.SHEETS.PLAN);
+  if (!sh) sh = ss.insertSheet(SK.SHEETS.PLAN);
+  const oldFilter = sh.getFilter(); if (oldFilter) oldFilter.remove();
+  sh.clear();
+  sh.getRange(1, 1, 1, PLAN_HEADERS_.length).setValues([PLAN_HEADERS_]);
+  sh.setTabColor('#1b7a3d');
+
+  const plans = {};
+  if (!targets.length) {
+    sh.getRange(2, 1).setValue('★★★の買いシグナルも保有銘柄もありません');
+    styleSheet_(sh, PLAN_HEADERS_.length, '#14331f', '#eaf6ee');
+    return plans;
+  }
+
+  const cfg = orderConfig_();
+  const resps = fetchAllWithRetry_(targets.map(t => ({
+    url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(t.code) +
+         '.T?range=' + SK.YAHOO_RANGE + '&interval=1d',
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    muteHttpExceptions: true,
+  }))) || [];
+
+  const rows = targets.map((t, i) => {
+    const res = resps[i];
+    const bars = (res && res.getResponseCode() === 200) ? parseYahooBars_(res) : [];
+    if (!bars.length) return planRow_(t, null);
+    const p = buildOrderPlan_(bars, cfg, t.pos);
+    plans[t.code] = p;
+    return planRow_(t, p);
+  });
+
+  const n = rows.length;
+  sh.getRange(2, 1, n, PLAN_HEADERS_.length).setValues(rows);
+  sh.getRange(2, 2, n, 1).setFormulas(targets.map(t =>
+    [t.code ? `=HYPERLINK("${tvChartUrl_(t.code)}","${t.code}")` : '']));
+
+  styleSheet_(sh, PLAN_HEADERS_.length, '#14331f', '#eaf6ee');
+  autoFit_(sh, 5);
+  [4, 6, 7, 8].forEach(col => sh.getRange(2, col, n, 1).setNumberFormat('#,##0.##'));
+  [5, 9].forEach(col => sh.getRange(2, col, n, 1).setNumberFormat('#,##0'));
+  sh.getRange(2, 1, n, 1).setHorizontalAlignment('center').setVerticalAlignment('middle');
+  sh.getRange(2, 2, n, 1).setHorizontalAlignment('right');
+  sh.getRange(2, 9, n, 1).setFontColor('#c0392b');    // 損切り額は赤（失う側の金額だと分かるように）
+  sh.setColumnWidth(10, 200); sh.getRange(2, 10, n, 1).setWrap(true).setVerticalAlignment('top');
+  sh.setColumnWidth(11, 300); sh.getRange(2, 11, n, 1).setWrap(true).setVerticalAlignment('top');
+
+  const all = sh.getRange(2, 1, n, PLAN_HEADERS_.length);
+  const kind = sh.getRange(2, 1, n, 1);
+  sh.setConditionalFormatRules([
+    // 価格が出せなかった行は淡赤で潰す（発注してよい行と一目で区別するため）
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=OR(LEFT($K2,3)="見送り",LEFT($K2,4)="算出不可")')
+      .setBackground('#f6e3e3').setFontColor('#8a3a3a').setRanges([all]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo('★3買い').setBackground('#e3f5ea').setFontColor('#1b7a3d').setBold(true)
+      .setRanges([kind]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo('保有').setBackground('#fff3da').setFontColor('#8a6100').setBold(true)
+      .setRanges([kind]).build(),
+  ]);
+  sh.getRange(1, 1, n + 1, PLAN_HEADERS_.length).createFilter();
+  return plans;
+}
+
+// シグナルシートと保有銘柄から売買プランを作り直す（走査完了時とメニューの両方から呼ぶ）。
+function buildPlansFromSignals_(sig) {
+  const rows = (sig && sig.getLastRow() >= 2)
+    ? sig.getRange(2, 1, sig.getLastRow() - 1, 9).getValues() : [];
+  let held = { codes: new Set(), positions: {}, reason: null };
+  try {
+    held = getSbiHeldCodes_();
+    if (held.reason) Logger.log('保有株を売買プランに載せられません: ' + held.reason);
+  } catch (e) {
+    // 参照元の権限切れ等。★3買いだけでもプランは出したいので止めない。
+    Logger.log('保有銘柄の取得に失敗（★3買いのみで継続）: ' + e.message);
+  }
+  return writePlanSheet_(planTargets_(rows, held));
+}
+
+// メニュー「売買プランを作成/更新」。走査をやり直さずにプランだけ引き直せるようにしておく
+// （許容損失額を変えて株数を見直したいときや、保有銘柄を入れ替えたとき）。
+function buildPlans() {
+  const ss = SpreadsheetApp.getActive();
+  const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
+  if (!sig || sig.getLastRow() < 2) throw new Error('先に「シグナル走査」を実行してください');
+  const plans = buildPlansFromSignals_(sig);
+  const ok = Object.keys(plans).filter(k => plans[k].ok).length;
+  ss.toast('売買プランを更新しました（算出できた銘柄 ' + ok + '件 / 対象 '
+    + Object.keys(plans).length + '件）', APP_NAME_, 6);
 }

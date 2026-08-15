@@ -576,9 +576,13 @@ function planMailLine_(plans, code) {
   // 保有中の銘柄には新規の買値が無い（返済売の2値だけを出す）。
   // 空の買値を書くと、いくらで買えばいいのか分からないメールになる。
   const entry = p.held ? '保有中' : (p.entryType + '買 ' + fmtNum_(p.entry));
+  // 保有株はトレンドが崩れた時点で、押し安値割れを待たずに手仕舞いを検討してほしい
+  // （シートの警告ハイライトと同じ判断材料を、メールだけ見ても分かるようにする）。
+  const trendWarn = (p.held && p.trend !== '上昇') ? ' ／トレンド崩れ・早期手仕舞い検討' : '';
   return '\n  └ ' + entry
     + ' / 利確 ' + fmtNum_(p.target) + ' / 損切 ' + fmtNum_(p.stop)
-    + (p.shares ? ' / ' + fmtNum_(p.shares) + '株 / 損切り額 ' + fmtNum_(p.lossYen) + '円' : '');
+    + (p.shares ? ' / ' + fmtNum_(p.shares) + '株 / 損切り額 ' + fmtNum_(p.lossYen) + '円' : '')
+    + trendWarn;
 }
 
 // 保有銘柄のうち、今回のシグナル一覧に載った銘柄の方向をすべて通知する（★の絞り込みなし）。
@@ -694,7 +698,8 @@ function getSbiHeldCodes_() {
   }
   SHEET_NAMES.forEach(name => {
     const sh = ss.getSheetByName(name);
-    if (!sh || sh.getLastRow() < 1) return;
+    if (!sh) { Logger.log('保有取得: シート「' + name + '」が見つかりません'); return; }
+    if (sh.getLastRow() < 1) { Logger.log('保有取得: シート「' + name + '」が空です'); return; }
     const data = sh.getDataRange().getValues();
     // 「銘柄コード」ヘッダの列を特定（Asset_Status のCSV取込と同じ構造）
     let hi = -1, ci = -1;
@@ -702,11 +707,16 @@ function getSbiHeldCodes_() {
       const c = data[r].findIndex(v => String(v || '').trim() === '銘柄コード');
       if (c >= 0) { hi = r; ci = c; }
     }
+    Logger.log('保有取得: シート「' + name + '」' + data.length + '行 / ヘッダ'
+      + (ci >= 0 ? '発見(行' + hi + ' 列' + ci + ')' : '見つからず（保険で全セル走査）')
+      + ' / 先頭行サンプル: ' + JSON.stringify((data[0] || []).slice(0, 6)));
     if (ci < 0) {   // ヘッダが見つからなければ全セルから4桁コードを拾う保険
+      let hit = 0;
       data.forEach(row => row.forEach(v => {
         const s = to4_(String(v || '').trim()).toUpperCase();   // 5桁→4桁に正規化
-        if (CODE_RE.test(s)) set.add(s);
+        if (CODE_RE.test(s)) { set.add(s); hit++; }
       }));
+      Logger.log('保有取得: シート「' + name + '」保険走査でのヒット数 ' + hit);
       return;
     }
     // 数量・取得単価の列も同じヘッダ行から探す。CSVの列名は現物/信用や年で変わるので、
@@ -714,12 +724,16 @@ function getSbiHeldCodes_() {
     const findCol = cands => data[hi].findIndex(v => cands.indexOf(String(v || '').trim()) >= 0);
     const qi = findCol(HELD_QTY_HEADERS_);
     const pi = findCol(HELD_COST_HEADERS_);
+    let hit = 0;
     for (let r = hi + 1; r < data.length; r++) {
       const s = to4_(String(data[r][ci] || '').trim()).toUpperCase();   // 5桁→4桁に正規化
       if (!CODE_RE.test(s)) continue;
       set.add(s);
+      hit++;
       if (qi >= 0) addPos(s, toNum_(data[r][qi]), pi >= 0 ? toNum_(data[r][pi]) : null);
     }
+    Logger.log('保有取得: シート「' + name + '」データ行 ' + (data.length - hi - 1)
+      + ' / コード一致 ' + hit + ' / 数量列' + (qi >= 0 ? '発見' : '無し'));
   });
   Logger.log('SBI保有銘柄コード: ' + set.size + '件（数量取得 ' + Object.keys(positions).length + '件）');
   return { codes: set, positions: positions, reason: null };
@@ -1275,6 +1289,8 @@ function createUsageSheet() {
     ['・損切り額 … その損切りに当たったときに失う金額。保有行は現在値からの下落分', 'p'],
     ['・メモ列が「見送り」「算出不可」の行（淡赤）は発注しないでください。理由も同じ列に出ます', 'p'],
     ['   （価格欄には算出できた水準を参考として出しますが、株数が無いので発注はできません）', 'p'],
+    ['・保有行でメモが「トレンド崩れ」（橙）… 高値・安値の切り上げが揃わなくなった状態です。', 'p'],
+    ['   損切り価格自体は動かしませんが、押し安値割れを待たずに早期の手仕舞いも検討してください', 'p'],
     ['・メニュー「売買プランを作成/更新」で、走査をやり直さずにプランだけ引き直せます', 'p'],
     ['   （許容損失額を変えたときや、保有銘柄を入れ替えたとき）', 'p'],
     ['', 'p'],
@@ -1852,6 +1868,12 @@ function planRow_(t, p) {
       (held ? '算出不可：' : '見送り：') + why];
   }
   const notes = [];
+  // 保有株はトレンドが崩れた時点（高値・安値の切り上げが揃わなくなった時点）で、
+  // 押し安値割れを待たずに手仕舞いを検討する材料として先頭に出す。損切り価格自体は
+  // 押し安値基準のまま動かさない（ダウ理論上の撤退水準を勝手に動かすと根拠が崩れる）。
+  if (held && p.trend !== '上昇') {
+    notes.push('トレンド崩れ（' + p.trend + '）: 押し安値を待たず早期手仕舞いも検討');
+  }
   if (t.note) notes.push(t.note);
   // 買い方はトレンドではなく実際の注文種別で書く。トレンド未確定でも戻り高値を
   // 既に上抜けていれば指値になるので、トレンドだけで文言を決めると実態とずれる。
@@ -1930,6 +1952,10 @@ function writePlanSheet_(targets) {
     SpreadsheetApp.newConditionalFormatRule()
       .whenFormulaSatisfied('=OR(LEFT($K2,3)="見送り",LEFT($K2,4)="算出不可")')
       .setBackground('#f6e3e3').setFontColor('#8a3a3a').setRanges([all]).build(),
+    // 保有株でトレンドが崩れた行（押し安値割れ前でも早期手仕舞いを検討してほしい）を橙で目立たせる
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=LEFT($K2,6)="トレンド崩れ"')
+      .setBackground('#fde9d9').setFontColor('#b35900').setBold(true).setRanges([all]).build(),
     SpreadsheetApp.newConditionalFormatRule()
       .whenTextEqualTo('★3買い').setBackground('#e3f5ea').setFontColor('#1b7a3d').setBold(true)
       .setRanges([kind]).build(),

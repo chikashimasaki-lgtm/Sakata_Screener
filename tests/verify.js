@@ -669,6 +669,12 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
   eq(M.buildOrderPlan_(up, cfg({ RISK_BUDGET_YEN: 1000 }), { shares: 300, cost: 110 }).ok, true,
     '許容損失を超えていても保有株のプランは出す（撤退水準は必要）');
 
+  // トレンドが崩れた（上昇でなくなった）保有株は、押し安値割れを待たず早期手仕舞いの
+  // 材料として出す。損切り価格自体はダウ理論の撤退水準（押し安値）のまま動かさない。
+  const over2 = zig([[0, 140], [8, 130], [14, 138], [22, 100], [30, 145]]);
+  const h3 = M.buildOrderPlan_(over2, cfg(), { shares: 300, cost: 110 });
+  eq(h3.trend, 'レンジ', 'トレンドが崩れているケースを用意');
+
   console.log('\n【20】売買プランの行整形・対象抽出');
   const buyT  = { kind: '★3買い', code: '8303', name: 'テスト', signal: '赤三兵', pos: null };
   const heldT = { kind: '保有', code: '7203', name: 'トヨタ', signal: '', note: '', pos: { shares: 300, cost: 110 } };
@@ -692,6 +698,12 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
   eq(String(M.planRow_(heldT, null)[10]).indexOf('算出不可') === 0, true,
     '保有株は「見送り」ではなく「算出不可」（持っている以上、見送るという選択肢が無い）');
   eq(M.planRow_(buyT, null)[10], '見送り：株価を取得できず未計算', '取得失敗も理由を残す');
+  eq(String(M.planRow_(heldT, h3)[10]).indexOf('トレンド崩れ（レンジ）') === 0, true,
+    '保有株はトレンドが崩れたら押し安値割れを待たず早期手仕舞いの警告をメモ先頭に出す');
+  eq([M.planRow_(heldT, h3)[6], M.planRow_(heldT, h3)[7]], [h3.target, h3.stop],
+    'トレンド崩れの警告があっても損切り・利確の価格は押し安値基準のまま動かさない');
+  eq(String(M.planRow_(heldT, h1)[10]).indexOf('トレンド崩れ') === -1, true,
+    '上昇トレンドが続いている保有株には警告を出さない');
 
   console.log('\n【21】売買プランの対象組み立て');
   const rows = [
@@ -735,6 +747,8 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
   eq(M.planMailLine_(null, '8303'), '', 'plans自体が無くても例外にならない');
   eq(M.planMailLine_({ '7203': h1 }, '72030'), '\n  └ 保有中 / 利確 164 / 損切 98 / 300株 / 損切り額 6,600円',
     '5桁コードでも4桁に正規化して引き当てる');
+  eq(M.planMailLine_({ '7203': h3 }, '7203').indexOf('／トレンド崩れ・早期手仕舞い検討') > 0, true,
+    'トレンドが崩れた保有株はメールにも早期手仕舞いの警告を添える');
 
   console.log('\n【23】通知メールのラベル');
   eq(M.SAKATA_PROFIT_LABEL_, '利益累計',

@@ -1274,6 +1274,7 @@ function createUsageSheet() {
     ['   ※許容損失と建玉上限はスクリプトプロパティ SAKATA_RISK_BUDGET_YEN / SAKATA_MAX_POSITION_YEN で変更', 'p'],
     ['・損切り額 … その損切りに当たったときに失う金額。保有行は現在値からの下落分', 'p'],
     ['・メモ列が「見送り」「算出不可」の行（淡赤）は発注しないでください。理由も同じ列に出ます', 'p'],
+    ['   （価格欄には算出できた水準を参考として出しますが、株数が無いので発注はできません）', 'p'],
     ['・メニュー「売買プランを作成/更新」で、走査をやり直さずにプランだけ引き直せます', 'p'],
     ['   （許容損失額を変えたときや、保有銘柄を入れ替えたとき）', 'p'],
     ['', 'p'],
@@ -1835,14 +1836,19 @@ function planTargets_(rows, held) {
   return buys.concat(holds);
 }
 
-// 1銘柄ぶんのシート行。算出できなかった場合は価格欄を空にして、メモに理由を出す。
+// 1銘柄ぶんのシート行。算出できなかった場合も、そこまでで計算できた価格
+// （買い・利確・損切り）はメモの理由とあわせて出す。株数だけは0にせず空にする
+// （見送りの原因は株数側にあるため、価格まで隠す理由はない）。
 function planRow_(t, p) {
   const held = t.kind === '保有';
   const pos = t.pos || {};
   if (!p || !p.ok) {
     const why = (p && p.reason) ? p.reason : '株価を取得できず未計算';
     return [t.kind, t.code, t.name, p ? p.close : '', held ? (pos.shares || '') : '',
-      held ? (pos.cost || '') : '', '', '', '', t.signal,
+      held ? (pos.cost || '') : (p && p.entry != null ? p.entry : ''),
+      (p && p.target != null) ? p.target : '',
+      (p && p.stop != null) ? p.stop : '',
+      '', t.signal,
       (held ? '算出不可：' : '見送り：') + why];
   }
   const notes = [];

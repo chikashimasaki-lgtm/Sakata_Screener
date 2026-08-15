@@ -43,7 +43,7 @@ const EXPORTS = [
   'filterCalendarToUniverse_', 'calendarStatusLabel_', 'edinetExtractArray_', 'calendarMapFromEntries_',
   'pickForeignFlow_', 'extractProfit_',
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
-  'orderPlanRow_', 'ORDER_HEADERS_', 'isTopBuyRow_', 'topBuyTargets_',
+  'planRow_', 'PLAN_HEADERS_', 'isTopBuyRow_', 'planTargets_', 'signalText_', 'toNum_',
 ];
 // 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ / to4_ を呼ぶため。
 const M = new Function(...Object.keys(sandbox), `
@@ -646,22 +646,79 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
   eq(M.buildOrderPlan_(mono, cfg()).reason, '押し安値を特定できない（確定スイング安値なし）', '押し安値が無ければ計算しない');
   eq(M.buildOrderPlan_([], cfg()).ok, false, '空配列でも例外にならない');
 
-  console.log('\n【19】注文プランの行整形・対象抽出');
-  eq(M.orderPlanRow_({ code: '8303', name: 'テスト', signal: '赤三兵' }, p1, cfg()).length,
-    M.ORDER_HEADERS_.length, '成立行の列数がヘッダと一致する');
-  eq(M.orderPlanRow_({ code: '8303', name: 'テスト', signal: '赤三兵' }, p3, cfg()).length,
-    M.ORDER_HEADERS_.length, '見送り行の列数もヘッダと一致する');
-  eq(M.orderPlanRow_({ code: '8303', name: 'テスト', signal: '赤三兵' }, p3, cfg())[4], '',
-    '見送り行は注文欄を空にする（そのまま発注できないように）');
+  console.log('\n【19】保有株モード — 返済売の2値だけを出す');
 
+  // 保有株はすでに建っているので、買値と株数は逆算せず、実際の建玉をそのまま使う。
+  // リスクの起点は買値ではなく現在値（これから失いうるのは現在値からの下落分）。
+  const h1 = M.buildOrderPlan_(up, cfg(), { shares: 300, cost: 110 });
+  eq(h1.ok, true, '保有株でもプランは成立する');
+  eq(h1.held, true, '保有株モードのフラグが立つ');
+  eq(h1.entry, null, '保有株に新規の買値は出さない');
+  eq([h1.basis, h1.stop, h1.target], [120, 98, 164], '基準は現在値120、損切り・利確は★3買いと同じ水準');
+  eq(h1.shares, 300, '株数は逆算せず実際の保有数を使う');
+  eq(h1.lossYen, 6600, '損切り額は現在値から損切りまでの下落 × 保有株数');
+
+  // 株数が取れないときに0株として損切り額0円を出すと、リスクが無いように見える
+  const h2 = M.buildOrderPlan_(up, cfg(), { shares: 0, cost: null });
+  eq(h2.ok, true, '株数不明でも価格は出す（損切りの置き直しには十分）');
+  eq(h2.lossYen, 0, '株数不明なら損切り額は空扱い');
+  eq(h2.notes.indexOf('保有株数を取得できず損切り額は未計算') >= 0, true, '株数が無いことを明示する');
+
+  // 保有株は許容損失で弾かない（もう建っているので「見送り」は成立しない）
+  eq(M.buildOrderPlan_(up, cfg({ RISK_BUDGET_YEN: 1000 }), { shares: 300, cost: 110 }).ok, true,
+    '許容損失を超えていても保有株のプランは出す（撤退水準は必要）');
+
+  console.log('\n【20】売買プランの行整形・対象抽出');
+  const buyT  = { kind: '★3買い', code: '8303', name: 'テスト', signal: '赤三兵', pos: null };
+  const heldT = { kind: '保有', code: '7203', name: 'トヨタ', signal: '', note: '', pos: { shares: 300, cost: 110 } };
+  eq(M.planRow_(buyT, p1).length, M.PLAN_HEADERS_.length, '★3買い行の列数がヘッダと一致する');
+  eq(M.planRow_(buyT, p3).length, M.PLAN_HEADERS_.length, '見送り行の列数もヘッダと一致する');
+  eq(M.planRow_(buyT, null).length, M.PLAN_HEADERS_.length, '株価が取れなかった行も列数は一致する');
+  eq(M.planRow_(buyT, p1)[5], 120, '★3買い行の「買い」は算出した買値');
+  eq(M.planRow_(heldT, h1)[5], 110, '保有行の「買い」は実際の建値');
+  eq(M.planRow_(buyT, p3)[6], '', '見送り行は価格欄を空にする（そのまま発注できないように）');
+
+  // トレンド未確定でも戻り高値を既に上抜けていれば買いは指値。
+  // メモをトレンドだけで決めると「逆指値で待つ」と書いてしまい、実際の注文と食い違う。
+  const over = zig([[0, 140], [8, 130], [14, 138], [22, 100], [30, 145]]);
+  const p6 = M.buildOrderPlan_(over, cfg());
+  eq([p6.trend, p6.entryType], ['レンジ', '指値'], '戻り高値を上抜け済みなら待たずに指値');
+  eq(String(M.planRow_(buyT, p6)[10]).split('／')[0], '戻り高値を上抜け済み（現値の指値）',
+    'メモの買い方は実際の注文種別に合わせる（トレンド名だけで決めない）');
+  eq(String(M.planRow_(buyT, p3)[10]).indexOf('見送り') === 0, true, '★3買いの不成立は「見送り」');
+  eq(String(M.planRow_(heldT, null)[10]).indexOf('算出不可') === 0, true,
+    '保有株は「見送り」ではなく「算出不可」（持っている以上、見送るという選択肢が無い）');
+  eq(M.planRow_(buyT, null)[10], '見送り：株価を取得できず未計算', '取得失敗も理由を残す');
+
+  console.log('\n【21】売買プランの対象組み立て');
   const rows = [
     ['', '★★★', '', '7203', 'トヨタ', 1000, '▲ 買い', '・赤三兵\n・切り込み線', ''],
     ['', '★★★', '', '6758', 'ソニー', 2000, '▼ 売り', '・三羽烏', ''],
     ['', '★★',   '', '9984', 'SBG',   3000, '▲ 買い', '・赤三兵', ''],
+    ['○', '★★★', '', '8306', '三菱UFJ', 1500, '▲ 買い', '・赤三兵', ''],
   ];
-  eq(rows.filter(M.isTopBuyRow_).length, 1, '★★★かつ買いの行だけを対象にする');
-  eq(M.topBuyTargets_(rows), [{ code: '7203', name: 'トヨタ', signal: '赤三兵 / 切り込み線' }],
-    'シグナル名は箇条書き記号と改行を落として1行にする');
+  eq(rows.filter(M.isTopBuyRow_).length, 2, '★★★かつ買いの行だけを対象にする');
+  eq(M.signalText_('・赤三兵\n・切り込み線'), '赤三兵 / 切り込み線', '箇条書き記号と改行を落として1行にする');
+
+  const held = { codes: new Set(['8306', '4502']), positions: { '8306': { shares: 200, cost: 1400 } } };
+  const targets = M.planTargets_(rows, held);
+  eq(targets.map(t => [t.kind, t.code]),
+    [['★3買い', '7203'], ['保有', '4502'], ['保有', '8306']],
+    '★3買いが先、保有はコード順。保有中の銘柄は買い側に重複させない');
+  eq(targets[2].note, '★3買いシグナルあり（買い増し候補）',
+    '保有中に★3買いが出たら1行にまとめ、買い増し候補としてメモに残す');
+  eq(targets[2].pos, { shares: 200, cost: 1400 }, '保有数量と建値を引き当てる');
+  eq(targets[1].pos, { shares: 0, cost: null }, '数量が取れない保有銘柄も落とさない');
+  eq(targets[1].signal, '', 'シグナルが出ていない保有銘柄も載せる');
+
+  eq(M.planTargets_([], { codes: new Set(), positions: {} }), [], '対象が無ければ空');
+
+  console.log('\n【22】保有数量の読み取り');
+  eq(M.toNum_('1,234'), 1234, '桁区切りを外して数値化する');
+  eq(M.toNum_('1,234 円'), 1234, '単位付きでも読む');
+  eq(M.toNum_(300), 300, '数値はそのまま');
+  eq(M.toNum_(''), null, '空欄はnull（0にすると「株数0」と区別できない）');
+  eq(M.toNum_('—'), null, '読めない値はnull');
 }
 
 console.log('\n' + '─'.repeat(62));

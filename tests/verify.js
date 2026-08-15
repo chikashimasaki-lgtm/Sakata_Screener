@@ -42,6 +42,8 @@ const EXPORTS = [
   'parseTseMarginGrid_', 'parseNikkeiEpsHtml_', 'selloffFrequency_', 'macroValueLabel_',
   'filterCalendarToUniverse_', 'calendarStatusLabel_', 'edinetExtractArray_', 'calendarMapFromEntries_',
   'pickForeignFlow_', 'extractProfit_',
+  'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
+  'orderPlanRow_', 'ORDER_HEADERS_', 'isTopBuyRow_', 'topBuyTargets_',
 ];
 // 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ / to4_ を呼ぶため。
 const M = new Function(...Object.keys(sandbox), `
@@ -531,6 +533,135 @@ console.log('\n【15】J-Quants V2移行 — pickForeignFlow_ / extractProfit_')
     40000000000, '連結全体キーが無ければattributable系でも可');
   eq(M.extractProfit_({}), NaN, '該当キーが無ければNaN');
   eq(M.extractProfit_(null), NaN, 'nullでも例外にならずNaN');
+}
+
+/* ── 16. 注文プラン（ダウ理論） ──────────────────────────────────────────── */
+
+console.log('\n【16】呼値・値幅制限');
+{
+  eq(M.tickSize_(1595.5), 1, '3,000円以下は1円刻み');
+  eq(M.tickSize_(3000), 1, '3,000円ちょうどは1円刻み（境界は「以下」）');
+  eq(M.tickSize_(3001), 5, '3,000円超は5円刻み');
+  eq(M.tickSize_(5001), 10, '5,000円超は10円刻み');
+  eq(M.tickSize_(30001), 50, '30,000円超は50円刻み');
+  eq(M.tickSize_(0), 1, '0や不正値でも0を返さない（0除算を作らない）');
+
+  eq(M.roundToTick_(1595.7, 'down'), 1595, '切り捨て');
+  eq(M.roundToTick_(1595.2, 'up'), 1596, '切り上げ');
+  eq(M.roundToTick_(1596, 'down'), 1596, 'ちょうどの値は動かさない（浮動小数で1つ下にずれない）');
+  eq(M.roundToTick_(3210.4, 'down'), 3210, '5円刻み帯の切り捨て');
+  eq(M.roundToTick_(3210.4, 'up'), 3215, '5円刻み帯の切り上げ');
+
+  // SBIの注文画面の実測値（基準値段1,595.5 → 1,195.5〜1,995.5）と一致すること
+  const lim = M.priceLimit_(1595.5);
+  eq([lim.low, lim.high, lim.width], [1195.5, 1995.5, 400], '制限値幅は基準値段±400（実画面と一致）');
+  eq(M.priceLimit_(99).width, 30, '100円未満は±30');
+  eq(M.priceLimit_(100).width, 50, '100円ちょうどは±50（境界は「未満」で切る）');
+  eq(M.priceLimit_(120).low, 70, '下限は基準値段−制限値幅');
+}
+
+console.log('\n【17】ダウ理論のスイングとトレンド判定');
+{
+  // 折れ点を線形補間したバー列。h=c+spread, l=c−spread なので極値は終値の極値と一致する。
+  const zig = (waypoints, spread) => {
+    const s = spread == null ? 1 : spread;
+    const last = waypoints[waypoints.length - 1];
+    const c = new Array(last[0] + 1);
+    for (let k = 0; k + 1 < waypoints.length; k++) {
+      const [i0, p0] = waypoints[k], [i1, p1] = waypoints[k + 1];
+      for (let i = i0; i < i1; i++) c[i] = p0 + (p1 - p0) * (i - i0) / (i1 - i0);
+    }
+    c[last[0]] = last[1];
+    return c.map((v, i) => ({ o: i ? c[i - 1] : v, h: v + s, l: v - s, c: v, v: 1e6, t: 1e9 + i * 86400, cont: true }));
+  };
+
+  // 高値切り上げ(110→125)・安値切り上げ(90→100) = ダウ理論の上昇トレンド
+  const up = zig([[0, 95], [5, 90], [12, 110], [20, 100], [28, 125], [34, 120]]);
+  const swUp = M.dowSwings_(up, 3);
+  eq([swUp.prevLow, swUp.low, swUp.prevHigh, swUp.high], [89, 99, 111, 126], '確定スイングの高値・安値を拾う');
+  eq(swUp.trend, '上昇', '高値・安値とも切り上げ → 上昇トレンド');
+  eq(M.pullbackLow_(up, swUp), 99, '押し安値＝直近スイング安値以降の最安値');
+
+  // 高値が1つしか確定していない = トレンドとは呼ばない
+  const rng = zig([[0, 140], [8, 130], [14, 138], [22, 100], [30, 108]]);
+  const swRng = M.dowSwings_(rng, 3);
+  eq(swRng.trend, 'レンジ', '比較対象の高値が無ければトレンド判定しない');
+
+  // 一直線に上がるだけの列にはスイング安値が無い
+  const mono = zig([[0, 100], [19, 140]]);
+  eq(M.dowSwings_(mono, 3).lowIdx, null, '単調上昇には確定スイング安値が無い');
+  eq(M.pullbackLow_(mono, M.dowSwings_(mono, 3)), null, 'スイング安値が無ければ押し安値もnull');
+
+  /* ── 注文プラン本体 ── */
+  console.log('\n【18】注文プラン — 買い/利確/損切り/株数');
+
+  const cfg = k => Object.assign({}, M.SK.ORDER, k || {});
+
+  // 上昇トレンド継続: 現値の指値で押し目を待ち、押し安値(99)の1ティック下で損切り
+  const p1 = M.buildOrderPlan_(up, cfg());
+  eq(p1.ok, true, '上昇トレンドではプランが成立する');
+  eq(p1.entryType, '指値', '上昇トレンド継続中は現値の指値（追いかけない）');
+  eq([p1.entry, p1.stop, p1.target], [120, 98, 164], '買い120 / 損切り98(押し安値99の1つ下) / 利確164(リスク22×2)');
+  eq(p1.rr, 2, '呼値に丸めた後もRRは2.0');
+  eq(p1.stopLimit, 96, 'OCO2の訂正指値はトリガーの2ティック下');
+  eq(p1.shares, 1300, '許容損失30,000円 ÷ リスク22円 → 1,300株（100株単位で切り捨て）');
+  eq(p1.lossYen, 28600, '損切り額は許容損失に収まる実額');
+  eq(p1.profitYen, 57200, '想定利益は損切り額の2倍');
+  eq(p1.notes, [], '警告なし');
+
+  // トレンド未確定: 戻り高値(138)を上抜けたところの逆指値で「転換の確定」を待つ
+  const p2 = M.buildOrderPlan_(rng, cfg());
+  eq(p2.entryType, '逆指値', 'トレンド未確定なら戻り高値の上抜けを待つ');
+  eq(p2.entry, 140, '買いは直近高値139の1ティック上');
+  eq(p2.stop, 98, '損切りは押し安値99の1つ下（エントリー方式によらずダウ理論の水準）');
+  eq(p2.shares, 700, 'リスクが広がるぶん株数は減る（許容損失は一定）');
+  eq(p2.notes.indexOf('利確が制限値幅の上限外（当日は発注不可）') >= 0, true,
+    '利確が値幅制限の外なら警告する（黙って発注不可の値段を出さない）');
+
+  // 許容損失が小さすぎて1単元も建てられないときは、0株ではなく「見送り」を返す
+  const p3 = M.buildOrderPlan_(up, cfg({ RISK_BUDGET_YEN: 1000 }));
+  eq(p3.ok, false, '許容損失内で100株も建てられなければ成立させない');
+  eq(p3.shares, 0, '見送り時は株数0');
+  eq(p3.reason.indexOf('リスク過大') === 0, true, '理由を返す（黙って空欄にしない）');
+
+  // 建てられない理由がリスク幅なのか建玉上限なのかを書き分ける
+  // （まとめて「リスク過大」と出すと、値がさ株で上限に当たっただけのときに損切り幅を疑う）
+  const p3b = M.buildOrderPlan_(up, cfg({ MAX_POSITION_YEN: 1000 }));
+  eq(p3b.ok, false, '建玉上限が買値100株に届かなければ成立させない');
+  eq(p3b.reason.indexOf('建玉上限') === 0, true, '建玉上限が理由のときはリスク過大と言わない');
+
+  // 建玉上限はリスク基準より優先して株数を抑える
+  const p4 = M.buildOrderPlan_(up, cfg({ MAX_POSITION_YEN: 100000 }));
+  eq(p4.shares, 800, '建玉上限10万円 ÷ 買値120 → 800株');
+  eq(p4.notes.indexOf('建玉上限で株数を抑制') >= 0, true, '株数を絞ったことを明示する');
+
+  // 押し安値が現値のすぐ下だと、理論どおりの損切りはノイズで即狩られる
+  const tight = zig([[0, 1000], [5, 995], [12, 1010], [20, 1002], [28, 1020], [36, 1001.9]], 0.2);
+  const p5 = M.buildOrderPlan_(tight, cfg());
+  eq(p5.notes.indexOf('損切り幅をATR14×0.5まで拡大') >= 0, true, '損切りが近すぎるときはATRまで広げる');
+  eq(p5.entry - p5.stop >= 1, true, '拡大後は最低1ティック以上離れている');
+
+  // 前提が揃わないケース
+  eq(M.buildOrderPlan_(up.slice(0, 8), cfg()).reason, '足が不足（スイングを確定できない）', '足が短ければ計算しない');
+  eq(M.buildOrderPlan_(mono, cfg()).reason, '押し安値を特定できない（確定スイング安値なし）', '押し安値が無ければ計算しない');
+  eq(M.buildOrderPlan_([], cfg()).ok, false, '空配列でも例外にならない');
+
+  console.log('\n【19】注文プランの行整形・対象抽出');
+  eq(M.orderPlanRow_({ code: '8303', name: 'テスト', signal: '赤三兵' }, p1, cfg()).length,
+    M.ORDER_HEADERS_.length, '成立行の列数がヘッダと一致する');
+  eq(M.orderPlanRow_({ code: '8303', name: 'テスト', signal: '赤三兵' }, p3, cfg()).length,
+    M.ORDER_HEADERS_.length, '見送り行の列数もヘッダと一致する');
+  eq(M.orderPlanRow_({ code: '8303', name: 'テスト', signal: '赤三兵' }, p3, cfg())[4], '',
+    '見送り行は注文欄を空にする（そのまま発注できないように）');
+
+  const rows = [
+    ['', '★★★', '', '7203', 'トヨタ', 1000, '▲ 買い', '・赤三兵\n・切り込み線', ''],
+    ['', '★★★', '', '6758', 'ソニー', 2000, '▼ 売り', '・三羽烏', ''],
+    ['', '★★',   '', '9984', 'SBG',   3000, '▲ 買い', '・赤三兵', ''],
+  ];
+  eq(rows.filter(M.isTopBuyRow_).length, 1, '★★★かつ買いの行だけを対象にする');
+  eq(M.topBuyTargets_(rows), [{ code: '7203', name: 'トヨタ', signal: '赤三兵 / 切り込み線' }],
+    'シグナル名は箇条書き記号と改行を落として1行にする');
 }
 
 console.log('\n' + '─'.repeat(62));

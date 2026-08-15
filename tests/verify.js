@@ -44,6 +44,7 @@ const EXPORTS = [
   'pickForeignFlow_', 'extractProfit_',
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'isTopBuyRow_', 'planTargets_', 'signalText_', 'toNum_',
+  'planMailLine_', 'SAKATA_PROFIT_LABEL_',
 ];
 // 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ / to4_ を呼ぶため。
 const M = new Function(...Object.keys(sandbox), `
@@ -713,7 +714,31 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
 
   eq(M.planTargets_([], { codes: new Set(), positions: {} }), [], '対象が無ければ空');
 
-  console.log('\n【22】保有数量の読み取り');
+  console.log('\n【22】メール本文の売買プラン行');
+  // メールだけ見て発注できるようにするのが目的なので、シートと同じ数字が出ること
+  eq(M.planMailLine_({ '8303': p1 }, '8303'),
+    '\n  └ 指値買 120 / 利確 164 / 損切 98 / 1,300株 / 損切り額 28,600円',
+    '★3買いは買い・利確・損切り・株数・損切り額を1行で添える');
+  eq(M.planMailLine_({ '7203': h1 }, '7203'),
+    '\n  └ 保有中 / 利確 164 / 損切 98 / 300株 / 損切り額 6,600円',
+    '保有株に新規の買値は出さず「保有中」と書く（空の買値を出さない）');
+  eq(M.planMailLine_({ '7203': h2 }, '7203'), '\n  └ 保有中 / 利確 164 / 損切 98',
+    '株数不明なら株数と損切り額は省く（0株0円と書かない）');
+  eq(M.planMailLine_({ '8303': p3 }, '8303').indexOf('\n  └ 売買プラン: 見送り（') === 0, true,
+    '不成立の★3買いは理由つきで「見送り」と書く');
+  eq(M.planMailLine_({ '7203': Object.assign({}, p3, { held: true }) }, '7203')
+    .indexOf('\n  └ 売買プラン: 算出不可（') === 0, true,
+    '保有株は「見送り」ではなく「算出不可」（持っている以上、見送るという選択肢が無い）');
+  eq(M.planMailLine_({}, '8303'), '', 'プランが無い銘柄は行を足さない');
+  eq(M.planMailLine_(null, '8303'), '', 'plans自体が無くても例外にならない');
+  eq(M.planMailLine_({ '7203': h1 }, '72030'), '\n  └ 保有中 / 利確 164 / 損切 98 / 300株 / 損切り額 6,600円',
+    '5桁コードでも4桁に正規化して引き当てる');
+
+  console.log('\n【23】通知メールのラベル');
+  eq(M.SAKATA_PROFIT_LABEL_, '利益累計',
+    '★3買い・保有銘柄シグナルのどちらのメールにもこのラベルを付けてアーカイブする');
+
+  console.log('\n【24】保有数量の読み取り');
   eq(M.toNum_('1,234'), 1234, '桁区切りを外して数値化する');
   eq(M.toNum_('1,234 円'), 1234, '単位付きでも読む');
   eq(M.toNum_(300), 300, '数値はそのまま');

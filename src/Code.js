@@ -291,7 +291,7 @@ function scanSignals() {
       ss.toast('売買プランを作成できませんでした: ' + e.message, '酒田五法', 8);
     }
     sendTopBuySignalsEmail_(sig, plans);   // 強さ★★★・買いだけを走査完了直後にメール通知
-    sendHeldStockDirectionEmail_(sig);   // 保有銘柄の方向を走査完了直後にメール通知
+    sendHeldStockDirectionEmail_(sig, plans);   // 保有銘柄の方向を走査完了直後にメール通知
   }
 }
 
@@ -550,37 +550,47 @@ function sendSignalEmail_(sig, opts) {
 
 // 強さ★★★・方向「買い」のシグナルだけを抜き出し、簡潔な日次メールで通知する。
 // plans（コード→売買プラン）があれば、ダウ理論ベースの買い・利確・損切りも1行添える。
-// メールだけ見て発注できるようにするため、「売買プラン」シートと同じ数字を載せる。
 function sendTopBuySignalsEmail_(sig, plans) {
-  const planLine = r => {
-    const p = plans && plans[to4_(String(r[3] || '').trim()).toUpperCase()];
-    if (!p) return '';
-    if (!p.ok) return '\n  └ 売買プラン: 見送り（' + p.reason + '）';
-    // 保有中の銘柄には新規の買値が無い（返済売の2値だけを出す）。
-    // 空の買値を書くと、いくらで買えばいいのか分からないメールになる。
-    const entry = p.held ? '保有中' : (p.entryType + '買 ' + fmtNum_(p.entry));
-    return '\n  └ ' + entry
-      + ' / 利確 ' + fmtNum_(p.target) + ' / 損切 ' + fmtNum_(p.stop)
-      + (p.shares ? ' / ' + fmtNum_(p.shares) + '株 / 損切り額 ' + fmtNum_(p.lossYen) + '円' : '');
-  };
   sendSignalEmail_(sig, {
     filterFn: isTopBuyRow_,
     subjectFn: count => `酒田五法_★3買い_${count}件`,
     // コード_銘柄名_終値_シグナル名（＋売買プラン）
-    rowFn: r => `${r[3]}_${r[4]}_${r[5]}_${String(r[7]).replace(/\n/g, '/')}` + planLine(r),
+    rowFn: r => `${r[3]}_${r[4]}_${r[5]}_${String(r[7]).replace(/\n/g, '/')}`
+      + planMailLine_(plans, r[3]),
     emptyLogMsg: '★★★買いシグナル無し。メール送信スキップ',
     successLogMsgFn: count => '★★★買いシグナルメールを送信しました（' + count + '件）',
     errLogPrefix: 'sendTopBuySignalsEmail_',
   });
 }
 
+/**
+ * 「売買プラン」シートと同じ数字をメール本文に1行で添える。
+ * メールだけ見て発注できるようにするのが目的なので、シートと数字がずれてはいけない。
+ * 該当プランが無ければ空文字（行そのものは従来どおり出す）。
+ */
+function planMailLine_(plans, code) {
+  const p = plans && plans[to4_(String(code || '').trim()).toUpperCase()];
+  if (!p) return '';
+  // 保有株に「見送り」は無い（持っている以上、見送るという選択肢が無い）。
+  if (!p.ok) return '\n  └ 売買プラン: ' + (p.held ? '算出不可' : '見送り') + '（' + p.reason + '）';
+  // 保有中の銘柄には新規の買値が無い（返済売の2値だけを出す）。
+  // 空の買値を書くと、いくらで買えばいいのか分からないメールになる。
+  const entry = p.held ? '保有中' : (p.entryType + '買 ' + fmtNum_(p.entry));
+  return '\n  └ ' + entry
+    + ' / 利確 ' + fmtNum_(p.target) + ' / 損切 ' + fmtNum_(p.stop)
+    + (p.shares ? ' / ' + fmtNum_(p.shares) + '株 / 損切り額 ' + fmtNum_(p.lossYen) + '円' : '');
+}
+
 // 保有銘柄のうち、今回のシグナル一覧に載った銘柄の方向をすべて通知する（★の絞り込みなし）。
+// 保有株のプランは返済売の2値（利確・損切り）なので、シグナルが出た日に置き直せる。
 // 保有マーク自体が機能していないと該当0件になる点に注意（getSbiHeldCodes_のreasonで原因が分かる）。
-function sendHeldStockDirectionEmail_(sig) {
+function sendHeldStockDirectionEmail_(sig, plans) {
   sendSignalEmail_(sig, {
     filterFn: r => r[0] === '○',
     subjectFn: count => `酒田五法_保有銘柄シグナル_${count}件`,
-    rowFn: r => `${r[3]}_${r[4]}_${String(r[6]).trim()}_${String(r[7]).replace(/\n/g, '/')}`,   // コード_銘柄名_方向_シグナル名
+    // コード_銘柄名_方向_シグナル名（＋売買プラン＝いま置くべき利確・損切り）
+    rowFn: r => `${r[3]}_${r[4]}_${String(r[6]).trim()}_${String(r[7]).replace(/\n/g, '/')}`
+      + planMailLine_(plans, r[3]),
     emptyLogMsg: '保有銘柄のシグナル無し。メール送信スキップ',
     successLogMsgFn: count => '保有銘柄シグナルメールを送信しました（' + count + '件）',
     errLogPrefix: 'sendHeldStockDirectionEmail_',
@@ -1266,6 +1276,15 @@ function createUsageSheet() {
     ['・メモ列が「見送り」「算出不可」の行（淡赤）は発注しないでください。理由も同じ列に出ます', 'p'],
     ['・メニュー「売買プランを作成/更新」で、走査をやり直さずにプランだけ引き直せます', 'p'],
     ['   （許容損失額を変えたときや、保有銘柄を入れ替えたとき）', 'p'],
+    ['', 'p'],
+    ['■ 通知メール', 'h'],
+    ['走査完了時に2通のメールを自動送信します（該当が無い日は送りません）。', 'p'],
+    ['・酒田五法_★3買い_N件 … ★★★かつ買いのシグナル', 'p'],
+    ['・酒田五法_保有銘柄シグナル_N件 … 保有銘柄に出たシグナル（方向を問わず）', 'p'],
+    ['どちらも各銘柄の下に売買プラン（買い・利確・損切り・株数・損切り額）が1行付きます。', 'p'],
+    ['メールだけ見て発注できるように、「売買プラン」シートと同じ数字を載せています。', 'p'],
+    ['送信後は「利益累計」ラベルを付けて受信トレイからアーカイブします。', 'p'],
+    ['   （後で損益を振り返るときに、このラベルで一覧できるようにするため）', 'p'],
     ['ここに出る価格は「シグナルの前提が崩れる水準」であって、値上がりの保証ではありません。', 'note'],
     ['', 'p'],
     ['■ 「相場マクロ」シート（地合いの入力）', 'h'],

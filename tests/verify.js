@@ -51,6 +51,7 @@ const EXPORTS = [
   'rocAuc_', 'evaluateBinary_', 'blockedTimeSeriesFolds_', 'crossValidate_',
   'selectLambda_', 'buildFeatureMatrix_', 'trainDirectionModel_',
   'benchmarkReturn_', 'extractMlRow_', 'buildDateCloseMap_', 'barDateKey_',
+  'wilsonInterval_', 'decideWeight_', 'SIGNAL_WEIGHT_', 'SIGNAL_DIR_',
 ];
 // 共通モジュール（symlink）も読み込む。本体が fetchWithRetry_ / confirmDestructive_ / to4_ を呼ぶため。
 const M = new Function(...Object.keys(sandbox), `
@@ -943,6 +944,81 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     // 方向の無いシグナルは学習に使えない
     eq(M.extractMlRow_({ bars, i: 10, sig: { name: 'x', dir: '' }, code: '1', lastFire: {}, idxByDate: idxAll, rsi: null, macd: null }),
       null, '方向が無いシグナルは採らない');
+  }
+
+  console.log('\n【32】重みの算出: Wilson信頼区間');
+  {
+    // 教科書的な既知値。p=0.5, n=100, z=1.96 の Wilson 区間は概ね [0.404, 0.596]
+    const a = M.wilsonInterval_(50, 100);
+    near(a.lower, 0.4038, 0.001, 'n=100・勝率50%の下限');
+    near(a.upper, 0.5962, 0.001, 'n=100・勝率50%の上限');
+    eq(a.p, 0.5, '点推定はそのまま');
+    // 正規近似と違い、端でも[0,1]をはみ出さない
+    const b = M.wilsonInterval_(0, 10);
+    eq(b.lower >= 0 && b.upper <= 1, true, '全敗でも区間が[0,1]に収まる');
+    const c = M.wilsonInterval_(10, 10);
+    eq(c.lower >= 0 && c.upper <= 1, true, '全勝でも区間が[0,1]に収まる');
+    eq(c.upper, 1, '全勝の上限は1');
+    // 件数が増えるほど区間は狭くなる
+    const wide = M.wilsonInterval_(15, 30), narrow = M.wilsonInterval_(1500, 3000);
+    eq((narrow.upper - narrow.lower) < (wide.upper - wide.lower), true, '件数が増えると区間が狭まる');
+    eq(M.wilsonInterval_(0, 0), null, '試行0件では区間を作らない');
+    // z を大きくすると区間は広がる（多重比較の補正で使う）
+    eq(M.wilsonInterval_(50, 100, 3.13).lower < a.lower, true, 'zを大きくすると区間が広がる');
+  }
+
+  console.log('\n【33】重みの算出: 重みを動かす条件');
+  {
+    const B = 0.575;   // 売り3日の実測基準線
+    // ① 件数が足りなければ動かさない
+    eq(M.decideWeight_(20, 25, 2, { baseline: B }).weight, 2, '30件未満は現行値を維持');
+    eq(M.decideWeight_(20, 25, 2, { baseline: B }).changed, false, '維持なので changed は false');
+    // ② 基準線と区別できなければ動かさない（0.5ではなく基準線と比べる）
+    const near575 = M.decideWeight_(Math.round(0.59 * 3000), 3000, 1, { baseline: B });
+    eq(near575.weight, 1, '基準57.5%に対し59%程度なら動かさない');
+    // 同じ勝率でも 0.5 と比べると「有意に勝ち越し」と誤判定されることの確認
+    eq(M.decideWeight_(Math.round(0.59 * 3000), 3000, 1, { baseline: 0.5 }).weight, 3,
+      '0.5基準だと同じ数字が3に上がってしまう（基準線を使う理由）');
+    // ③ 有意でも差が小さければ動かさない（件数が大きいと僅差が有意になる）
+    const tiny = M.decideWeight_(Math.round(0.591 * 6650), 6650, 1, { baseline: B, minEdge: 0.05 });
+    eq(tiny.weight, 1, '+1.6ptの差は件数が多くても動かさない');
+    eq(tiny.reason.indexOf('差が小さい') >= 0 || tiny.reason.indexOf('区別できない') >= 0, true,
+      '動かさない理由を返す');
+    // 差が十分で有意なら動く
+    const up = M.decideWeight_(Math.round(0.70 * 400), 400, 2, { baseline: B, minEdge: 0.05 });
+    eq(up.weight, 3, '基準を大きく上回れば3');
+    eq(up.changed, true, '変更されたことが分かる');
+    const down = M.decideWeight_(Math.round(0.42 * 3000), 3000, 2, { baseline: B, minEdge: 0.05 });
+    eq(down.weight, 1, '基準を大きく下回れば1');
+    // 効果量の下限を0にすると僅差でも通ってしまう（③の存在意義の確認）
+    eq(M.decideWeight_(Math.round(0.591 * 6650), 6650, 1, { baseline: B, minEdge: 0 }).weight, 3,
+      '下限を外すと+1.6ptでも3に上がる＝③が効いている');
+  }
+
+  console.log('\n【34】特徴量から静的重みを外せること');
+  {
+    const rows = [];
+    for (let i = 0; i < 20; i++) rows.push({ date: '2026-01-01', pattern: '赤三兵', dir: '買い', staticWeight: 2, rsi: 50, macdHist: 0.1, macdDiff: 0.2, label: i % 2 });
+    const withStatic = M.buildFeatureMatrix_(rows, { minPatternOnehot: 15 });
+    const without = M.buildFeatureMatrix_(rows, { minPatternOnehot: 15, excludeStaticWeight: true });
+    eq(withStatic.names.indexOf('静的重み') >= 0, true, '既定では静的重みを特徴量に含む');
+    eq(without.names.indexOf('静的重み'), -1, 'excludeStaticWeight で静的重み列が消える');
+    eq(without.X[0].length, withStatic.X[0].length - 1, '列が1つだけ減る');
+    // SIGNAL_WEIGHT_ を決める学習でこれを外さないと、出力で入力を書き換える自己参照になる
+    eq(without.names, ['P:赤三兵', 'RSI14', 'MACDヒスト', 'MACD-Signal差'], '残る特徴量の並び');
+  }
+
+  console.log('\n【35】SIGNAL_WEIGHT_ の健全性');
+  {
+    const names = Object.keys(M.SIGNAL_WEIGHT_);
+    eq(names.every(n => [1, 2, 3].includes(M.SIGNAL_WEIGHT_[n])), true, '重みは1〜3の整数のみ');
+    // 方向テーブルと対応が取れていること（算出スクリプトが方向別の基準線を引けるため）
+    const missing = names.filter(n => !M.SIGNAL_DIR_[n]);
+    eq(missing, [], 'すべてのパターンに方向が定義されている');
+    // 実データで算出した3件が入っていること（意図しない巻き戻しの検知）
+    eq(M.SIGNAL_WEIGHT_['赤三兵'], 1, '赤三兵は基準を5.2pt下回るため1');
+    eq(M.SIGNAL_WEIGHT_['MACDデッドクロス'], 1, 'MACDデッドクロスは基準を9.0pt下回るため1');
+    eq(M.SIGNAL_WEIGHT_['切り込み線'], 3, '切り込み線は基準を9.7pt上回るため3');
   }
 }
 

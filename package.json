@@ -4,7 +4,8 @@
   "private": true,
   "description": "酒田五法シグナル・スクリーナー（Google Apps Script）の純ロジック検証",
   "scripts": {
-    "test": "node tests/verify.js"
+    "test": "node tests/verify.js",
+    "calc-weights": "node tools/calc_weights.js"
   },
   "license": "UNLICENSED"
 }

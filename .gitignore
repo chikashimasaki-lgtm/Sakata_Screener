@@ -1,3 +1,6 @@
 node_modules/
 .DS_Store
 *.log
+
+# 重み算出の中間生成物（6MB。株価そのものなので取り直せば同じものができる）
+tools/dataset_cache.json

@@ -94,6 +94,7 @@ function onOpen() {
     .addItem('シグナル走査/続行',            'scanSignals')
     .addItem('売買プランを作成/更新（★3買い＋保有株）', 'buildPlans')
     .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights')
+    .addItem('ML参考重みを学習（実験的・順位には未使用）', 'trainMlWeights')
     .addItem('相場マクロ/急落サインを更新', 'updateMarketMacro')
     .addItem('決算カレンダーを更新',        'updateEarningsCalendar')
     .addItem('決算発表列だけ更新（シグナル）', 'refreshSignalEarningsColumn')
@@ -1422,6 +1423,111 @@ function writeStatsSheet_(map) {
   sh.setTabColor('#4a90d9');
 }
 
+// ============================================================================
+//  ML学習データの収集（backtestWeights の走査に相乗り）
+//  ---------------------------------------------------------------------------
+//  同じ6ヶ月ローリング走査から、イベント1件＝1行のデータセットを作って
+//  「ML学習データ」シートへ貯める。学習の本体は MLWeights.js（参考値・順位には未使用）。
+//
+//  suggestWeight_ が廃止された4つの理由を、ここで構造的に潰しておく:
+//    (1) ベンチマーク未控除 → 日経平均の同期間リターンを引いた「超過リターン」でラベル付け
+//    (2) 連日重複でサンプル水増し → 評価期間が重なる再点灯はクールダウンで採らない
+//    (3) 約定タイミングが粗い    → 翌日始値エントリー・h営業日後終値エグジット
+//    (4) サンプル不足            → 学習側（MLWeights.js）で最低件数ゲートをかける
+// ============================================================================
+
+// Yahooのバー配列から「YYYY-MM-DD → 終値」のマップを作る。
+// 銘柄側のバーは休止日などで欠けることがあるので、指数との対応は配列位置ではなく日付で取る。
+function buildDateCloseMap_(bars) {
+  const map = {};
+  (bars || []).forEach(b => { if (b && b.t != null) map[barDateKey_(b)] = b.c; });
+  return map;
+}
+
+// バーのUNIX秒からJSTの日付キーを作る。指数と銘柄で同じ関数を通すことで対応がずれない。
+function barDateKey_(bar) {
+  return Utilities.formatDate(new Date(bar.t * 1000), 'Asia/Tokyo', 'yyyy-MM-dd');
+}
+
+/**
+ * ベンチマーク（日経平均）の同区間リターン。
+ * 該当日が指数側に無ければ null を返し、呼び出し側で行ごと捨てる。
+ * 「取れなかった日を0%として扱う」と、控除しないのと同じ歪みが入るため。
+ */
+function benchmarkReturn_(idxByDate, entryKey, exitKey) {
+  const e0 = idxByDate[entryKey], e1 = idxByDate[exitKey];
+  if (e0 == null || e1 == null || !(e0 > 0)) return null;
+  return (e1 - e0) / e0;
+}
+
+/**
+ * 1つのシグナル発生イベントから学習データ1行を作る。採用しない場合は null。
+ *
+ * bars: 古い→新しい順の全期間バー。i: シグナル確定日のインデックス。
+ * lastFire: 「コード|パターン名」→ 直近に採用したインデックス（クールダウン判定用の状態）。
+ */
+function extractMlRow_(params) {
+  const bars = params.bars, i = params.i, sig = params.sig, code = params.code;
+  const lastFire = params.lastFire, idxByDate = params.idxByDate;
+  const rsi = params.rsi, macd = params.macd;
+
+  const sign = sig.dir === '買い' ? 1 : sig.dir === '売り' ? -1 : 0;
+  if (!sign) return null;
+
+  // (2) クールダウン: 前回採用から評価ホライズン未満なら採らない。
+  // 連日点灯するパターンをそのまま数えると、評価期間が重なる＝ほぼ同じ値動きを
+  // 何度も学習することになり、実効サンプル数が水増しされる。
+  const h = signalHorizon_(sig.name);
+  const key = code + '|' + sig.name;
+  if (lastFire[key] != null && (i - lastFire[key]) < h) return null;
+
+  // (3) 約定タイミング: 走査は終値確定後なので、現実の約定は翌営業日の寄付。
+  const entryIdx = i + 1, exitIdx = i + 1 + h;
+  if (exitIdx > bars.length - 1) return null;
+  const entryBar = bars[entryIdx], exitBar = bars[exitIdx];
+  const entry = entryBar.o, exit = exitBar.c;
+  if (!(entry > 0) || !(exit > 0)) return null;
+
+  // (1) ベンチマーク控除: 銘柄の方向調整後リターンから、指数の同区間リターンを同じ向きで引く。
+  const bench = benchmarkReturn_(idxByDate, barDateKey_(entryBar), barDateKey_(exitBar));
+  if (bench == null) return null;
+  const stockRet = (exit - entry) / entry * sign;
+  const excess = stockRet - bench * sign;
+
+  lastFire[key] = i;
+  const mh = (macd && macd.macd[i] != null && macd.signal[i] != null) ? macd.macd[i] - macd.signal[i] : '';
+  return [
+    barDateKey_(bars[i]), code, sig.name, sig.dir, patternPoints_(sig.name),
+    (rsi && rsi[i] != null) ? Math.round(rsi[i] * 100) / 100 : '',
+    (macd && macd.macd[i] != null) ? Math.round(macd.macd[i] * 10000) / 10000 : '',
+    (mh === '') ? '' : Math.round(mh * 10000) / 10000,
+    Math.round(entry * 100) / 100, Math.round(exit * 100) / 100,
+    Math.round(bench * 10000) / 10000, Math.round(stockRet * 10000) / 10000,
+    Math.round(excess * 10000) / 10000,
+    excess > 0 ? 1 : 0, h,
+  ];
+}
+
+// ML学習データシートを初期化（走査を最初から始めるときだけ呼ぶ）。
+function resetMlDataSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(ML.SHEET_DATA);
+  if (!sh) sh = ss.insertSheet(ML.SHEET_DATA);
+  sh.clear();
+  sh.getRange(1, 1, 1, ML_DATA_HEADERS_.length).setValues([ML_DATA_HEADERS_]);
+  sh.setFrozenRows(1);
+  return sh;
+}
+
+// 蓄積した行をまとめて追記する。1行ずつ appendRow するとAPI呼び出しが増えて時間予算を食う。
+function appendMlRows_(rows) {
+  if (!rows || !rows.length) return;
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(ML.SHEET_DATA);
+  if (!sh) sh = resetMlDataSheet_();
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, ML_DATA_HEADERS_.length).setValues(rows);
+}
+
 // 過去6ヶ月バックテスト（時間分割・自動再開）。各パターンの N日後リターン実績を集計し成績DBを自動更新。
 function backtestWeights() {
   const lock = LockService.getScriptLock();
@@ -1449,8 +1555,18 @@ function backtestWeights() {
   if (!cursor || !acc) {
     cursor = 0;
     acc = {};   // name -> [n, wins, retSum]
+    resetMlDataSheet_();   // 新規走査のときだけ初期化（再開時に消すと途中の行を失う）
     ss.toast('パターン成績の集計を開始（自動再開で完走します）', '酒田五法', 5);
   }
+
+  // ML学習データのベンチマーク控除に使う日経平均。走査中に1回だけ取る。
+  // 取れなければ ML 用の行だけ作らない（パターン成績の集計自体は従来どおり続ける）。
+  let idxByDate = null;
+  try {
+    // 銘柄側と同じ期間を明示して取る（MACRO.YAHOO_RANGE と別々に変わっても揃うように）
+    idxByDate = buildDateCloseMap_(fetchIndexBars_('^N225', SK.YAHOO_RANGE));
+    if (!Object.keys(idxByDate).length) { idxByDate = null; Logger.log('ML学習データ: 日経平均を取得できず、この回は行を作りません'); }
+  } catch (e) { idxByDate = null; Logger.log('ML学習データ: 日経平均の取得に失敗 ' + e.message); }
 
   const start = Date.now();
   while (cursor < total) {
@@ -1463,11 +1579,19 @@ function backtestWeights() {
     }));
     const resps = fetchAllWithRetry_(reqs);
     if (!resps) break;   // ネットワークごと落ちている。カーソルは進めず次回に持ち越す。
-    resps.forEach(res => {
+    const mlRows = [];   // このバッチで作ったML学習データ行（まとめて追記する）
+    resps.forEach((res, si) => {
       if (!res || res.getResponseCode() !== 200) return;
       const bars = parseYahooBars_(res);
       const last = bars.length - 1;
       if (bars.length < BT_MIN_HISTORY + BT_FORWARD + 1) return;
+      // ML用の指標は全期間分を1回だけ計算する。RSI(Wilder)もMACD(EMA)も逐次再帰で
+      // 未来を参照しないため、インデックス i を引けばその日時点の値になる。
+      const code = slice[si];
+      const closes = idxByDate ? bars.map(b => b.c) : null;
+      const rsi  = idxByDate ? rsiSeries_(closes, 14) : null;
+      const macd = idxByDate ? macdSeries_(closes, 12, 26, 9) : null;
+      const lastFire = {};   // 「コード|パターン名」→直近採用インデックス（クールダウン用）
       for (let i = BT_MIN_HISTORY; i <= last - BT_FORWARD; i++) {
         const signals = detectSakata_(bars.slice(0, i + 1));
         if (!signals.length) continue;
@@ -1482,8 +1606,17 @@ function backtestWeights() {
           const a = acc[s.name] || (acc[s.name] = [0, 0, 0]);
           a[0] += 1; a[1] += dr > 0 ? 1 : 0; a[2] += dr;
         });
+        // ML学習データ側は別ルール（ベンチマーク控除・クールダウン・翌日寄付）で採否を決める。
+        // 上の集計は既存の互換のためそのまま残す。
+        if (idxByDate) {
+          signals.forEach(s => {
+            const row = extractMlRow_({ bars, i, sig: s, code, lastFire, idxByDate, rsi, macd });
+            if (row) mlRows.push(row);
+          });
+        }
       }
     });
+    appendMlRows_(mlRows);
     // バッチ単位でカーソルと集計値を確定させる（6分制限で強制終了しても取りこぼさない）
     cursor += slice.length;
     props.setProperty('BT_CURSOR', String(cursor));
@@ -1505,8 +1638,12 @@ function backtestWeights() {
     writeStatsSheet_(map);
     props.deleteProperty('BT_CURSOR'); props.deleteProperty('BT_ACC');
     props.deleteProperty('BT_QUEUE');   // 旧方式の残骸があれば掃除
-    Logger.log('成績集計 完了: ' + Object.keys(map).length + 'パターン（参考値。順位付けには未使用）');
-    ss.toast('パターン成績を更新しました（参考値・順位には未使用）', '酒田五法', 6);
+    const mlSheet = ss.getSheetByName(ML.SHEET_DATA);
+    const mlRows = mlSheet ? Math.max(mlSheet.getLastRow() - 1, 0) : 0;
+    Logger.log('成績集計 完了: ' + Object.keys(map).length + 'パターン（参考値。順位付けには未使用）'
+      + ' / ML学習データ ' + mlRows + '行');
+    ss.toast('パターン成績を更新しました（参考値・順位には未使用）。ML学習データ' + mlRows
+      + '行 →「ML参考重みを学習」で係数を出せます', '酒田五法', 8);
   }
 }
 

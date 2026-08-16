@@ -463,17 +463,28 @@ function fetchEarningsCalendarRows_() {
   return rows;
 }
 
-// Yahoo チャートAPIから指数の終値配列を取得（^N225 / ^GSPC / ^VIX 等）。parseYahooBars_(Code.js) 流用。
-function fetchIndexCloses_(symbol) {
+/**
+ * Yahoo チャートAPIから指数のバー配列を取得（^N225 / ^GSPC / ^VIX 等）。parseYahooBars_(Code.js) 流用。
+ *
+ * 終値だけでなくタイムスタンプ付きのバーを返す。ML学習データのベンチマーク控除では、
+ * 銘柄側と指数側を**日付で**突き合わせる必要があるため（休止日などで配列長が揃わない）。
+ * range は既定で MACRO.YAHOO_RANGE。バックテスト側は SK.YAHOO_RANGE を明示して呼ぶ。
+ */
+function fetchIndexBars_(symbol, range) {
   const url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(symbol) +
-    '?range=' + MACRO.YAHOO_RANGE + '&interval=1d';
+    '?range=' + (range || MACRO.YAHOO_RANGE) + '&interval=1d';
   // Yahooは429を返すことがある。ここで空配列になると NS倍率が FLAT・VIXが NONE となり、
   // 急落サインが「条件を満たさなかった」のか「取れなかった」のか区別できないまま消える。
   const res = fetchWithRetry_(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true },
     { retry: SK.FETCH_RETRY, backoffMs: SK.FETCH_BACKOFF_MS, label: 'Yahoo ' + symbol });
-  const closes = parseYahooBars_(res).map(b => b.c);
-  if (!closes.length) Logger.log('⚠ ' + symbol + ' の終値を取得できませんでした（HTTP ' + res.getResponseCode() + '）');
-  return closes;
+  const bars = parseYahooBars_(res);
+  if (!bars.length) Logger.log('⚠ ' + symbol + ' の終値を取得できませんでした（HTTP ' + res.getResponseCode() + '）');
+  return bars;
+}
+
+// 指数の終値配列。既存の呼び出し元はこちらのまま（fetchIndexBars_ の薄いラッパー）。
+function fetchIndexCloses_(symbol) {
+  return fetchIndexBars_(symbol).map(b => b.c);
 }
 
 // JPX週次「信用取引現在高」(.xls) を取り込む。JPXはボット遮断(403)でGAS直取得不可のため、

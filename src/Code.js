@@ -275,7 +275,7 @@ function scanSignals() {
   } else {
     props.deleteProperty('SK_CURSOR');
     props.deleteProperty('SK_FAILED');
-    finalizeSignals_(sig);
+    const n = finalizeSignals_(sig);   // 並べ替え・強さ評価・保有マーキングまで（メール送信に必要な内容を確定）
     const hit = Math.max(sig.getLastRow() - 1, 0);
     writeScanStatus_(sig, total, total, failed);
     Logger.log('走査完了: シグナル ' + hit + '件 / 取得失敗 ' + failed + '件');
@@ -293,6 +293,17 @@ function scanSignals() {
     }
     sendTopBuySignalsEmail_(sig, plans);   // 強さ★★★・買いだけを走査完了直後にメール通知
     sendHeldStockDirectionEmail_(sig, plans);   // 保有銘柄の方向を走査完了直後にメール通知
+
+    // 信用倍率・決算発表列・ハイパーリンク・書式設定などの見た目の仕上げはメール送信の後で行う。
+    // 全銘柄走査が時間バジェットぎりぎりで終わった日にここで6分上限を超えて強制終了しても、
+    // 通知メールは既に送信済みのため実害はない（以前は仕上げまで含めて1関数で行っており、
+    // 強制終了時にその日の通知メールが一通も送られないまま気づかれないことがあった）。
+    try {
+      finalizeSignalsCosmetic_(sig, n);
+    } catch (e) {
+      Logger.log('シグナルシートの仕上げ処理に失敗（通知メールは送信済み）: ' + e.message);
+      ss.toast('シート仕上げでエラー: ' + e.message + '（通知メールは送信済みです）', '酒田五法', 8);
+    }
   }
 }
 
@@ -392,7 +403,8 @@ function scheduledHeldCheck() {
   if (!isMarketOpen_(now)) { Logger.log('立会時間外のため保有確認をスキップ: ' + now); return; }
   const sig = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.SIGNALS);
   if (!sig || sig.getLastRow() < 2) { Logger.log('シグナル未生成のため保有確認をスキップ'); return; }
-  finalizeSignals_(sig);
+  const n = finalizeSignals_(sig);
+  finalizeSignalsCosmetic_(sig, n);   // メール送信を伴わない経路なので、従来通り仕上げまで一括で行う
   Logger.log('購入ポートフォリオ確認: 保有ハイライトを更新');
 }
 
@@ -426,8 +438,14 @@ function refreshSignalEarningsColumn() {
   ss.toast('決算発表列（K列）を更新しました（' + n + '銘柄・詳細はログ参照）', '酒田五法', 6);
 }
 
+// 並べ替え・強さ評価・保有マーキングまでを行う「メール送信に必要な内容」の確定処理。
+// 信用倍率取得・決算発表列・ハイパーリンク・書式設定などの見た目の仕上げは
+// finalizeSignalsCosmetic_ に分離し、メール送信（scanSignals側）より後で行う。
+// 以前はこれら全てを1関数で行っていたため、全銘柄走査が4.5分の時間バジェットぎりぎりで
+// 終わった日、仕上げ処理まで含めた合計がGASの6分ハード上限を超えて強制終了し、
+// その日の通知メールが一通も送られないまま気づかれない、という実害が起きた。
 function finalizeSignals_(sig) {
-  if (sig.getLastRow() < 2) return;
+  if (sig.getLastRow() < 2) return 0;
   const n = sig.getLastRow() - 1;
 
   // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き）。重みは静的（SIGNAL_WEIGHT_）。
@@ -447,6 +465,39 @@ function finalizeSignals_(sig) {
     row[6] = d === '買い' ? '▲ 買い' : d === '売り' ? '▼ 売り' : d === '混在' ? '◆ 混在' : d;
   });
   sig.getRange(2, 1, n, 9).setValues(data);
+
+  // 保有銘柄: 保有列に○を立てる（行のハイライトは条件付き書式が○を見て行う）。
+  // sendHeldStockDirectionEmail_ はこの列（r[0]==='○'）で対象行を絞り込むため、
+  // メール送信より前にここで確定させる必要がある。
+  try {
+    const held = getSbiHeldCodes_();
+    const marks = [];
+    for (let i = 0; i < n; i++) {
+      const code = to4_(String(data[i][3] || '').trim()).toUpperCase();
+      marks.push([held.codes.has(code) ? '○' : '']);
+    }
+    sig.getRange(2, 1, n, 1).setValues(marks).setFontColor('#c0392b').setFontWeight('bold');
+    // 未設定・アクセス不可のときは例外を投げないため、ここで明示的に知らせる
+    // （以前は0件のまま静かに終わり、「なぜか保有マークが出ない」原因が分からなかった）。
+    if (held.reason) {
+      Logger.log('保有ハイライトが機能していません: ' + held.reason);
+      SpreadsheetApp.getActive().toast('保有ハイライトが機能していません: ' + held.reason, '酒田五法', 10);
+    }
+  } catch (e) {
+    // 参照元スプレッドシートの権限切れ等で落ちることがある。以前はログのみで、
+    // ハイライトが消えた理由が利用者に伝わらなかった。
+    Logger.log('SBI保有ハイライト失敗: ' + e.message);
+    SpreadsheetApp.getActive().toast('保有銘柄のハイライトを取得できませんでした: ' + e.message, '酒田五法', 8);
+  }
+
+  return n;
+}
+
+// finalizeSignals_ の続き（見た目の仕上げ）。メール送信の後に呼ぶ。
+// ここで6分上限に達して強制終了しても、通知メールは既に送信済みのため実害はない。
+function finalizeSignalsCosmetic_(sig, n) {
+  if (n <= 0) return;
+  const data = sig.getRange(2, 1, n, 9).getValues();   // 並べ替え・保有マーキング確定後の内容を読み直す
 
   // 信用倍率(合計)を Yahoo Finance Japan から結合（10列目）。点灯銘柄のみ取得。
   // 取得不可のときは空欄ではなく失敗理由を表示する（Stackdriverを見なくても原因が分かるように）。
@@ -489,28 +540,6 @@ function finalizeSignals_(sig) {
 
   // 明示背景をいったんリセット（売却済み銘柄のハイライトを残さないため）
   sig.getRange(2, 1, n, 11).setBackground(null);
-
-  // 保有銘柄: 保有列に○を立てる（行のハイライトは条件付き書式が○を見て行う）
-  try {
-    const held = getSbiHeldCodes_();
-    const marks = [];
-    for (let i = 0; i < n; i++) {
-      const code = to4_(String(data[i][3] || '').trim()).toUpperCase();
-      marks.push([held.codes.has(code) ? '○' : '']);
-    }
-    sig.getRange(2, 1, n, 1).setValues(marks).setFontColor('#c0392b').setFontWeight('bold');
-    // 未設定・アクセス不可のときは例外を投げないため、ここで明示的に知らせる
-    // （以前は0件のまま静かに終わり、「なぜか保有マークが出ない」原因が分からなかった）。
-    if (held.reason) {
-      Logger.log('保有ハイライトが機能していません: ' + held.reason);
-      SpreadsheetApp.getActive().toast('保有ハイライトが機能していません: ' + held.reason, '酒田五法', 10);
-    }
-  } catch (e) {
-    // 参照元スプレッドシートの権限切れ等で落ちることがある。以前はログのみで、
-    // ハイライトが消えた理由が利用者に伝わらなかった。
-    Logger.log('SBI保有ハイライト失敗: ' + e.message);
-    SpreadsheetApp.getActive().toast('保有銘柄のハイライトを取得できませんでした: ' + e.message, '酒田五法', 8);
-  }
 
   // 方向・保有の色分けは条件付き書式で持たせる。
   // 直接 setBackground で塗ると、利用者がフィルタで並べ替えたときに色だけ元の行位置に

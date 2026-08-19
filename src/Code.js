@@ -91,7 +91,7 @@ function onOpen() {
     .addItem('セットアップ', 'setup')
     .addSeparator()
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
-    .addItem('シグナル走査/続行',            'scanSignals')
+    .addItem('シグナル走査/続行（売買プランも更新）', 'scanSignals')
     .addItem('売買プランを作成/更新（★3買い＋保有株）', 'buildPlans')
     .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights')
     .addItem('ML参考重みを学習（実験的・順位には未使用）', 'trainMlWeights')

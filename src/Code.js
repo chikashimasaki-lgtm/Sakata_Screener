@@ -2141,6 +2141,9 @@ function writePlanSheet_(targets) {
   sh.clear();
   sh.getRange(1, 1, 1, PLAN_HEADERS_.length).setValues([PLAN_HEADERS_]);
   sh.setTabColor('#1b7a3d');
+  // 12列目（L1）。ヘッダーは11列目（メモ）までなので空いている列に置く（シグナルシートのL1と同じ流儀）。
+  sh.getRange(1, 12).setValue('更新 ' + Utilities.formatDate(new Date(), 'JST', 'MM/dd HH:mm'))
+    .setFontColor('#1a7f37').setFontWeight('bold');
 
   const plans = {};
   if (!targets.length) {

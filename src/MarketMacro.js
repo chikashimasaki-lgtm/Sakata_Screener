@@ -5,7 +5,8 @@
 //    (Driveのmtseisan*.xls)・日経EPS(stock-marketdata.com)・海外投資家 現物ネット
 //    (J-Quants /equities/investor-types)・好決算sell-on-news(J-Quants fins/details×equities/bars/daily)。
 //    各取得は失敗/サンプル不足/プラン遅延時に「相場マクロ」シートの手入力へフォールバック。
-//  ・7条件の点灯を「急落サイン」シートに N/7 で出力。
+//  ・7条件の点灯をN/7で「相場マクロ」シートの下段（入力欄の下、急落サイン節）に出力。
+//    2026-08-21、以前は別シート「急落サイン」だったが、入力と結果を1画面で見られるよう統合した。
 //  ・条件1・2（売残・信用倍率）から地合い(SHORT_COVER/NEUTRAL/SUPPLY_RISK)を算出し、
 //    Code.js の finalizeSignals_ がシグナルの強さ(★)スコアに反映する。
 //  ・閾値/係数は Code.js の SK.MARGIN に一元化。macdSeries_(Code.js) を VIX 判定に流用。
@@ -13,8 +14,10 @@
 
 const MACRO = {
   INPUT_SHEET: '相場マクロ',
-  ALERT_SHEET: '急落サイン',
   CALENDAR_SHEET: '決算カレンダー',
+  // 「相場マクロ」シートは上段=手入力欄・下段=急落サインの判定結果（2026-08-21統合、旧「急落サイン」シート）。
+  INPUT_ROWS: 6,          // 入力欄の行数（見出し1行＋項目5行）。この範囲だけを手入力として読み書きする
+  ALERT_START_ROW: 8,     // 急落サイン表の開始行（INPUT_ROWS+2、間に1行あける）
   REGIME_PROP: 'SK_MARGIN_REGIME',
   NS_WINDOW:   20,      // NS倍率トレンド判定窓（営業日）
   YAHOO_RANGE: '6mo',
@@ -593,7 +596,10 @@ function parseTseMarginGrid_(grid) {
 function writeMacroInputValues_(pairs) {
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(MACRO.INPUT_SHEET); if (!sh) sh = setupMacroSheets_().input;
-  var rows = Math.max(sh.getLastRow(), 1);
+  // 入力欄（1〜INPUT_ROWS行）だけを対象にする。getLastRow() だと下段の急落サイン表まで
+  // 対象に入ってしまい、条件名（「日経平均EPS 下落…」等）が誤って入力ラベルとして
+  // マッチし、判定結果を手入力値と取り違えて上書きしてしまう（2026-08-21統合で判明）。
+  var rows = MACRO.INPUT_ROWS;
   var vals = sh.getRange(1, 1, rows, 3).getValues();
   // 該当行ごとに setValue を呼ばず、B列・C列を組み立てて一度に書き戻す（API呼び出しを減らす）
   var out = vals.map(function (r) { return [r[1]]; });
@@ -627,7 +633,10 @@ function readMacroInputSheet_() {
   const ss = SpreadsheetApp.getActive();
   let sh = ss.getSheetByName(MACRO.INPUT_SHEET);
   if (!sh) sh = setupMacroSheets_().input;
-  const rows = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 3).getValues();
+  // 入力欄（1〜INPUT_ROWS行）だけを読む。下段の急落サイン表の条件名まで含めて正規表現照合すると
+  // （例:「日経平均EPS 下落…」が /EPS/ に、「海外投資家の現物売り越し」が /海外/ に一致する等）、
+  // 判定結果を入力値と取り違える（2026-08-21統合で判明）。
+  const rows = sh.getRange(1, 1, MACRO.INPUT_ROWS, 3).getValues();
   // ラベルはキーワードで照合（旧「二市場売残」等が残っていても拾えるよう寛容に）
   const find = (re) => { for (var i = 0; i < rows.length; i++) { if (re.test(String(rows[i][0] || ''))) return rows[i][1]; } return undefined; };
   // C列の最終更新日から鮮度を見る。値だけでは「更新済み」と「放置」を区別できない。
@@ -795,32 +804,49 @@ function calendarMapFromEntries_(entries) {
   return m;
 }
 
+/**
+ * 急落サインの判定結果を「相場マクロ」シートの下段（ALERT_START_ROW行目〜）へ書く。
+ *
+ * 2026-08-21、以前は別シート「急落サイン」に書いていたが、入力と結果を1画面で
+ * 見られるよう「相場マクロ」シートへ統合した。上段（1〜INPUT_ROWS行）は手入力欄なので、
+ * ここでは触らない（sh.clear() は使わず、下段の範囲だけをクリアしてから書き直す）。
+ * styleSheet_/autoFit_ もシート全体（行1をヘッダ扱いする実装）を使うと入力欄の見た目を
+ * 壊すため使わず、この関数の中で下段だけを直接装飾する。
+ */
 function writeAlertSheet_(conds, lit, data) {
   const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(MACRO.ALERT_SHEET) || ss.insertSheet(MACRO.ALERT_SHEET);
-  sh.clear();
+  const sh = ss.getSheetByName(MACRO.INPUT_SHEET) || setupMacroSheets_().input;
   const regime = marginRegime_(data.sell_margin_oku, data.margin_ratio);
   // 点灯数だけでは強弱が読み取れないため、目安を併記する
   const scale = lit >= 5 ? '（5件以上＝警戒領域）' : lit >= 3 ? '（3〜4件＝注意）' : '（2件以下＝落ち着いている）';
   const rows = [
-    ['急落サイン 点灯数', lit + ' / 7' + scale],
+    ['急落サイン 点灯数', lit + ' / 7' + scale, ''],
     ['市場地合い', regime + (regime === 'SHORT_COVER' ? '（ショートカバー好機・買い追い風）'
-      : regime === 'SUPPLY_RISK' ? '（需給悪化・売り警戒）' : '（中立）')],
+      : regime === 'SUPPLY_RISK' ? '（需給悪化・売り警戒）' : '（中立）'), ''],
     ['この表を更新した時刻', Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm')
-      + '（※データそのものの基準日は「相場マクロ」シートのC列を参照）'],
+      + '（※データそのものの基準日は上の入力欄のC列を参照）', ''],
   ];
+  const summaryRowCount = rows.length;   // 点灯数/地合い/更新時刻。stale有無によらずここは常に固定件数
   // 入力が古いままだと、判定は動いていても中身は数か月前の需給ということが起きる
   const stale = data.stale || [];
-  if (stale.length) rows.push(['⚠ 更新が古い/日付未記入の入力', stale.join('、')]);
-  rows.push(['', '']);
+  if (stale.length) rows.push(['⚠ 更新が古い/日付未記入の入力', stale.join('、'), '']);
+  rows.push(['', '', '']);
+  const subHeaderIdx = rows.length;   // ['条件','状態','値'] を積む位置（0始まり）
   rows.push(['条件', '状態', '値']);
   conds.forEach(c => rows.push([c.condition, c.alert ? '⚠ 点灯' : '正常', macroValueLabel_(c.value)]));
-  // 列数を3に揃える
+
+  const startRow = MACRO.ALERT_START_ROW;
   const width = 3;
+  // 前回より行数が減っても古い内容が残らないよう、余裕を持ってクリアしてから書く
+  sh.getRange(startRow, 1, Math.max(rows.length, 20), width).clearContent().clearFormat();
   const grid = rows.map(r => { const a = r.slice(0, width); while (a.length < width) a.push(''); return a; });
-  sh.getRange(1, 1, grid.length, width).setValues(grid);
-  try { styleSheet_(sh, width, '#7a1f2b', '#fbeef0'); autoFit_(sh, width); } catch (e) {}
-  sh.setTabColor('#c0392b');
+  sh.getRange(startRow, 1, grid.length, width).setValues(grid);
+
+  sh.getRange(startRow, 1, summaryRowCount, 1).setFontWeight('bold');
+  sh.getRange(startRow + subHeaderIdx, 1, 1, width)
+    .setBackground('#7a1f2b').setFontColor('#ffffff').setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  try { autoFit_(sh, width); } catch (e) {}
 }
 
 // 「決算カレンダー」シートを作成/更新。entries は filterCalendarToUniverse_ の返り値、
@@ -887,7 +913,10 @@ function updateEarningsCalendar() {
  * 誤記が黙って既定値へフォールバックし、入力したつもりの値が効いていなかった。
  */
 function applyMacroValidation_(sh, lastRow) {
-  const rows = sh.getRange(1, 1, Math.max(lastRow, sh.getLastRow()), 1).getValues();
+  // lastRow（入力欄の行数）だけを対象にする。sh.getLastRow() まで広げると、下段の
+  // 急落サイン表の条件名（「日経平均EPS 下落…」「好決算銘柄の決算後急落が頻発」等）にまで
+  // 誤ってプルダウン検証がかかってしまう（2026-08-21統合で判明）。
+  const rows = sh.getRange(1, 1, lastRow, 1).getValues();
   const mk = (list) => SpreadsheetApp.newDataValidation()
     .requireValueInList(list, true).setAllowInvalid(false)
     .setHelpText('次のいずれかを選んでください: ' + list.join(' / ')).build();

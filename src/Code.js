@@ -18,7 +18,7 @@
 // ============================================================================
 
 const SK = {
-  SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方', STATS: 'パターン成績', HISTORY: 'シグナル履歴', PLAN: '売買プラン' },
+  SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方', STATS: 'パターン成績', PLAN: '売買プラン' },
   YAHOO_RANGE: '6mo',
   BATCH: 40,
   TIME_BUDGET_MS: 4.5 * 60 * 1000,
@@ -93,8 +93,8 @@ function onOpen() {
     .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
     .addItem('シグナル走査/続行（売買プランも更新）', 'scanSignals')
     .addItem('売買プランを作成/更新（★3買い＋保有株）', 'buildPlans')
+    .addItem('AI推奨コメントを生成（参考・投資助言ではありません）', 'generateAiSummary_')
     .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights')
-    .addItem('ML参考重みを学習（実験的・順位には未使用）', 'trainMlWeights')
     .addItem('相場マクロ/急落サインを更新', 'updateMarketMacro')
     .addItem('決算カレンダーを更新',        'updateEarningsCalendar')
     .addItem('決算発表列だけ更新（シグナル）', 'refreshSignalEarningsColumn')
@@ -102,6 +102,8 @@ function onOpen() {
     .addSeparator()
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
     .addItem('走査の進捗リセット',           'resetScanQueue')
+    .addItem('シート順序を整える',           'ensureSheetOrder_')
+    .addItem('旧MLシートを削除（一度だけ）', 'removeDeprecatedMlSheets_')
     .addToUi();
 }
 
@@ -363,6 +365,41 @@ function resetScanQueue() {
 
 function clearResumeTriggers_() {
   clearTriggersFor_('scanSignals');   // 共通モジュール TriggerUtils.js
+}
+
+// 廃止した「ML学習データ」「ML重み(参考)」シートの後片付け（一度だけ実行すればよい）。
+// 削除した機能（trainMlWeights等）がもう存在しないため、稼働中のスプレッドシートに
+// タブとしてだけ残ってしまったものを消す。存在しなければ何もしない安全設計。
+function removeDeprecatedMlSheets_() {
+  const ss = SpreadsheetApp.getActive();
+  const names = ['ML学習データ', 'ML重み(参考)'];
+  const removed = [];
+  names.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (sh) { ss.deleteSheet(sh); removed.push(name); }
+  });
+  const msg = removed.length ? removed.join('・') + ' を削除しました' : '対象のシートはありませんでした';
+  Logger.log('旧MLシート削除: ' + msg);
+  ss.toast(msg, '酒田五法', 6);
+}
+
+// タブの並びを人が実際に見る優先順に揃える。存在しないシートは無視するので、
+// 何度実行しても安全（実行するまでは何も変わらない）。
+function ensureSheetOrder_() {
+  const ss = SpreadsheetApp.getActive();
+  const order = [
+    SK.SHEETS.USAGE, SK.SHEETS.PLAN, AI_SHEET_, SK.SHEETS.SIGNALS,
+    MACRO.INPUT_SHEET, MACRO.CALENDAR_SHEET, SK.SHEETS.UNIVERSE, SK.SHEETS.STATS,
+  ];
+  let moved = 0;
+  order.forEach((name, i) => {
+    const sh = ss.getSheetByName(name);
+    if (!sh) return;
+    sh.activate();
+    ss.moveActiveSheet(i + 1);
+    moved++;
+  });
+  ss.toast('シート順序を整えました（' + moved + '件）', '酒田五法', 5);
 }
 
 // ---- 定期実行（平日18時・土日祝／年末年始はスキップ） ----
@@ -897,6 +934,8 @@ const SIGNAL_DESC_ = {
   'MACDデッドクロス':     'MACDがシグナル線を上から下抜け。下落転換のサイン（売り）。',
 };
 // シグナルの強さ重み（「傾向が強い順」の並べ替えに使用）。大きいほど強いフォーメーション。
+// npm run calc-weights が書き換えます。手動編集は次回実行で上書きされます。
+// SIGNAL_WEIGHT_ AUTO-GENERATED START
 const SIGNAL_WEIGHT_ = {
   // 2026-08-16 実データで算出（1225銘柄・6mo・日経平均控除後）。再現は npm run calc-weights
   // 比較対象は0.5ではなく「シグナル無しで入った場合の勝率」＝ 売り20日58.3% / 売り3日57.5% / 買い20日41.7% / 買い3日42.5%
@@ -934,6 +973,7 @@ const SIGNAL_WEIGHT_ = {
   '毛抜き底': 1,                      // n=6819 44.4%(基準42.5% +2.0pt) CI[42.6%,46.3%] → 有意だが差が小さい（+2.0pt < +5.0pt）→ 現行値を維持
   '赤三兵': 1,                       // n=3455 37.3%(基準42.5% -5.2pt) CI[34.8%,39.9%] → 基準42.5%を下回る（-5.2pt）（旧2）
 };
+// SIGNAL_WEIGHT_ AUTO-GENERATED END
 
 // 各パターンの方向（実績集計・履歴記録に使用）
 const SIGNAL_DIR_ = {
@@ -979,7 +1019,9 @@ function suggestWeight_(name, n, wins) {
 }
 
 // パターン1つの点数 = 静的重み（SIGNAL_WEIGHT_）。
-// バックテストの学習結果は上記の理由により順位付けへ反映しない。
+// SIGNAL_WEIGHT_ 自体は npm run calc-weights（tools/calc_weights.js, decideWeight_/wilsonInterval_）で
+// 実データから統計的に検証して決めている。順位付けに使わないのは suggestWeight_ の生の勝率
+// （上記コメント参照。ベンチマーク未控除・有意性検定なし）であり、SIGNAL_WEIGHT_ とは別物。
 function patternPoints_(name) {
   return SIGNAL_WEIGHT_[name] || 1;
 }
@@ -1362,17 +1404,16 @@ function createUsageSheet() {
     ['   （後で損益を振り返るときに、このラベルで一覧できるようにするため）', 'p'],
     ['ここに出る価格は「シグナルの前提が崩れる水準」であって、値上がりの保証ではありません。', 'note'],
     ['', 'p'],
-    ['■ 「相場マクロ」シート（地合いの入力）', 'h'],
-    ['急落サインの判定材料を入れるシートです。B列が値、C列が最終更新日です。', 'p'],
+    ['■ 「相場マクロ」シート（地合いの入力＋急落サイン判定）', 'h'],
+    ['上段（1〜6行目）が急落サインの判定材料を入れる手入力欄です。B列が値、C列が最終更新日です。', 'p'],
     ['・東証 売残／信用倍率 … JPXの信用取引現在高ファイル(mtseisan*.xls)から自動取込', 'p'],
     ['   ※JPXのサイトからDLした mtseisan*.xls を、このスプレッドシートと同じGoogleドライブに置いてください', 'p'],
     ['   （JPXはボットからの直接ダウンロードを拒否するため、ファイルの入手だけは手作業になります）', 'p'],
     ['・日経EPS／海外投資家／好決算sell-on-news … 自動取得を試み、取れないときは手入力', 'p'],
     ['・C列の最終更新日が10日以上前、または空欄だと「更新が古い」と警告します', 'p'],
     ['   値だけ見ていると更新忘れに気づけず、古い需給のまま判定してしまうためです', 'p'],
-    ['', 'p'],
-    ['■ 「急落サイン」シート', 'h'],
-    ['相場全体の急落リスクを7つの条件で判定し、点灯数をN/7で表示します。', 'p'],
+    ['下段（8行目〜）が急落サインの判定結果です。相場全体の急落リスクを7つの条件で判定し、', 'p'],
+    ['点灯数をN/7で表示します（2026-08-21、旧「急落サイン」シートをここへ統合しました）。', 'p'],
     ['目安 … 2件以下=落ち着いている / 3〜4件=注意 / 5件以上=警戒領域', 'p'],
     ['判定結果は個別シグナルの強さ(★)にも反映されます（買い/売りで逆方向に作用）。', 'p'],
     ['', 'p'],
@@ -1397,29 +1438,8 @@ function createUsageSheet() {
     ['   「統計的に検出できる差」と「実務で意味のある差」は別物として扱っています。', 'p'],
     ['条件を満たさなかったパターンは、従来どおり形の強弱で決めた値のままにしてあります。', 'p'],
     ['再計算は開発者向けコマンド npm run calc-weights で、いつでもやり直せます。', 'p'],
+    ['   目安は月次〜四半期に1回（基準線が相場付きで変わり得るため）。自動実行はしません。', 'p'],
     ['※これは「過去6ヶ月のこの相場で」の話です。相場付きが変われば結果も変わります。', 'note'],
-    ['', 'p'],
-    ['■ 「ML重み(参考)」シート（実験的）', 'h'],
-    ['各パターンの効きやすさを機械学習（ロジスティック回帰）で推定し、', 'p'],
-    ['本番で使っている静的重み（1〜3）と横に並べて表示します。', 'p'],
-    ['手順 … ①「パターン成績を集計」で「ML学習データ」シートを作る → ②「ML参考重みを学習」', 'p'],
-    ['   （①の走査に相乗りしてデータを貯めるので、株価の再取得は発生しません）', 'p'],
-    ['上の「パターン成績」と違い、次の4点を直したデータで学習しています。', 'p'],
-    ['・日経平均の同じ期間の値動きを差し引いた「超過リターン」で勝ち負けを判定', 'p'],
-    ['   （相場全体が上げただけの分を、パターンの手柄として数えないため）', 'p'],
-    ['・同じシグナルが連日点灯しても、評価期間が重なる分は数えない（件数の水増し防止）', 'p'],
-    ['・買値は「翌営業日の寄付」で計算（走査は終値確定後なので、当日終値では買えないため）', 'p'],
-    ['・方向ごとに60件集まらなければ学習せず、「サンプル不足」と表示します', 'p'],
-    ['読み方 … 「ML予測勝率」と「実績勝率」が近ければ、そのパターンの傾向を素直に捉えています。', 'p'],
-    ['   係数は標準化してあるので、絶対値が大きいものほど勝ち負けへの効き方が強い項目です。', 'p'],
-    ['   「学習内AUC」が「交差検証AUC」より大きく高い場合は、過去データに合わせ込みすぎ（過学習）です。', 'p'],
-    ['※実データで検証したところ、この回帰モデルには期間をまたぐ予測力がありませんでした', 'note'],
-    ['   （交差検証AUCが買い0.48・売り0.49＝当てずっぽうと同じ。学習内は0.54なので、', 'p'],
-    ['   過去に合わせ込んでいるだけで先の期間には効いていない、という読みになります）。', 'p'],
-    ['   そのため重みの決定にはこのモデルを使わず、パターンごとの勝率を基準線と直接', 'p'],
-    ['   比べる方法を採っています（上の「■ パターンの重みの決め方」）。', 'p'],
-    ['   このシートは「モデルにすると何が見えるか」を確認するための実験として残しています。', 'p'],
-    ['   なお地合い（信用需給）は過去の履歴を取得できないため、学習には含めていません。', 'p'],
     ['', 'p'],
     ['■ 自動実行（トリガー）', 'h'],
     ['メニュー「自動実行を設定」で以下の3つを設定します。', 'p'],
@@ -1427,7 +1447,7 @@ function createUsageSheet() {
     ['② 全銘柄走査 … 平日18時に1回、全銘柄の株価を取得して酒田五法シグナルを走査（重い処理）', 'p'],
     ['③ 購入ポートフォリオ確認 … 毎時、SBI保有銘柄をシグナルシート上で最新のハイライトに更新（株価取得はしない）', 'p'],
     ['   ※いずれも休場日（土日祝・年末年始）はスキップします', 'p'],
-    ['   ※パターン成績の集計とML参考重みの学習は自動実行しません（必要なときにメニューから実行）', 'p'],
+    ['   ※パターン成績の集計は自動実行しません（必要なときにメニューから実行）', 'p'],
     ['', 'p'],
     ['■ 検出する酒田五法', 'h'],
     ['赤三兵 … 陽線3本の切り上げ（買い）', 'p'],
@@ -1464,11 +1484,6 @@ function createUsageSheet() {
     ['   海外投資家の売買動向の取得に使います。利用にはAPIキーの登録が必要です。', 'p'],
     ['スクリプトプロパティ … Apps Scriptに秘密の設定値（APIキー等）を保存する場所。', 'p'],
     ['   Apps Scriptエディタ → 左の歯車（プロジェクトの設定） → スクリプト プロパティ から設定します。', 'p'],
-    ['AUC … 「勝つ銘柄を上位に並べられているか」を0〜1で測った値（ML重みシート）。', 'p'],
-    ['   0.5＝でたらめと同じ、1＝完璧。株価の予測では0.55〜0.6でも十分良い方です。', 'p'],
-    ['交差検証 … 学習に使っていない期間で答え合わせをして、実力を測る手順。', 'p'],
-    ['過学習 … 過去データの偶然のクセまで覚えてしまい、未来には効かなくなること。', 'p'],
-    ['   「学習内AUC」と「交差検証AUC」の差が大きいほど、この状態を疑います。', 'p'],
   ];
 
   return UsageSheet.buildDoc(SpreadsheetApp.getActive(), SK.SHEETS.USAGE, rows);
@@ -1523,16 +1538,18 @@ function writeStatsSheet_(map) {
 }
 
 // ============================================================================
-//  ML学習データの収集（backtestWeights の走査に相乗り）
+//  重み算出の再利用可能な純粋関数（tools/calc_weights.js から呼ばれる）
 //  ---------------------------------------------------------------------------
-//  同じ6ヶ月ローリング走査から、イベント1件＝1行のデータセットを作って
-//  「ML学習データ」シートへ貯める。学習の本体は MLWeights.js（参考値・順位には未使用）。
+//  ここにある buildDateCloseMap_/barDateKey_/benchmarkReturn_/extractMlRow_ は、
+//  SIGNAL_WEIGHT_ を実データから算出する tools/calc_weights.js が本体と同じロジックを
+//  使うために存在する（書き写しによる乖離を防ぐ）。GAS側の backtestWeights() 自体は
+//  これらを使わず、従来の「パターン成績」集計のみを行う（参考値・順位には未使用）。
 //
-//  suggestWeight_ が廃止された4つの理由を、ここで構造的に潰しておく:
+//  suggestWeight_ が廃止された4つの理由を、tools/calc_weights.js 側で構造的に潰している:
 //    (1) ベンチマーク未控除 → 日経平均の同期間リターンを引いた「超過リターン」でラベル付け
 //    (2) 連日重複でサンプル水増し → 評価期間が重なる再点灯はクールダウンで採らない
 //    (3) 約定タイミングが粗い    → 翌日始値エントリー・h営業日後終値エグジット
-//    (4) サンプル不足            → 学習側（MLWeights.js）で最低件数ゲートをかける
+//    (4) サンプル不足            → decideWeight_ で最低件数ゲートをかける
 // ============================================================================
 
 // Yahooのバー配列から「YYYY-MM-DD → 終値」のマップを作る。
@@ -1607,26 +1624,6 @@ function extractMlRow_(params) {
   ];
 }
 
-// ML学習データシートを初期化（走査を最初から始めるときだけ呼ぶ）。
-function resetMlDataSheet_() {
-  const ss = SpreadsheetApp.getActive();
-  let sh = ss.getSheetByName(ML.SHEET_DATA);
-  if (!sh) sh = ss.insertSheet(ML.SHEET_DATA);
-  sh.clear();
-  sh.getRange(1, 1, 1, ML_DATA_HEADERS_.length).setValues([ML_DATA_HEADERS_]);
-  sh.setFrozenRows(1);
-  return sh;
-}
-
-// 蓄積した行をまとめて追記する。1行ずつ appendRow するとAPI呼び出しが増えて時間予算を食う。
-function appendMlRows_(rows) {
-  if (!rows || !rows.length) return;
-  const ss = SpreadsheetApp.getActive();
-  let sh = ss.getSheetByName(ML.SHEET_DATA);
-  if (!sh) sh = resetMlDataSheet_();
-  sh.getRange(sh.getLastRow() + 1, 1, rows.length, ML_DATA_HEADERS_.length).setValues(rows);
-}
-
 // 過去6ヶ月バックテスト（時間分割・自動再開）。各パターンの N日後リターン実績を集計し成績DBを自動更新。
 function backtestWeights() {
   const lock = LockService.getScriptLock();
@@ -1654,18 +1651,8 @@ function backtestWeights() {
   if (!cursor || !acc) {
     cursor = 0;
     acc = {};   // name -> [n, wins, retSum]
-    resetMlDataSheet_();   // 新規走査のときだけ初期化（再開時に消すと途中の行を失う）
     ss.toast('パターン成績の集計を開始（自動再開で完走します）', '酒田五法', 5);
   }
-
-  // ML学習データのベンチマーク控除に使う日経平均。走査中に1回だけ取る。
-  // 取れなければ ML 用の行だけ作らない（パターン成績の集計自体は従来どおり続ける）。
-  let idxByDate = null;
-  try {
-    // 銘柄側と同じ期間を明示して取る（MACRO.YAHOO_RANGE と別々に変わっても揃うように）
-    idxByDate = buildDateCloseMap_(fetchIndexBars_('^N225', SK.YAHOO_RANGE));
-    if (!Object.keys(idxByDate).length) { idxByDate = null; Logger.log('ML学習データ: 日経平均を取得できず、この回は行を作りません'); }
-  } catch (e) { idxByDate = null; Logger.log('ML学習データ: 日経平均の取得に失敗 ' + e.message); }
 
   const start = Date.now();
   while (cursor < total) {
@@ -1678,19 +1665,11 @@ function backtestWeights() {
     }));
     const resps = fetchAllWithRetry_(reqs);
     if (!resps) break;   // ネットワークごと落ちている。カーソルは進めず次回に持ち越す。
-    const mlRows = [];   // このバッチで作ったML学習データ行（まとめて追記する）
     resps.forEach((res, si) => {
       if (!res || res.getResponseCode() !== 200) return;
       const bars = parseYahooBars_(res);
       const last = bars.length - 1;
       if (bars.length < BT_MIN_HISTORY + BT_FORWARD + 1) return;
-      // ML用の指標は全期間分を1回だけ計算する。RSI(Wilder)もMACD(EMA)も逐次再帰で
-      // 未来を参照しないため、インデックス i を引けばその日時点の値になる。
-      const code = slice[si];
-      const closes = idxByDate ? bars.map(b => b.c) : null;
-      const rsi  = idxByDate ? rsiSeries_(closes, 14) : null;
-      const macd = idxByDate ? macdSeries_(closes, 12, 26, 9) : null;
-      const lastFire = {};   // 「コード|パターン名」→直近採用インデックス（クールダウン用）
       for (let i = BT_MIN_HISTORY; i <= last - BT_FORWARD; i++) {
         const signals = detectSakata_(bars.slice(0, i + 1));
         if (!signals.length) continue;
@@ -1705,17 +1684,8 @@ function backtestWeights() {
           const a = acc[s.name] || (acc[s.name] = [0, 0, 0]);
           a[0] += 1; a[1] += dr > 0 ? 1 : 0; a[2] += dr;
         });
-        // ML学習データ側は別ルール（ベンチマーク控除・クールダウン・翌日寄付）で採否を決める。
-        // 上の集計は既存の互換のためそのまま残す。
-        if (idxByDate) {
-          signals.forEach(s => {
-            const row = extractMlRow_({ bars, i, sig: s, code, lastFire, idxByDate, rsi, macd });
-            if (row) mlRows.push(row);
-          });
-        }
       }
     });
-    appendMlRows_(mlRows);
     // バッチ単位でカーソルと集計値を確定させる（6分制限で強制終了しても取りこぼさない）
     cursor += slice.length;
     props.setProperty('BT_CURSOR', String(cursor));
@@ -1737,12 +1707,8 @@ function backtestWeights() {
     writeStatsSheet_(map);
     props.deleteProperty('BT_CURSOR'); props.deleteProperty('BT_ACC');
     props.deleteProperty('BT_QUEUE');   // 旧方式の残骸があれば掃除
-    const mlSheet = ss.getSheetByName(ML.SHEET_DATA);
-    const mlRows = mlSheet ? Math.max(mlSheet.getLastRow() - 1, 0) : 0;
-    Logger.log('成績集計 完了: ' + Object.keys(map).length + 'パターン（参考値。順位付けには未使用）'
-      + ' / ML学習データ ' + mlRows + '行');
-    ss.toast('パターン成績を更新しました（参考値・順位には未使用）。ML学習データ' + mlRows
-      + '行 →「ML参考重みを学習」で係数を出せます', '酒田五法', 8);
+    Logger.log('成績集計 完了: ' + Object.keys(map).length + 'パターン（参考値。順位付けには未使用）');
+    ss.toast('パターン成績を更新しました（参考値・順位には未使用）', '酒田五法', 8);
   }
 }
 

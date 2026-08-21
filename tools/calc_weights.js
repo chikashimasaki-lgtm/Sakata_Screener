@@ -24,6 +24,10 @@
  *   （日経平均は値がさ株偏重で、個別株の中央値はこれに劣後するため）。
  *   0.5と比べると売りが軒並み「勝ち」買いが軒並み「負け」と出るが、それは
  *   指数の作りの話であってパターンの優位性ではない。
+ *
+ * 再実行の目安:
+ *   月次〜四半期に1回（基準線・勝率が相場付きでドリフトするため）。自動実行はしない
+ *   （意図的に手動コマンドのまま。実行後は git diff で src/Code.js の変更内容を確認してからコミットする）。
  */
 const fs = require('fs');
 const path = require('path');
@@ -40,8 +44,6 @@ const LIMIT = Number(argVal('--limit', '0')) || 0;
 // 0 を渡せる必要があるので `|| undefined` では書けない（0は falsy）。
 const edgeArg = argVal('--edge', null);
 const MIN_EDGE = (edgeArg != null && isFinite(Number(edgeArg))) ? Number(edgeArg) / 100 : undefined;
-// しきい値の感度だけ見たいときは回帰の学習を飛ばす（4万行の学習は数十秒かかる）
-const SKIP_MODEL = args.includes('--skip-model');
 // 多重比較の補正（既定でオン）。29パターンを95%水準で検定すると、
 // 全て無効だとしても偶然「有意」になるものが1〜2件は出る。有意水準を 0.05/検定数 に絞る
 // （z=1.96 → 3.134）。実データでは補正の有無で結論が変わらないことを確認済みだが、
@@ -72,7 +74,7 @@ const EXPORTS = [
   'parseYahooBars_', 'detectSakata_', 'rsiSeries_', 'macdSeries_',
   'extractMlRow_', 'buildDateCloseMap_', 'barDateKey_', 'signalHorizon_',
   'signalStrength_', 'patternPoints_', 'medianTurnover_', 'isLiquidEnough_',
-  'ML', 'wilsonInterval_', 'decideWeight_', 'buildFeatureMatrix_', 'trainDirectionModel_',
+  'ML', 'wilsonInterval_', 'decideWeight_',
 ];
 const M = new Function(...Object.keys(sandbox), `
 ${read('FetchRetry.js')}
@@ -231,24 +233,6 @@ const pct = v => (v * 100).toFixed(1) + '%';
   });
   console.log('  ※日経平均は値がさ株偏重のため個別株の中央値が劣後する。0.5ではなくこの値と比べる。');
 
-  // 参考: ロジスティック回帰（静的重みは特徴量から外す＝自己参照を断つ）
-  console.log('\n■ ロジスティック回帰（参考・静的重みは特徴量から除外）');
-  const models = {};
-  (SKIP_MODEL ? [] : ['買い', '売り']).forEach(dir => {
-    const sub = rows.filter(r => String(r.dir).indexOf(dir) >= 0);
-    const m = M.trainDirectionModel_(sub, { excludeStaticWeight: true });
-    models[dir] = m;
-    if (m.skipped) { console.log('  ' + dir + ': 学習せず（' + m.reason + '）'); return; }
-    console.log('  ' + dir + ': n=' + m.n + ' 陽性' + m.posN + '  λ=' + m.lambda +
-      '  交差検証AUC=' + m.cv.aucMean.toFixed(3) + '±' + m.cv.aucSd.toFixed(3) +
-      '  学習内AUC=' + m.inSampleAuc.toFixed(3));
-  });
-  const predOf = {};
-  ['買い', '売り'].forEach(d => {
-    const m = models[d];
-    if (m && !m.skipped) (m.perPattern || []).forEach(p => { predOf[p.pattern] = p.predWinRate; });
-  });
-
   // パターンごとに Wilson 区間で重みを決める
   const agg = {};
   rows.forEach(r => {
@@ -281,7 +265,7 @@ const pct = v => (v * 100).toFixed(1) + '%';
     const d = M.decideWeight_(a.wins, a.n, cur, { baseline: base, minEdge: MIN_EDGE, z: Z });
     return { name, dir, horizon: h, n: a.n, wins: a.wins, baseline: base,
       edge: a.n ? (a.wins / a.n - (base == null ? 0.5 : base)) : null,
-      cur, next: d.weight, reason: d.reason, ci: d.ci, pred: predOf[name] };
+      cur, next: d.weight, reason: d.reason, ci: d.ci };
   }).sort((x, y) => y.n - x.n);
 
   console.log('\n■ パターン別の判定（' + M.ML.MIN_PATTERN_SAMPLE + '件未満は現行値を維持）');
@@ -329,34 +313,50 @@ const pct = v => (v * 100).toFixed(1) + '%';
       '  (' + (diff >= 0 ? '+' : '') + diff + ' / ' + (o ? ((diff / o) * 100).toFixed(0) : '—') + '%)');
   });
 
-  // 貼り付け用のブロック
-  console.log('\n■ src/Code.js の SIGNAL_WEIGHT_ に貼るブロック');
+  // SIGNAL_WEIGHT_ ブロックを構築し、src/Code.js のマーカー間へ直接書き込む
+  console.log('\n■ src/Code.js の SIGNAL_WEIGHT_ を更新');
   console.log('─'.repeat(104));
   const stamp = new Date().toISOString().slice(0, 10);
   const baseTxt = Object.keys(baseline).sort().map(k => k.replace('|', '') + '日' + pct(baseline[k])).join(' / ');
   const edgeUsed = (MIN_EDGE != null ? MIN_EDGE : M.ML.MIN_EDGE) * 100;
-  console.log('const SIGNAL_WEIGHT_ = {');
-  console.log('  // ' + stamp + ' 実データで算出（' + ok + '銘柄・' + M.SK.YAHOO_RANGE + '・日経平均控除後）。再現は npm run calc-weights');
-  console.log('  // 比較対象は0.5ではなく「シグナル無しで入った場合の勝率」＝ ' + baseTxt);
-  console.log('  //   日経平均は値がさ株偏重で個別株の中央値が劣後するため、控除後でも0.5にならない。');
-  console.log('  // 動かす条件は次の3つを全て満たすもの。それ以外は人手で決めた従来値のまま。');
-  console.log('  //   ①' + M.ML.MIN_PATTERN_SAMPLE + '件以上  ②Wilson区間が基準線を外れる' +
+  const lines = [];
+  lines.push('const SIGNAL_WEIGHT_ = {');
+  lines.push('  // ' + stamp + ' 実データで算出（' + ok + '銘柄・' + M.SK.YAHOO_RANGE + '・日経平均控除後）。再現は npm run calc-weights');
+  lines.push('  // 比較対象は0.5ではなく「シグナル無しで入った場合の勝率」＝ ' + baseTxt);
+  lines.push('  //   日経平均は値がさ株偏重で個別株の中央値が劣後するため、控除後でも0.5にならない。');
+  lines.push('  // 動かす条件は次の3つを全て満たすもの。それ以外は人手で決めた従来値のまま。');
+  lines.push('  //   ①' + M.ML.MIN_PATTERN_SAMPLE + '件以上  ②Wilson区間が基準線を外れる' +
     (BONFERRONI ? '（Bonferroni補正 z=' + Z.toFixed(2) + '）' : '（z=1.96）') +
     '  ③基準線との差が' + edgeUsed.toFixed(0) + 'pt以上');
-  console.log('  //   ③が要るのは、件数が数千あると1〜2ptの差でも②を通ってしまうため（有意≠意味のある差）。');
+  lines.push('  //   ③が要るのは、件数が数千あると1〜2ptの差でも②を通ってしまうため（有意≠意味のある差）。');
   results.slice().sort((a, b) => (a.name < b.name ? -1 : 1)).forEach(r => {
     const ciTxt = r.ci ? 'CI[' + pct(r.ci.lower) + ',' + pct(r.ci.upper) + ']' : '';
     const ed = r.edge != null ? ((r.edge >= 0 ? '+' : '') + (r.edge * 100).toFixed(1) + 'pt') : '';
     const note = r.n
       ? ('n=' + r.n + ' ' + pct(r.wins / r.n) + '(基準' + pct(r.baseline) + ' ' + ed + ') ' + ciTxt + ' → ' + r.reason)
       : '該当なし → 現行値を維持';
-    console.log("  '" + r.name + "': " + r.next + ',' +
+    lines.push("  '" + r.name + "': " + r.next + ',' +
       ' '.repeat(Math.max(1, 26 - r.name.length)) + '// ' + note + (r.cur !== r.next ? '（旧' + r.cur + '）' : ''));
   });
-  console.log('};');
+  lines.push('};');
+  const blockText = lines.join('\n');
+  console.log(blockText);
   console.log('─'.repeat(104));
+
+  const codePath = path.join(ROOT, 'src', 'Code.js');
+  const startMarker = '// SIGNAL_WEIGHT_ AUTO-GENERATED START';
+  const endMarker = '// SIGNAL_WEIGHT_ AUTO-GENERATED END';
+  const codeSrc = fs.readFileSync(codePath, 'utf8');
+  const ms = codeSrc.indexOf(startMarker), me = codeSrc.indexOf(endMarker);
+  if (ms === -1 || me === -1) {
+    console.error('\nSIGNAL_WEIGHT_ のマーカーが src/Code.js に見つかりません。書き込みをスキップしました。');
+  } else {
+    const nextSrc = codeSrc.slice(0, ms + startMarker.length) + '\n' + blockText + '\n' + codeSrc.slice(me);
+    fs.writeFileSync(codePath, nextSrc);
+    console.log('\nsrc/Code.js の SIGNAL_WEIGHT_ を更新しました。git diff で確認してください。');
+  }
 
   fs.writeFileSync(path.join(__dirname, 'weights_result.json'),
     JSON.stringify({ generatedAt: new Date().toISOString(), universe: codes.length, fetched: ok, events: rows.length, results }, null, 2));
-  console.log('\n詳細を tools/weights_result.json に保存しました。');
+  console.log('詳細を tools/weights_result.json に保存しました。');
 })();

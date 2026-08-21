@@ -45,11 +45,8 @@ const EXPORTS = [
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'isTopBuyRow_', 'planTargets_', 'signalText_', 'toNum_',
   'planMailLine_', 'SAKATA_PROFIT_LABEL_',
-  // ML参考重み（MLWeights.js）。学習・評価まわりはGAS APIに触らない純粋関数。
-  'ML', 'sigmoid_', 'dot_', 'standardizeFit_', 'standardizeApply_',
-  'logisticGrad_', 'trainLogisticRegression_', 'predictProba_',
-  'rocAuc_', 'evaluateBinary_', 'blockedTimeSeriesFolds_', 'crossValidate_',
-  'selectLambda_', 'buildFeatureMatrix_', 'trainDirectionModel_',
+  // SIGNAL_WEIGHT_ 算出の統計コア（MLWeights.js）。tools/calc_weights.js から呼ばれる純粋関数。
+  'ML',
   'benchmarkReturn_', 'extractMlRow_', 'buildDateCloseMap_', 'barDateKey_',
   'wilsonInterval_', 'decideWeight_', 'SIGNAL_WEIGHT_', 'SIGNAL_DIR_',
 ];
@@ -769,139 +766,7 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
   eq(M.toNum_(''), null, '空欄はnull（0にすると「株数0」と区別できない）');
   eq(M.toNum_('—'), null, '読めない値はnull');
 
-  console.log('\n【25】ML参考重み: シグモイドと標準化');
-  eq(M.sigmoid_(0), 0.5, 'sigmoid_(0)=0.5');
-  eq(M.sigmoid_(1000) === 1, true, '大きな正値で1へ飽和（オーバーフローしない）');
-  eq(M.sigmoid_(-1000) === 0, true, '大きな負値で0へ飽和（NaNにならない）');
-  near(M.sigmoid_(2) + M.sigmoid_(-2), 1, 1e-12, 'σ(z)+σ(-z)=1');
-
-  {
-    const X = [[1, 10], [2, 20], [3, 30], [4, 40]];
-    const sp = M.standardizeFit_(X);
-    const Z = M.standardizeApply_(X, sp);
-    const col = j => Z.map(r => r[j]);
-    const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
-    near(mean(col(0)), 0, 1e-12, '標準化後の平均は0');
-    near(Math.sqrt(mean(col(0).map(v => v * v))), 1, 1e-12, '標準化後の標準偏差は1');
-    // 定数列を0で割らないこと。ここが割れると以降が全部NaNになり、原因が追いにくい。
-    const sp2 = M.standardizeFit_([[5], [5], [5]]);
-    eq(sp2.sd[0], 1, '定数列の標準偏差は1に置き換える（0除算しない）');
-    eq(M.standardizeApply_([[5]], sp2)[0][0], 0, '定数列は標準化して0（NaNにしない）');
-  }
-
-  console.log('\n【26】ML参考重み: ロジスティック回帰の学習');
-  {
-    // x1 が正なら y=1 という線形分離可能な合成データ
-    const X = [], y = [];
-    for (let i = -10; i <= 10; i++) { if (!i) continue; X.push([i, 0.5]); y.push(i > 0 ? 1 : 0); }
-    const m = M.trainLogisticRegression_(X, y, { lambda: 0.01, lr: 0.5, epochs: 300 });
-    eq(m.w[0] > 0, true, '正のクラスを持ち上げる特徴量の係数は正になる');
-    eq(m.lossHistory[0] > m.lossHistory[m.lossHistory.length - 1], true, '損失が学習で減っている');
-    const p = M.predictProba_(X, m.w, m.b);
-    eq(p.every(v => v >= 0 && v <= 1), true, '予測確率は[0,1]に収まる');
-    eq(M.rocAuc_(y, p), 1, '線形分離可能なデータは学習後AUC=1');
-
-    // L2を強くすると係数が縮む（Ridgeの効き目そのもの）。実際に使うグリッド全域で単調に縮むこと。
-    const norm = w => Math.sqrt(w.reduce((s, v) => s + v * v, 0));
-    const norms = M.ML.LAMBDAS.map(lam =>
-      norm(M.trainLogisticRegression_(X, y, { lambda: lam, lr: M.ML.LEARNING_RATE, epochs: 500 }).w));
-    eq(norms.every((v, i) => i === 0 || v < norms[i - 1]), true,
-      'λを大きくすると係数ノルムが単調に縮む（L2正則化・実グリッド全域）');
-    eq(norms.every(v => isFinite(v)), true, '実グリッドのλでは発散しない');
-
-    // 発散の検知。lr*λ/n が2を超えると更新が振動して膨張し Infinity→NaN になる。
-    // 黙って NaN や 1e87 の係数をシートに出すと「効きの強い特徴量」に見えてしまうので、
-    // 直前の有限な係数を返して発散を申告する。
-    const div = M.trainLogisticRegression_(X, y, { lambda: 500, lr: 0.5, epochs: 300 });
-    eq(div.diverged, true, '実効ステップが大きすぎる設定は発散として検知する');
-    eq(div.w.every(isFinite) && isFinite(div.b), true, '発散してもNaN/Infinityの係数は返さない');
-    eq(M.trainLogisticRegression_(X, y, { lambda: 1, lr: 0.1, epochs: 200 }).diverged, false,
-      '正常な設定では発散フラグが立たない');
-  }
-
-  console.log('\n【27】ML参考重み: 評価指標');
-  eq(M.rocAuc_([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]), 1, '完全に分離できていればAUC=1');
-  eq(M.rocAuc_([0, 0, 1, 1], [0.9, 0.8, 0.2, 0.1]), 0, '順序が真逆ならAUC=0');
-  eq(M.rocAuc_([0, 1], [0.5, 0.5]), 0.5, '同値スコアは平均順位で扱いAUC=0.5');
-  eq(M.rocAuc_([1, 1, 1], [0.1, 0.5, 0.9]), null, '片方のクラスが無ければAUCは定義できずnull');
-  {
-    const ev = M.evaluateBinary_([1, 1, 0, 0], [0.9, 0.8, 0.2, 0.1]);
-    eq([ev.tp, ev.fp, ev.tn, ev.fn], [2, 0, 2, 0], '混同行列が正しい');
-    eq([ev.accuracy, ev.precision, ev.recall, ev.f1], [1, 1, 1, 1], '完全正解なら各指標1');
-    // 「陽性と予測したものが0件」で適合率0と出すと性能が悪いように読めるが、実際は定義できない
-    const ev2 = M.evaluateBinary_([1, 0], [0.1, 0.2]);
-    eq(ev2.precision, null, '陽性の予測が1件も無ければ適合率はnull（0ではない）');
-  }
-
-  console.log('\n【28】ML参考重み: ブロック分割交差検証');
-  {
-    const folds = M.blockedTimeSeriesFolds_(10, 5);
-    eq(folds.length, 5, '指定した数のフォールドができる');
-    eq(folds.map(f => f.testIdx), [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
-      'テスト側は時系列順の連続ブロック（ランダムに混ぜない＝時系列リーク対策）');
-    const allTest = [].concat.apply([], folds.map(f => f.testIdx));
-    eq(allTest.length, new Set(allTest).size, 'テストインデックスが重複しない');
-    folds.forEach((f, i) => eq(f.trainIdx.some(x => f.testIdx.indexOf(x) >= 0), false,
-      `フォールド${i}の学習側とテスト側が排他`));
-    // 端数は最終フォールドへ寄せる（切り捨てて評価対象から漏らさない）
-    eq(M.blockedTimeSeriesFolds_(11, 5).map(f => f.testIdx.length), [2, 2, 2, 2, 3],
-      '割り切れない分は最終フォールドに含める');
-    eq(M.blockedTimeSeriesFolds_(3, 5), [], 'サンプルが分割数に満たなければフォールドを作らない');
-  }
-
-  console.log('\n【29】ML参考重み: 特徴量の組み立て');
-  {
-    const rows = [];
-    // 「赤三兵」は20件、「毛抜き底」は3件。前者だけ one-hot 列を持つ想定。
-    for (let i = 0; i < 20; i++) rows.push({ date: '2026-01-' + (i + 1), pattern: '赤三兵', dir: '買い', staticWeight: 2, rsi: 50, macdHist: 0.1, macdDiff: 0.2, label: i % 2 });
-    for (let i = 0; i < 3; i++)  rows.push({ date: '2026-02-0' + (i + 1), pattern: '毛抜き底', dir: '買い', staticWeight: 1, rsi: 30, macdHist: -0.1, macdDiff: -0.2, label: 1 });
-    const fm = M.buildFeatureMatrix_(rows, { minPatternOnehot: 15 });
-    eq(fm.onehot, ['赤三兵'], '発生件数が閾値以上のパターンだけ個別one-hot列を持つ');
-    eq(fm.names, ['P:赤三兵', '静的重み', 'RSI14', 'MACDヒスト', 'MACD-Signal差'],
-      '少数派パターンは静的重み列へ丸め込み、次元がサンプル数に対して過大にならないようにする');
-    eq(fm.X[0][0], 1, '該当パターンのone-hotは1');
-    eq(fm.X[20][0], 0, '閾値未満のパターンはone-hot列が立たない');
-    eq(fm.X[20][1], 1, '代わりに静的重み（1〜3）で表現される');
-    eq(fm.y.length, 23, 'ラベルが行数分できる');
-  }
-
-  console.log('\n【30】ML参考重み: 学習の入口（サンプル不足ゲート）');
-  {
-    const few = [{ date: '2026-01-01', pattern: '赤三兵', dir: '買い', staticWeight: 2, rsi: 50, macdHist: 0, macdDiff: 0, label: 1 }];
-    const r = M.trainDirectionModel_(few, { minSample: 60 });
-    eq(r.skipped, true, 'サンプルが足りなければ学習しない（n=20で勝率を語った過去の反省）');
-    eq(r.reason.indexOf('サンプル不足') === 0, true, 'スキップの理由を明示する');
-    // ラベルが片方に偏ったデータは学習が成立しない。無理に係数を出さない。
-    const oneSided = [];
-    for (let i = 0; i < 80; i++) oneSided.push({ date: '2026-01-01', pattern: '赤三兵', dir: '買い', staticWeight: 2, rsi: 50, macdHist: 0, macdDiff: 0, label: 1 });
-    eq(M.trainDirectionModel_(oneSided, { minSample: 60 }).skipped, true, 'ラベルが片側だけなら学習しない');
-
-    // 学習が通るデータで、静的重みと並べる表（perPattern）が出ること。
-    // 「効くパターン」を仕込んで、モデルがそれを最上位に置けるかまで見る。
-    const rows = [];
-    const rnd = lcg(42);
-    const pats = ['赤三兵', '明けの明星', '毛抜き底'];
-    const wts = { '赤三兵': 2, '明けの明星': 3, '毛抜き底': 1 };
-    for (let i = 0; i < 300; i++) {
-      const p = pats[Math.floor(rnd() * pats.length)];
-      const rsi = 20 + rnd() * 60;
-      rows.push({ date: '2026-' + String(1 + Math.floor(i / 30)).padStart(2, '0') + '-' + String(1 + i % 28).padStart(2, '0'),
-        pattern: p, dir: '買い', staticWeight: wts[p], rsi, macdHist: 0.1, macdDiff: 0.2,
-        label: (rnd() < 0.5 + (p === '明けの明星' ? 0.35 : 0)) ? 1 : 0 });
-    }
-    const fit = M.trainDirectionModel_(rows);
-    eq(fit.skipped, false, '十分なサンプルとばらついたラベルがあれば学習できる');
-    eq(fit.perPattern.length, 3, 'パターンごとの予測勝率が出る');
-    eq(fit.perPattern[0].pattern, '明けの明星', '仕込んだ優位性の高いパターンを最上位に並べる');
-    eq(fit.perPattern.every(p => p.predWinRate >= 0 && p.predWinRate <= 1), true, '予測勝率は[0,1]');
-    eq(fit.perPattern.every(p => p.staticWeight === wts[p.pattern]), true,
-      '本番の静的重みを併記する（置き換えではなく並行表示）');
-    eq(fit.perPattern.reduce((s, p) => s + p.n, 0), 300, '件数の合計が入力行数と一致する');
-    // 交差検証AUCと学習内AUCが極端に乖離していないこと（過学習の早期発見）
-    eq(fit.inSampleAuc - fit.cv.aucMean < 0.15, true, '学習内AUCと交差検証AUCが大きく乖離しない');
-  }
-
-  console.log('\n【31】ML参考重み: ベンチマーク控除とクールダウン');
+  console.log('\n【25】重みの算出: ベンチマーク控除とクールダウン（extractMlRow_）');
   {
     const idx = { '2026-01-05': 100, '2026-01-08': 110 };
     near(M.benchmarkReturn_(idx, '2026-01-05', '2026-01-08'), 0.1, 1e-12, '指数の同区間リターンを返す');
@@ -946,7 +811,7 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
       null, '方向が無いシグナルは採らない');
   }
 
-  console.log('\n【32】重みの算出: Wilson信頼区間');
+  console.log('\n【26】重みの算出: Wilson信頼区間');
   {
     // 教科書的な既知値。p=0.5, n=100, z=1.96 の Wilson 区間は概ね [0.404, 0.596]
     const a = M.wilsonInterval_(50, 100);
@@ -967,7 +832,7 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     eq(M.wilsonInterval_(50, 100, 3.13).lower < a.lower, true, 'zを大きくすると区間が広がる');
   }
 
-  console.log('\n【33】重みの算出: 重みを動かす条件');
+  console.log('\n【27】重みの算出: 重みを動かす条件');
   {
     const B = 0.575;   // 売り3日の実測基準線
     // ① 件数が足りなければ動かさない
@@ -995,20 +860,7 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
       '下限を外すと+1.6ptでも3に上がる＝③が効いている');
   }
 
-  console.log('\n【34】特徴量から静的重みを外せること');
-  {
-    const rows = [];
-    for (let i = 0; i < 20; i++) rows.push({ date: '2026-01-01', pattern: '赤三兵', dir: '買い', staticWeight: 2, rsi: 50, macdHist: 0.1, macdDiff: 0.2, label: i % 2 });
-    const withStatic = M.buildFeatureMatrix_(rows, { minPatternOnehot: 15 });
-    const without = M.buildFeatureMatrix_(rows, { minPatternOnehot: 15, excludeStaticWeight: true });
-    eq(withStatic.names.indexOf('静的重み') >= 0, true, '既定では静的重みを特徴量に含む');
-    eq(without.names.indexOf('静的重み'), -1, 'excludeStaticWeight で静的重み列が消える');
-    eq(without.X[0].length, withStatic.X[0].length - 1, '列が1つだけ減る');
-    // SIGNAL_WEIGHT_ を決める学習でこれを外さないと、出力で入力を書き換える自己参照になる
-    eq(without.names, ['P:赤三兵', 'RSI14', 'MACDヒスト', 'MACD-Signal差'], '残る特徴量の並び');
-  }
-
-  console.log('\n【35】SIGNAL_WEIGHT_ の健全性');
+  console.log('\n【28】SIGNAL_WEIGHT_ の健全性');
   {
     const names = Object.keys(M.SIGNAL_WEIGHT_);
     eq(names.every(n => [1, 2, 3].includes(M.SIGNAL_WEIGHT_[n])), true, '重みは1〜3の整数のみ');

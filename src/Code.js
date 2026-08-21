@@ -103,7 +103,7 @@ function onOpen() {
     .addItem('使い方シートを作成/更新',      'createUsageSheet')
     .addItem('走査の進捗リセット',           'resetScanQueue')
     .addItem('シート順序を整える',           'ensureSheetOrder_')
-    .addItem('旧MLシートを削除（一度だけ）', 'removeDeprecatedMlSheets_')
+    .addItem('廃止シートを削除（一度だけ）', 'removeDeprecatedSheets_')
     .addToUi();
 }
 
@@ -367,19 +367,19 @@ function clearResumeTriggers_() {
   clearTriggersFor_('scanSignals');   // 共通モジュール TriggerUtils.js
 }
 
-// 廃止した「ML学習データ」「ML重み(参考)」シートの後片付け（一度だけ実行すればよい）。
-// 削除した機能（trainMlWeights等）がもう存在しないため、稼働中のスプレッドシートに
-// タブとしてだけ残ってしまったものを消す。存在しなければ何もしない安全設計。
-function removeDeprecatedMlSheets_() {
+// 廃止した「ML学習データ」「ML重み(参考)」「AI推奨（参考）」シートの後片付け（一度だけ実行すればよい）。
+// 削除・設計変更した機能（trainMlWeights・別シート方式のAI推奨コメント等）がもう存在しないため、
+// 稼働中のスプレッドシートにタブとしてだけ残ってしまったものを消す。存在しなければ何もしない安全設計。
+function removeDeprecatedSheets_() {
   const ss = SpreadsheetApp.getActive();
-  const names = ['ML学習データ', 'ML重み(参考)'];
+  const names = ['ML学習データ', 'ML重み(参考)', 'AI推奨（参考）'];
   const removed = [];
   names.forEach(name => {
     const sh = ss.getSheetByName(name);
     if (sh) { ss.deleteSheet(sh); removed.push(name); }
   });
   const msg = removed.length ? removed.join('・') + ' を削除しました' : '対象のシートはありませんでした';
-  Logger.log('旧MLシート削除: ' + msg);
+  Logger.log('廃止シート削除: ' + msg);
   ss.toast(msg, '酒田五法', 6);
 }
 

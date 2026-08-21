@@ -867,6 +867,8 @@ function writeEarningsCalendarSheet_(entries, nameMap, note) {
   const grid = [header].concat(rows.length ? rows : [[note || '対象銘柄の決算発表予定は見つかりませんでした', '', '', '', '']]);
   const width = header.length;
   sh.getRange(1, 1, grid.length, width).setValues(grid);
+  // 時価総額は3桁カンマ区切りで表示する（Asset_Status等、他プロジェクトの金額列と同じ表記）
+  if (rows.length) sh.getRange(2, width, rows.length, 1).setNumberFormat('#,##0');
   try { styleSheet_(sh, width, '#1a4d7a', '#eaf3fb'); autoFit_(sh, width); } catch (e) {}
   sh.setTabColor('#2e75b6');
 }

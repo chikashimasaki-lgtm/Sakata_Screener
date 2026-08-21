@@ -474,9 +474,9 @@ console.log('\n【12】決算カレンダー — 対象銘柄への絞り込み�
 {
   // edinetdb.jp /v1/calendar の実測フィールド名（secCode／announcementDate／estimatedAnnouncementDate）
   const rows = [
-    { secCode: '9999', announcementDate: '2026-08-10', dateStatus: 'confirmed', marketCap: 500 },   // 対象外コード
-    { secCode: '72030', announcementDate: '2026-08-05', dateStatus: 'confirmed', marketCap: 30000 }, // 5桁→to4_で7203化
-    { secCode: '6758', announcementDate: null, estimatedAnnouncementDate: '2026-08-01', dateStatus: 'estimated', marketCap: 15000 },
+    { secCode: '9999', announcementDate: '2026-08-10', dateStatus: 'confirmed', marketCap: 500000000 },   // 対象外コード
+    { secCode: '72030', announcementDate: '2026-08-05', dateStatus: 'confirmed', marketCap: 30000000000 }, // 5桁→to4_で7203化
+    { secCode: '6758', announcementDate: null, estimatedAnnouncementDate: '2026-08-01', dateStatus: 'estimated', marketCap: 304411187880 },
   ];
   const out = M.filterCalendarToUniverse_(rows, ['7203', '6758']);
   eq(out.length, 2, '対象銘柄(7203/6758)の2件のみ残る');
@@ -484,6 +484,13 @@ console.log('\n【12】決算カレンダー — 対象銘柄への絞り込み�
   eq(out[1].code, '7203', '次が8/5の7203（5桁コードもto4_で正規化）');
   eq(out[0].dateStatus, 'estimated', 'dateStatusを保持する');
   eq(out[1].date, '2026-08-05', 'confirmed時はannouncementDateを採る');
+  // marketCapはedinetdb.jpから生の円単位で返る（実測: 宝ホールディングス304,411,187,880円）。
+  // シート見出しは「時価総額（億円）」なので1億で割る。円のまま書くと実際の1億倍という
+  // 非現実的な数値になる不具合があった（2026-08-21発見）。
+  eq(out[0].marketCap, 3044, '円→億円（304,411,187,880円 → 3,044億円）');
+  eq(out[1].marketCap, 300, '円→億円（30,000,000,000円 → 300億円）');
+  eq(M.filterCalendarToUniverse_([{ secCode: '7203', announcementDate: '2026-08-05', dateStatus: 'confirmed' }], ['7203'])[0].marketCap,
+    null, 'marketCap未提供ならnull（0円と誤読しない）');
 
   eq(M.filterCalendarToUniverse_([], ['7203']), [], '行が空なら空配列');
   eq(M.filterCalendarToUniverse_(null, ['7203']), [], 'rowsがnullでも例外にならず空配列');

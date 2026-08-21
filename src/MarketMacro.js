@@ -789,7 +789,10 @@ function filterCalendarToUniverse_(rows, universeCodes) {
       code: to4_(String(r.secCode || r.code || r.Code || '').trim()),
       date: r.announcementDate || r.estimatedAnnouncementDate || r.date || '',
       dateStatus: r.dateStatus || r.status || '',
-      marketCap: r.marketCap != null ? r.marketCap : null,
+      // 実測: marketCap は生の円単位で返る。円のまま書いていたため、実際の時価総額の
+      // 1億倍という非現実的な値になっていた不具合を修正（2026-08-21発見）。
+      // 億円表記（例: 宝ホールディングス 304,411,187,880円 → 3,044億円）。
+      marketCap: r.marketCap != null ? Math.round(Number(r.marketCap) / 1e8) : null,
     }))
     .filter(r => r.code && r.date && set[r.code]);
   out.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
@@ -856,7 +859,7 @@ function writeEarningsCalendarSheet_(entries, nameMap, note) {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(MACRO.CALENDAR_SHEET) || ss.insertSheet(MACRO.CALENDAR_SHEET);
   sh.clear();
-  const header = ['コード', '銘柄名', '発表予定日', '確度', '時価総額（百万円）'];
+  const header = ['コード', '銘柄名', '発表予定日', '確度', '時価総額（億円）'];
   const rows = (entries || []).map(e => [
     e.code, (nameMap && nameMap[e.code]) || '', e.date, calendarStatusLabel_(e.dateStatus),
     e.marketCap != null ? e.marketCap : '',

@@ -1,32 +1,37 @@
 /**
  * AI推奨コメント（Gemini）
  * ---------------------------------------------------------------------------
- * 「売買プラン」シートの内容と、急落サイン/決算カレンダーの情報をGeminiに渡し、
- * 日本語の参考コメントを「AI推奨（参考）」シートへ書き出す。
+ * 「売買プラン」シートのメモ欄（K列）を、Geminiが生成した参考コメントで置き換える。
+ * 別シートは作らない。既存メモ（トレンド崩れ警告・注文種別の根拠等、機械的に算出された
+ * 事実）はプロンプトに渡し、AIコメントにその要点を残しつつ、地合い・決算近接などの
+ * 文脈を添えた1〜2文へ書き換えさせる（事実を消さず、解釈を足す）。
  *
  * 位置づけ:
  *   統計的な重み決定（Wilson信頼区間・ベンチマーク控除・有意性検定、MLWeights.js）とは別物。
  *   ここでのAIは「新しく学習させる」のではなく、既に大規模に訓練済みのGemini（自己回帰の
  *   大規模言語モデルであるLLM）に、計算済みの統計結果を渡して自然文で解釈・要約させる使い方。
  *   投資助言ではなく、注目点・リスク要因を客観的に整理する参考情報として扱う（プロンプトにも
- *   明記する）。
+ *   明記し、シート側にも一言添える）。
  *
  * 認証・呼び出し方は ~/projects/Abitus-Automation の callGeminiText_ と同じパターン
  * （UrlFetchApp + Generative Language API、GEMINI_API_KEY をスクリプトプロパティから読む）。
+ * JSON抽出も同プロジェクトの extractRuleProposal_ と同じ「本文からJSON部分だけ正規表現で
+ * 取り出してparseする」方式（応答に前置き・コードブロック記号が混じっても崩れないように）。
  *
  * 自動トリガーには繋げず、メニューから手動実行のみとする（外部APIのレイテンシ・コストを
  * 毎回のシグナル走査に乗せないため。「パターン成績を集計」と同じ扱い）。
  */
 
 const AI_MODELS_ = ['gemini-3.5-flash', 'gemini-2.5-flash'];
-const AI_SHEET_ = 'AI推奨（参考）';
+const AI_MEMO_COL_ = 11;   // 「売買プラン」シートのメモ列（PLAN_HEADERS_ の11番目）
 
-// メニューから呼ぶ入口。「売買プラン」シートを読み、Geminiでコメントを生成して書き出す。
+// メニューから呼ぶ入口。「売買プラン」シートを読み、Geminiでコメントを生成してメモ欄へ書く。
 function generateAiSummary_() {
   const ss = SpreadsheetApp.getActive();
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) throw new Error('GEMINI_API_KEY がスクリプトプロパティに未設定です');
 
+  const sh = ss.getSheetByName(SK.SHEETS.PLAN);
   const planRows = readPlanRowsForAi_(ss);
   if (!planRows.length) {
     ss.toast('「' + SK.SHEETS.PLAN + '」に対象行がありません。先に「売買プランを作成/更新」を実行してください', APP_NAME_, 8);
@@ -40,18 +45,27 @@ function generateAiSummary_() {
     ss.toast('AIコメントの生成に失敗しました（実行ログを確認してください）', APP_NAME_, 8);
     return;
   }
-  writeAiSummarySheet_(text);
-  ss.toast('AI推奨コメントを更新しました（参考・投資助言ではありません）', APP_NAME_, 6);
+  const comments = parseAiComments_(text);
+  if (!comments) {
+    ss.toast('AIの応答を解析できませんでした（実行ログを確認してください）', APP_NAME_, 8);
+    return;
+  }
+  writeAiCommentsIntoPlan_(sh, planRows, comments);
+  ss.toast('メモ欄をAIコメントに更新しました（参考・投資助言ではありません）', APP_NAME_, 6);
 }
 
 // 「売買プラン」シートから、AI要約の材料になる行を読む（PLAN_HEADERS_ の並びに合わせる）。
+// row はシート上の行番号（書き戻し先の特定に使う）。
 function readPlanRowsForAi_(ss) {
   const sh = ss.getSheetByName(SK.SHEETS.PLAN);
   if (!sh || sh.getLastRow() < 2) return [];
   const values = sh.getRange(2, 1, sh.getLastRow() - 1, PLAN_HEADERS_.length).getValues();
-  return values
-    .filter(r => r[1])   // コード列が空の行（「対象がありません」等の案内行）は除く
-    .map(r => ({ kind: r[0], code: r[1], name: r[2], signal: r[9], note: r[10] }));
+  const out = [];
+  values.forEach((r, i) => {
+    if (!r[1]) return;   // コード列が空の行（「対象がありません」等の案内行）は除く
+    out.push({ row: i + 2, kind: r[0], code: r[1], name: r[2], signal: r[9], note: r[10] });
+  });
+  return out;
 }
 
 // 急落サイン（地合い）・決算カレンダー（銘柄別の決算近接）を読む。
@@ -78,13 +92,16 @@ function readMacroContextForAi_(ss) {
   return ctx;
 }
 
-// Geminiに渡す日本語プロンプトを組み立てる。
+// Geminiに渡す日本語プロンプトを組み立てる。JSON（コード→コメント）で返させる。
 function buildAiPrompt_(planRows, ctx) {
   const lines = [];
   lines.push('あなたは個人投資家向けの分析アシスタントです。以下は酒田五法の統計的シグナルに基づいて');
   lines.push('機械的に算出された売買プラン（買い候補・保有株）です。これは統計的シグナルの整理であり、');
-  lines.push('投資助言ではありません。断定的な売買指示ではなく、注目点・リスク要因を客観的に、');
-  lines.push('簡潔な日本語で整理してください。');
+  lines.push('投資助言ではありません。断定的な売買指示ではなく、注目点・リスク要因を客観的に整理してください。');
+  lines.push('');
+  lines.push('各銘柄には「既存メモ」として、注文種別やトレンド判定など機械的に算出された事実が');
+  lines.push('付いています。これらの事実は削らず活かしつつ、地合い・急落サイン・決算近接などの');
+  lines.push('文脈を添えて、1〜2文の簡潔な日本語コメントに書き換えてください。');
   lines.push('');
   lines.push('【市場全体の地合い】');
   lines.push(ctx.alertLine ? '急落サイン: ' + ctx.alertLine : '急落サイン: （データなし）');
@@ -93,14 +110,15 @@ function buildAiPrompt_(planRows, ctx) {
   lines.push('【対象銘柄】');
   planRows.forEach(r => {
     const earn = ctx.earningsByCode[String(r.code)];
-    lines.push('- ' + r.code + ' ' + r.name + '（区分:' + r.kind + '）シグナル:' + (r.signal || 'なし')
-      + (earn ? ' 決算:' + earn : '') + (r.note ? ' メモ:' + r.note : ''));
+    lines.push('- コード:' + r.code + ' 銘柄名:' + r.name + ' 区分:' + r.kind
+      + ' シグナル:' + (r.signal || 'なし') + ' 既存メモ:' + (r.note || 'なし')
+      + (earn ? ' 決算:' + earn : ''));
   });
   lines.push('');
   lines.push('【出力形式】');
-  lines.push('1行目: 全体サマリー（地合いと急落サインを踏まえて2〜3文）');
-  lines.push('2行目以降: 銘柄ごとに1行、「コード 銘柄名: コメント（1〜2文）」の形式で改行区切り');
-  lines.push('前置き・見出し記号（#等）・箇条書き記号は不要です。');
+  lines.push('コードをキー、書き換えたコメントを値とするJSONオブジェクトのみを返してください。');
+  lines.push('説明・前置き・コードブロック記号（```等）は一切不要です。');
+  lines.push('例: {"7203": "コメント本文", "6758": "コメント本文"}');
   return lines.join('\n');
 }
 
@@ -116,7 +134,7 @@ function callAiWithFallback_(apiKey, prompt) {
         contentType: 'application/json',
         payload: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
+          generationConfig: { temperature: 0.3, maxOutputTokens: 2048, responseMimeType: 'application/json' },
         }),
         muteHttpExceptions: true,
       });
@@ -144,28 +162,33 @@ function callAiWithFallback_(apiKey, prompt) {
   return null;
 }
 
-// 生成結果を「AI推奨（参考）」シートへ書く。1行目は必ず免責の但し書き。
-function writeAiSummarySheet_(text) {
-  const ss = SpreadsheetApp.getActive();
-  let sh = ss.getSheetByName(AI_SHEET_);
-  if (!sh) sh = ss.insertSheet(AI_SHEET_);
-  const oldFilter = sh.getFilter(); if (oldFilter) oldFilter.remove();
-  sh.clear();
+// Geminiの応答本文からJSON部分だけを取り出してパースする。前置き文やコードブロック記号が
+// 混じっても崩れないよう、正規表現で { ... } の最初の塊を抜き出してから parse する
+// （Abitus-Automation の extractRuleProposal_ と同じ方式）。
+function parseAiComments_(text) {
+  const m = String(text || '').match(/\{[\s\S]*\}/);
+  if (!m) { Logger.log('AI要約: 応答にJSONが見つかりません: ' + String(text).slice(0, 200)); return null; }
+  try {
+    const obj = JSON.parse(m[0]);
+    return (obj && typeof obj === 'object') ? obj : null;
+  } catch (e) {
+    Logger.log('AI要約: JSON解析に失敗 ' + e.message);
+    return null;
+  }
+}
 
+// コード→コメントのマップを「売買プラン」シートのメモ列（K列）へ書き戻す。
+// コメントが得られなかった行は既存メモを残す（書き換え失敗で情報が消えないように）。
+function writeAiCommentsIntoPlan_(sh, planRows, comments) {
+  let updated = 0;
+  planRows.forEach(r => {
+    const c = comments[r.code];
+    if (c == null || c === '') return;
+    sh.getRange(r.row, AI_MEMO_COL_).setValue(String(c));
+    updated++;
+  });
   const stamp = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm');
-  const CAVEAT = '⚠ AIによる参考コメントです（' + stamp + ' 生成）。投資判断の最終責任はご自身にあります。'
-    + '売買プランの統計的根拠そのものではなく、Geminiによる解釈・要約です。';
-  sh.getRange(1, 1).setValue(CAVEAT);
-
-  const bodyLines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
-  const rows = (bodyLines.length ? bodyLines : ['（本文が空でした）']).map(l => [l]);
-  sh.getRange(2, 1, rows.length, 1).setValues(rows);
-
-  sh.getRange(1, 1).setBackground('#fff4f4').setFontColor('#b00020').setFontWeight('bold')
-    .setHorizontalAlignment('left').setVerticalAlignment('middle').setWrap(true);
-  sh.setRowHeight(1, 44);
-  sh.getRange(2, 1, rows.length, 1).setWrap(true).setVerticalAlignment('top');
-  sh.setColumnWidth(1, 720);
-  sh.setFrozenRows(1);
-  sh.setTabColor('#8e6bd6');
+  sh.getRange(1, 13)
+    .setValue('メモ欄はAI参考コメント（' + stamp + ' 生成・' + updated + '件更新。投資助言ではありません）')
+    .setFontColor('#8e6bd6').setFontWeight('bold');
 }

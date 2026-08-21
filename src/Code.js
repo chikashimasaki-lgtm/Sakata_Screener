@@ -388,7 +388,7 @@ function removeDeprecatedMlSheets_() {
 function ensureSheetOrder_() {
   const ss = SpreadsheetApp.getActive();
   const order = [
-    SK.SHEETS.USAGE, SK.SHEETS.PLAN, AI_SHEET_, SK.SHEETS.SIGNALS,
+    SK.SHEETS.USAGE, SK.SHEETS.PLAN, SK.SHEETS.SIGNALS,
     MACRO.INPUT_SHEET, MACRO.CALENDAR_SHEET, SK.SHEETS.UNIVERSE, SK.SHEETS.STATS,
   ];
   let moved = 0;
@@ -1393,6 +1393,11 @@ function createUsageSheet() {
     ['   損切り価格自体は動かしませんが、押し安値割れを待たずに早期の手仕舞いも検討してください', 'p'],
     ['・メニュー「売買プランを作成/更新」で、走査をやり直さずにプランだけ引き直せます', 'p'],
     ['   （許容損失額を変えたときや、保有銘柄を入れ替えたとき）', 'p'],
+    ['・メニュー「AI推奨コメントを生成」で、メモ列をGeminiによる参考コメントに書き換えます。', 'p'],
+    ['   トレンド崩れ警告や注文根拠などの事実は消さず、地合い・決算近接などの文脈を足します。', 'p'],
+    ['   スクリプトプロパティ GEMINI_API_KEY が必要です。自動実行はしません（手動メニューのみ）。', 'p'],
+    ['※これは統計的な重み決定（SIGNAL_WEIGHT_）とは別物で、投資助言ではありません。', 'note'],
+    ['   Geminiに計算済みの結果を渡して解釈・要約させているだけです。最終判断はご自身で。', 'p'],
     ['', 'p'],
     ['■ 通知メール', 'h'],
     ['走査完了時に2通のメールを自動送信します（該当が無い日は送りません）。', 'p'],

@@ -209,11 +209,10 @@ function fetchYahooJpMarginRatios_(codes, errorsOut) {
     var reqs = slice.map(function (c) {
       return { url: 'https://finance.yahoo.co.jp/quote/' + c + '.T', headers: { 'User-Agent': 'Mozilla/5.0' }, muteHttpExceptions: true };
     });
-    var resps;
-    try { resps = UrlFetchApp.fetchAll(reqs); }
-    catch (e) {
-      Logger.log('信用倍率の取得に失敗（' + slice.length + '銘柄スキップ）: ' + e.message);
-      if (errorsOut) slice.forEach(function (c) { errorsOut[c] = 'HTTP取得失敗: ' + e.message; });
+    var resps = fetchAllWithRetry_(reqs);   // 429/5xx は一時的なことが多いので指数バックオフで再試行
+    if (!resps) {
+      Logger.log('信用倍率の取得に失敗（' + slice.length + '銘柄スキップ）');
+      if (errorsOut) slice.forEach(function (c) { errorsOut[c] = 'HTTP取得失敗（fetchAll失敗）'; });
       continue;
     }
     resps.forEach(function (res, j) {
@@ -453,16 +452,29 @@ function edinetExtractArray_(j) {
 // 決算発表カレンダーを edinetdb.jp /v1/calendar から取得（今日〜CALENDAR_LOOKAHEAD_DAYS日先）。
 // J-Quants equities/earnings-calendar と違い日付範囲の先読みができる（fetchTomorrowAnnouncementCodes_のコメント参照）。
 // キー未設定/取得失敗時は null（→呼び元でシートに未取込である旨を出す）。
+//
+// CacheServiceで日付キー・最大6h(21600s)キャッシュする。scheduledHeldCheckが毎時（立会時間中は
+// 最大6-7回/日）呼ぶ上、updateEarningsCalendar・scanSignalsからも同じ範囲を叩くため、無キャッシュだと
+// 1日9回前後 edinetdb.jp を叩いていた。この日付範囲は当日中ほぼ変わらないデータで、キャッシュなしの日に
+// 応答が数分単位まで遅延しscheduledHeldCheckがGASの6分上限でタイムアウトする実害が出た。
 function fetchEarningsCalendarRows_() {
   var key = PropertiesService.getScriptProperties().getProperty('EDINETDB_API_KEY');
   if (!key) { Logger.log('決算カレンダー: EDINETDB_API_KEY 未設定'); return null; }
   var today = new Date(), to = new Date(today.getTime() + MACRO.CALENDAR_LOOKAHEAD_DAYS * 86400000);
+  var cache = CacheService.getScriptCache();
+  var cacheKey = 'earningsCalendarRows_' + fmtDate_(today);
+  var cached = cache.get(cacheKey);
+  if (cached) { Logger.log('決算カレンダー: キャッシュから取得'); return JSON.parse(cached); }
   var rows;
   try {
     rows = edinetGet_('calendar', {
       from: fmtDate_(today), to: fmtDate_(to), market: 'prime', status: 'all', sort: 'date', order: 'asc',
     }, key);
   } catch (e) { Logger.log('決算カレンダーの取得に失敗: ' + e.message); return null; }
+  if (rows) {
+    try { cache.put(cacheKey, JSON.stringify(rows), 21600); }
+    catch (e) { Logger.log('決算カレンダー: キャッシュ保存に失敗（100KB超の可能性）: ' + e.message); }
+  }
   return rows;
 }
 

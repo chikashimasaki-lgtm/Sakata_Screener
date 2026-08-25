@@ -184,7 +184,11 @@ function writeAiCommentsIntoPlan_(sh, planRows, comments) {
   planRows.forEach(r => {
     const c = comments[r.code];
     if (c == null || c === '') return;
-    sh.getRange(r.row, AI_MEMO_COL_).setValue(String(c));
+    // Geminiの生成文はプロンプト経由で外部データ（決算カレンダー等）の影響を受けるため、
+    // 先頭が =+-@ だとGoogle Sheetsが数式として解釈してしまう（数式インジェクション）。
+    // sanitizeForSheetCell_ (SheetUtils.js) はAbitus-Automation/PdfAutoRename等で
+    // 同種のAI生成テキスト・外部由来テキストの書き込み前に使っているのと同じ対策。
+    sh.getRange(r.row, AI_MEMO_COL_).setValue(sanitizeForSheetCell_(String(c)));
     updated++;
   });
   const stamp = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm');

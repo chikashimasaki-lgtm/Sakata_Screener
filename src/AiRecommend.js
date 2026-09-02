@@ -122,6 +122,15 @@ function buildAiPrompt_(planRows, ctx) {
   return lines.join('\n');
 }
 
+// このURLには ?key=<GEMINI_API_KEY> がそのまま入っている。GASのUrlFetchApp.fetchは
+// DNS解決失敗・接続断などの通信例外時に失敗したURLを例外メッセージへそのまま含める
+// ことがあるため、e.messageをログへ渡す前に必ずこれでAPIキー部分を伏字化する
+// （PdfAutoRename の redactApiKey_ と同じパターン）。
+function redactApiKey_(text, apiKey) {
+  const s = String(text == null ? '' : text);
+  return apiKey ? s.split(apiKey).join('***') : s;
+}
+
 // Geminiを呼ぶ。混雑エラー（429/503等）は次のモデルへフォールバックする
 // （Abitus-Automation の callProofreadGemini_ と同じ考え方）。
 function callAiWithFallback_(apiKey, prompt) {
@@ -156,7 +165,7 @@ function callAiWithFallback_(apiKey, prompt) {
         && candidate.content.parts[0].text;
       if (text) return text;
     } catch (e) {
-      Logger.log('AI要約: ' + model + ' 呼び出しに失敗 ' + e.message);
+      Logger.log('AI要約: ' + model + ' 呼び出しに失敗 ' + redactApiKey_(e.message, apiKey));
     }
   }
   return null;

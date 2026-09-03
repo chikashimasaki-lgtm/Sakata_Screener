@@ -1,0 +1,37 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 共有モジュール（gas-shared）を取得
+        uses: actions/checkout@v4
+        with:
+          repository: chikashimasaki-lgtm/gas-shared
+          path: .gas-shared
+      - name: src/ の共有モジュール symlink を実体化
+        run: |
+          for l in src/*.js; do
+            [ -L "$l" ] || continue
+            name=$(basename "$l")
+            if [ -f ".gas-shared/modules/$name" ]; then
+              rm "$l"
+              cp ".gas-shared/modules/$name" "src/$name"
+              echo "materialized: $name"
+            fi
+          done
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: テスト（node tests/verify.js）
+        run: node tests/verify.js

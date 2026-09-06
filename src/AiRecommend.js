@@ -22,7 +22,7 @@
  * 毎回のシグナル走査に乗せないため。「パターン成績を集計」と同じ扱い）。
  */
 
-const AI_MODELS_ = ['gemini-3.5-flash', 'gemini-2.5-flash'];
+const AI_MODELS_ = ['gemini-3.8-flash', 'gemini-2.5-flash'];
 const AI_MEMO_COL_ = 11;   // 「売買プラン」シートのメモ列（PLAN_HEADERS_ の11番目）
 
 // メニューから呼ぶ入口。「売買プラン」シートを読み、Geminiでコメントを生成してメモ欄へ書く。

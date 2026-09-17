@@ -776,7 +776,7 @@ function getSbiHeldCodes_() {
     }
     Logger.log('保有取得: シート「' + name + '」' + data.length + '行 / ヘッダ'
       + (ci >= 0 ? '発見(行' + hi + ' 列' + ci + ')' : '見つからず（保険で全セル走査）')
-      + ' / 先頭行の列数: ' + (data[0] || []).length);
+      + ' / 先頭行サンプル: ' + JSON.stringify((data[0] || []).slice(0, 6)));
     if (ci < 0) {   // ヘッダが見つからなければ全セルから4桁コードを拾う保険
       let hit = 0;
       data.forEach(row => row.forEach(v => {

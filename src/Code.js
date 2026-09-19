@@ -87,6 +87,10 @@ const BT_MIN_SAMPLE  = 20;   // 実績を重みに採用する最低件数（未
 
 // ---- メニュー ----
 function onOpen() {
+  // 使い方シートは一番右に置く（全プロジェクト共通方針、2026-09-19）。
+  // 既存のスプレッドシートを開いたときに追従させるためのもの。既に末尾なら何もしない。
+  try { UsageSheet.moveToLast(SpreadsheetApp.getActiveSpreadsheet()); } catch (e) {}
+
   SpreadsheetApp.getUi().createMenu('酒田五法')
     .addItem('セットアップ', 'setup')
     .addSeparator()

@@ -19,6 +19,7 @@ jobs:
         with:
           repository: chikashimasaki-lgtm/gas-shared
           path: .gas-shared
+          token: ${{ secrets.GAS_SHARED_PAT }}
       - name: src/ の共有モジュール symlink を実体化
         run: |
           for l in src/*.js; do

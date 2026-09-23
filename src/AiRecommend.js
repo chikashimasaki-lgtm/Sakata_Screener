@@ -22,7 +22,6 @@
  * 毎回のシグナル走査に乗せないため。「パターン成績を集計」と同じ扱い）。
  */
 
-const AI_MODELS_ = ['gemini-3.8-flash', 'gemini-2.5-flash'];
 const AI_MEMO_COL_ = 11;   // 「売買プラン」シートのメモ列（PLAN_HEADERS_ の11番目）
 
 // メニューから呼ぶ入口。「売買プラン」シートを読み、Geminiでコメントを生成してメモ欄へ書く。
@@ -124,44 +123,34 @@ function buildAiPrompt_(planRows, ctx) {
 
 // redactApiKey_ は共通モジュール RedactUtil.js（~/projects/RedactUtil.js のsymlink）に定義
 
-// Geminiを呼ぶ。混雑エラー（429/503等）は次のモデルへフォールバックする
-// （Abitus-Automation の callProofreadGemini_ と同じ考え方）。
+// Geminiを呼ぶ。モデルフォールバック・429/503判別・リトライは共通モジュール GeminiCall.js
+// （ADR-003）に統一済み。ここでの固有ロジックは「STOP以外（MAX_TOKENS・SAFETY等で
+// 尻切れ）の応答は採用しない」判定だけ（自動トリガーには繋げず手動実行のみの機能のため、
+// 失敗時はnullを返してUIにトースト表示する——例外は投げない）。
 function callAiWithFallback_(apiKey, prompt) {
-  for (let i = 0; i < AI_MODELS_.length; i++) {
-    const model = AI_MODELS_[i];
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey;
-    try {
-      const res = UrlFetchApp.fetch(url, {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 2048, responseMimeType: 'application/json' },
-        }),
-        muteHttpExceptions: true,
-      });
-      const json = JSON.parse(res.getContentText());
-      if (json.error) {
-        const msg = String(json.error.message || '');
-        const busy = json.error.code === 429 || json.error.code === 503 || /quota|overloaded|high demand/i.test(msg);
-        Logger.log('AI要約: ' + model + ' エラー ' + msg);
-        if (busy && i < AI_MODELS_.length - 1) continue;   // 混雑なら次のモデルへ切替え
-        return null;
-      }
-      const candidate = json.candidates && json.candidates[0];
-      // STOP以外は出力が途中で打ち切られている（MAX_TOKENS・SAFETY等）。尻切れの文章は採用しない。
-      if (candidate && candidate.finishReason && candidate.finishReason !== 'STOP') {
-        Logger.log('AI要約: 出力が不完全です (finishReason=' + candidate.finishReason + ')');
-        return null;
-      }
-      const text = candidate && candidate.content && candidate.content.parts && candidate.content.parts[0]
-        && candidate.content.parts[0].text;
-      if (text) return text;
-    } catch (e) {
-      Logger.log('AI要約: ' + model + ' 呼び出しに失敗 ' + redactApiKey_(e.message, apiKey));
-    }
+  let result;
+  try {
+    result = GeminiCall.call({
+      apiKey, models: GeminiCall.STANDARD_MODELS,
+      payload: {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.3, maxOutputTokens: 2048, responseMimeType: 'application/json' },
+      },
+    });
+  } catch (e) {
+    Logger.log('AI要約: 呼び出しに失敗 ' + redactApiKey_(e.message, apiKey));
+    return null;
   }
-  return null;
+
+  try { TokenLog.log(SpreadsheetApp.getActive(), 'AI推奨コメント', result); }
+  catch (e) { Logger.log('トークンログ記録失敗: ' + e.message); }
+
+  const finishReason = result.raw.candidates?.[0]?.finishReason;
+  if (finishReason && finishReason !== 'STOP') {
+    Logger.log('AI要約: 出力が不完全です (finishReason=' + finishReason + ')');
+    return null;
+  }
+  return result.text;
 }
 
 // Geminiの応答本文からJSON部分だけを取り出してパースする。前置き文やコードブロック記号が

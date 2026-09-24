@@ -238,6 +238,10 @@ function scanSignals() {
     const oldFilter = sig.getFilter(); if (oldFilter) oldFilter.remove();
     sig.clear();
     sig.getRange(1, 1, 1, 11).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '信用倍率', '決算発表']]);
+    // コード列は最初からテキスト書式にする。既定(自動)のままだと "5602" を数値と解釈して
+    // 5,602 と桁区切りで表示され、コードに見えなくなる。新形式の英数字コード(130A)と
+    // 表示がちぐはぐになるうえ、先頭0のコードも0が落ちる。
+    sig.getRange(2, 4, sig.getMaxRows() - 1, 1).setNumberFormat('@');
     failed = 0;
   }
 
@@ -577,9 +581,11 @@ function finalizeSignalsCosmetic_(sig, n) {
   // コード(4列目)を TradingView 日足チャートへのハイパーリンクに。
   // 個人のチャートレイアウトIDはスクリプトプロパティ TRADINGVIEW_LAYOUT_ID で差し替えられる。
   // 未設定ならレイアウト指定なしの汎用チャートを開く（tvChartUrl_）。
-  sig.getRange(2, 4, n, 1).setFormulas(data.map(row => {
+  // ラベルは TO_TEXT() で包む。"5602" のような数字だけの文字列リテラルは
+  // 数値に解釈され、セルの書式しだいで 5,602 と桁区切り表示になってしまう。
+  sig.getRange(2, 4, n, 1).setNumberFormat('@').setFormulas(data.map(row => {
     const code = to4_(String(row[3] || '').trim()).toUpperCase();
-    return [code ? `=HYPERLINK("${tvChartUrl_(code)}","${code}")` : ''];
+    return [code ? `=HYPERLINK("${tvChartUrl_(code)}",TO_TEXT("${code}"))` : ''];
   }));
 
   // 全体スタイル: 濃紺ヘッダ＋淡色の行帯＋ヘッダ固定
@@ -2175,8 +2181,9 @@ function writePlanSheet_(targets) {
 
   const n = rows.length;
   sh.getRange(2, 1, n, PLAN_HEADERS_.length).setValues(rows);
-  sh.getRange(2, 2, n, 1).setFormulas(targets.map(t =>
-    [t.code ? `=HYPERLINK("${tvChartUrl_(t.code)}","${t.code}")` : '']));
+  // コード列は「シグナル」シートと同じ理由でテキスト書式＋TO_TEXT()（5,602 表示を防ぐ）
+  sh.getRange(2, 2, n, 1).setNumberFormat('@').setFormulas(targets.map(t =>
+    [t.code ? `=HYPERLINK("${tvChartUrl_(t.code)}",TO_TEXT("${t.code}"))` : '']));
 
   styleSheet_(sh, PLAN_HEADERS_.length, '#14331f', '#eaf6ee');
   autoFit_(sh, 5);

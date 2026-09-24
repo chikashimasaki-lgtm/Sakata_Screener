@@ -998,6 +998,9 @@ function writeEarningsCalendarSheet_(entries, nameMap, note) {
   ]);
   const grid = [header].concat(rows.length ? rows : [[note || '対象銘柄の決算発表予定は見つかりませんでした', '', '', '', '']]);
   const width = header.length;
+  // コード列は値を入れる前にテキスト書式にする（「シグナル」「銘柄」シートと揃える）。
+  // 後から書式を変えても、既に数値化された 7203 は型が戻らない。
+  sh.getRange(2, 1, sh.getMaxRows() - 1, 1).setNumberFormat('@');
   sh.getRange(1, 1, grid.length, width).setValues(grid);
   // 時価総額は3桁カンマ区切りで表示する（Asset_Status等、他プロジェクトの金額列と同じ表記）
   if (rows.length) sh.getRange(2, width, rows.length, 1).setNumberFormat('#,##0');

@@ -386,8 +386,7 @@ function clearResumeTriggers_() {
 // 廃止した「ML学習データ」「ML重み(参考)」「AI推奨（参考）」シートの後片付け（一度だけ実行すればよい）。
 // 削除・設計変更した機能（trainMlWeights・別シート方式のAI推奨コメント等）がもう存在しないため、
 // 稼働中のスプレッドシートにタブとしてだけ残ってしまったものを消す。存在しなければ何もしない安全設計。
-// ※ 関数名を末尾「_」にしないこと。GAS は末尾「_」を private 扱いにし、
-//    メニュー(addItem)から呼ぶと「Script function not found」で失敗する。
+// メニューの入口なので末尾「_」を付けない（「_」は内部ヘルパの目印として使い分ける）。
 function removeDeprecatedSheets() {
   const ss = SpreadsheetApp.getActive();
   const names = ['ML学習データ', 'ML重み(参考)', 'AI推奨（参考）'];
@@ -403,7 +402,7 @@ function removeDeprecatedSheets() {
 
 // タブの並びを人が実際に見る優先順に揃える。存在しないシートは無視するので、
 // 何度実行しても安全（実行するまでは何も変わらない）。
-// ※ 関数名を末尾「_」にしないこと（private 扱いでメニューから呼べない）。
+// メニューの入口なので末尾「_」を付けない（「_」は内部ヘルパの目印として使い分ける）。
 // 「使い方」は一番右（全プロジェクト共通方針、2026-09-19）。onOpen の
 // UsageSheet.moveToLast() と並びが食い違うと、開くたびに位置が入れ替わって見える。
 function ensureSheetOrder() {

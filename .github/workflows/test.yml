@@ -36,5 +36,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - name: 個人情報・パスワードの混入検査
+        run: .gas-shared/tools/scan-secrets.sh --all
       - name: テスト（node tests/verify.js）
         run: node tests/verify.js

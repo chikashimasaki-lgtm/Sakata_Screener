@@ -18,7 +18,19 @@ const sandbox = {
   PropertiesService: {
     getScriptProperties: () => ({ getProperty: () => null, setProperty: () => {}, deleteProperty: () => {} }),
   },
-  SpreadsheetApp: { getActive: () => { throw new Error('シートは使わない'); } },
+  SpreadsheetApp: {
+    getActive: () => { throw new Error('シートは使わない'); },
+    // RichTextValue のビルダーだけは実物の形を真似る（コード列のリンク生成を検証するため）
+    newRichTextValue: () => {
+      const v = { text: '', link: null };
+      const b = {
+        setText(s) { v.text = String(s); return b; },
+        setLinkUrl(u) { v.link = u; return b; },
+        build() { return v; },
+      };
+      return b;
+    },
+  },
   UrlFetchApp: { fetch: () => { throw new Error('通信は使わない'); } },
   Utilities: { formatDate: (d) => d.toISOString().slice(0, 10), sleep: () => {} },
   ScriptApp: { getProjectTriggers: () => [], newTrigger: () => {}, deleteTrigger: () => {} },
@@ -45,7 +57,7 @@ const EXPORTS = [
   'pickForeignFlow_', 'extractProfit_',
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'isTopBuyRow_', 'planTargets_', 'signalText_', 'toNum_',
-  'planMailLine_', 'SAKATA_PROFIT_LABEL_',
+  'planMailLine_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
   // SIGNAL_WEIGHT_ 算出の統計コア（MLWeights.js）。tools/calc_weights.js から呼ばれる純粋関数。
   'ML',
   'benchmarkReturn_', 'extractMlRow_', 'buildDateCloseMap_', 'barDateKey_',
@@ -946,6 +958,23 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     eq(M.SIGNAL_WEIGHT_['MACDデッドクロス'], 1, 'MACDデッドクロスは基準を9.0pt下回るため1');
     eq(M.SIGNAL_WEIGHT_['切り込み線'], 3, '切り込み線は基準を9.7pt上回るため3');
   }
+}
+
+console.log('\n【29】コード列はテキスト型（リンク付き文字列）');
+{
+  // =HYPERLINK() だとセルの中身が数式になり "5602" が数値評価されて 5,602 と表示される。
+  // RichTextValue なら値そのものが文字列のまま。
+  const a = M.codeLinkRichText_('5602');
+  eq(a.text, '5602', '値は文字列（数値に評価されない）');
+  eq(typeof a.text, 'string', '型も文字列');
+  eq(a.link, M.tvChartUrl_('5602'), 'TradingViewへのリンクが張られる');
+  // 新形式の英数字コードも同じ扱い（数値化されないので表示が揃う）
+  eq(M.codeLinkRichText_('130A').text, '130A', '英数字コードもそのまま');
+  // 空コードでリンクを張ると、シート上で行き先の無いリンクが残る
+  const e = M.codeLinkRichText_('');
+  eq(e.text, '', '空コードは空文字');
+  eq(e.link, null, '空コードにはリンクを張らない');
+  eq(M.codeLinkRichText_(null).text, '', 'null も空文字（"null" と書かない）');
 }
 
 console.log('\n' + '─'.repeat(62));

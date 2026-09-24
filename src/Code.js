@@ -132,6 +132,8 @@ function setup() {
   if (!uni) {
     uni = ss.insertSheet(SK.SHEETS.UNIVERSE);
     uni.getRange(1, 1, 1, 2).setValues([['コード', '銘柄名']]);
+    // コード列はテキスト型で持つ（数値に落ちると 7,203 表示・先頭0落ち・130A と型が不揃いになる）
+    uni.getRange(2, 1, uni.getMaxRows() - 1, 1).setNumberFormat('@');
     uni.getRange(2, 1, 5, 2).setValues([
       ['7203', 'トヨタ自動車'], ['6758', 'ソニーグループ'], ['9984', 'ソフトバンクグループ'],
       ['8306', '三菱UFJ'], ['6501', '日立製作所'],
@@ -183,6 +185,9 @@ function fetchPrimeUniverse() {
   const uni = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.UNIVERSE);
   uni.clear();
   uni.getRange(1, 1, 1, 2).setValues([['コード', '銘柄名']]);
+  // 値を入れる前にテキスト書式にする。後からだと "7203" は既に数値7203になっていて
+  // 書式を変えても型は戻らない（表示が 7203 に見えても中身は数値のまま）。
+  uni.getRange(2, 1, uni.getMaxRows() - 1, 1).setNumberFormat('@');
   if (collect.length) uni.getRange(2, 1, collect.length, 2).setValues(collect);
   styleSheet_(uni, 2, '#1a1e3a', '#eef3fc');   // 銘柄シートも配色
   if (uni.getLastRow() > 1) uni.getRange(2, 1, uni.getLastRow() - 1, 1).setHorizontalAlignment('right');  // コード右寄せ
@@ -578,14 +583,18 @@ function finalizeSignalsCosmetic_(sig, n) {
   sig.setColumnWidth(11, 110);
   sig.getRange(2, 11, n, 1).setHorizontalAlignment('center').setVerticalAlignment('middle');
 
-  // コード(4列目)を TradingView 日足チャートへのハイパーリンクに。
+  // コード(4列目)を TradingView 日足チャートへのリンク付きテキストにする。
   // 個人のチャートレイアウトIDはスクリプトプロパティ TRADINGVIEW_LAYOUT_ID で差し替えられる。
   // 未設定ならレイアウト指定なしの汎用チャートを開く（tvChartUrl_）。
-  // ラベルは TO_TEXT() で包む。"5602" のような数字だけの文字列リテラルは
-  // 数値に解釈され、セルの書式しだいで 5,602 と桁区切り表示になってしまう。
-  sig.getRange(2, 4, n, 1).setNumberFormat('@').setFormulas(data.map(row => {
+  //
+  // =HYPERLINK() ではなく RichTextValue のリンクを使う。HYPERLINK だとセルの中身は
+  // 「数式」であって文字列ではなく、"5602" が数値として評価されるため書式しだいで
+  // 5,602 と桁区切り表示になる（実際そうなっていた）。RichTextValue なら
+  // セルの値そのものが文字列 "5602" になり、getValues()・コピー・XLOOKUP のいずれでも
+  // テキストとして扱える。リンクは見た目どおりクリックできる。
+  sig.getRange(2, 4, n, 1).setNumberFormat('@').setRichTextValues(data.map(row => {
     const code = to4_(String(row[3] || '').trim()).toUpperCase();
-    return [code ? `=HYPERLINK("${tvChartUrl_(code)}",TO_TEXT("${code}"))` : ''];
+    return [codeLinkRichText_(code)];
   }));
 
   // 全体スタイル: 濃紺ヘッダ＋淡色の行帯＋ヘッダ固定
@@ -620,9 +629,8 @@ function finalizeSignalsCosmetic_(sig, n) {
 // （行フィルタ→件名/本文生成→送信→ログ→アーカイブ）をまとめたヘルパー。
 // finalizeSignals_ が完了した直後に呼ぶ。該当が無い日は送らない
 // （Asset_Status_Notifyのstockドロップ通知と同じ「該当がある時だけ送る」方針）。
-// コード(4列目)は finalizeSignals_ が TradingView への HYPERLINK 数式に置き換え済みだが、
-// getValues() は数式ではなく表示値（HYPERLINKの第2引数＝コード文字列）を返すため、
-// ここでは素のコード文字列として読める。
+// コード(4列目)は finalizeSignalsCosmetic_ が TradingView へのリンク付きテキストにするが、
+// セルの値は文字列型のままなので（RichTextValue、数式ではない）ここでは素のコード文字列として読める。
 function sendSignalEmail_(sig, opts) {
   try {
     if (sig.getLastRow() < 2) return;
@@ -2047,6 +2055,20 @@ function isTopBuyRow_(r) {
   return r[1] === '★★★' && String(r[6]).indexOf('買い') !== -1;
 }
 
+/**
+ * コードを「TradingViewへのリンクが張られた文字列セル」にする RichTextValue を作る。
+ *
+ * セルの値は文字列型のまま（=HYPERLINK の数式にしない）。数式にすると "5602" が
+ * 数値として評価され、桁区切りで 5,602 と表示されたり、先頭0が落ちたりする。
+ * 空コードは空文字（リンクなし）を返す。
+ */
+function codeLinkRichText_(code) {
+  const s = String(code || '');
+  const b = SpreadsheetApp.newRichTextValue().setText(s);
+  if (s) b.setLinkUrl(tvChartUrl_(s));
+  return b.build();
+}
+
 // TradingView 日足チャートのURL。個人のレイアウトIDはスクリプトプロパティで差し替え可。
 function tvChartUrl_(code) {
   const TV = PropertiesService.getScriptProperties().getProperty('TRADINGVIEW_LAYOUT_ID') || '';
@@ -2181,9 +2203,9 @@ function writePlanSheet_(targets) {
 
   const n = rows.length;
   sh.getRange(2, 1, n, PLAN_HEADERS_.length).setValues(rows);
-  // コード列は「シグナル」シートと同じ理由でテキスト書式＋TO_TEXT()（5,602 表示を防ぐ）
-  sh.getRange(2, 2, n, 1).setNumberFormat('@').setFormulas(targets.map(t =>
-    [t.code ? `=HYPERLINK("${tvChartUrl_(t.code)}",TO_TEXT("${t.code}"))` : '']));
+  // コード列は「シグナル」シートと同じくリンク付きテキスト（値は文字列型のまま）
+  sh.getRange(2, 2, n, 1).setNumberFormat('@')
+    .setRichTextValues(targets.map(t => [codeLinkRichText_(t.code)]));
 
   styleSheet_(sh, PLAN_HEADERS_.length, '#14331f', '#eaf6ee');
   autoFit_(sh, 5);

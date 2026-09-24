@@ -19,7 +19,9 @@ jobs:
         with:
           repository: chikashimasaki-lgtm/gas-shared
           path: .gas-shared
-          token: ${{ secrets.GAS_SHARED_PAT }}
+          # gas-shared は private。読み取り専用のデプロイキー（gas-shared 1個に限定）で clone する。
+          # PAT はアカウント全体に効いてしまうため使わない。
+          ssh-key: ${{ secrets.GAS_SHARED_KEY }}
       - name: src/ の共有モジュール symlink を実体化
         run: |
           for l in src/*.js; do

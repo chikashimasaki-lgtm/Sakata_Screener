@@ -12,7 +12,7 @@
 //               明けの明星 / 宵の明星 / 捨て子線
 //
 //  使い方:
-//   1) メニュー「酒田五法」→ セットアップ
+//   1) メニュー「酒田五法」→ 設定とメンテナンス → セットアップ
 //   2) 「銘柄」シートにコード(4桁)を入れる（または「プライム銘柄を取得」でJ-Quantsから取得）
 //   3) 「シグナル走査」を実行 → 「シグナル」シートに結果
 // ============================================================================
@@ -96,23 +96,30 @@ function onOpen() {
   // 既存のスプレッドシートを開いたときに追従させるためのもの。既に末尾なら何もしない。
   try { UsageSheet.moveToLast(SpreadsheetApp.getActiveSpreadsheet()); } catch (e) {}
 
-  SpreadsheetApp.getUi().createMenu('酒田五法')
-    .addItem('セットアップ', 'setup')
-    .addSeparator()
-    .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
+  const ui = SpreadsheetApp.getUi();
+
+  // 日常的に押すのは上の2つだけ。残りは「たまに個別に更新したいもの」と
+  // 「初回設定・後片付け」なので、サブメニューへ畳んで最初の画面を短く保つ。
+  // 平日18時の走査トリガーが回っている限り、上の2つも押す必要はない。
+  ui.createMenu('酒田五法')
     .addItem('シグナル走査/続行（売買プランも更新）', 'scanSignals')
     .addItem('売買プランを作成/更新（★3買い＋保有株）', 'buildPlans')
-    .addItem('AI推奨コメントを生成（参考・投資助言ではありません）', 'generateAiSummary_')
-    .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights')
-    .addItem('相場マクロ/急落サインを更新', 'updateMarketMacro')
-    .addItem('決算カレンダーを更新',        'updateEarningsCalendar')
-    .addItem('決算発表列だけ更新（シグナル）', 'refreshSignalEarningsColumn')
-    .addItem('自動実行を設定（走査:平日18時/保有確認:毎時）', 'installDailyScanTrigger')
     .addSeparator()
-    .addItem('使い方シートを作成/更新',      'createUsageSheet')
-    .addItem('走査の進捗リセット',           'resetScanQueue')
-    .addItem('シート順序を整える',           'ensureSheetOrder_')
-    .addItem('廃止シートを削除（一度だけ）', 'removeDeprecatedSheets_')
+    .addSubMenu(ui.createMenu('個別に更新')
+      .addItem('相場マクロ/急落サインを更新',   'updateMarketMacro')
+      .addItem('決算カレンダーを更新',          'updateEarningsCalendar')
+      .addItem('決算発表列だけ更新（シグナル）', 'refreshSignalEarningsColumn')
+      .addItem('AI推奨コメントを生成（参考・投資助言ではありません）', 'generateAiSummary')
+      .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights'))
+    .addSubMenu(ui.createMenu('設定とメンテナンス')
+      .addItem('セットアップ',                  'setup')
+      .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
+      .addItem('自動実行を設定（走査:平日18時/保有確認:毎時）', 'installDailyScanTrigger')
+      .addSeparator()
+      .addItem('使い方シートを作成/更新', 'createUsageSheet')
+      .addItem('シート順序を整える',      'ensureSheetOrder')
+      .addItem('走査の進捗リセット',      'resetScanQueue')
+      .addItem('廃止シートを削除（一度だけ）', 'removeDeprecatedSheets'))
     .addToUi();
 }
 
@@ -379,7 +386,9 @@ function clearResumeTriggers_() {
 // 廃止した「ML学習データ」「ML重み(参考)」「AI推奨（参考）」シートの後片付け（一度だけ実行すればよい）。
 // 削除・設計変更した機能（trainMlWeights・別シート方式のAI推奨コメント等）がもう存在しないため、
 // 稼働中のスプレッドシートにタブとしてだけ残ってしまったものを消す。存在しなければ何もしない安全設計。
-function removeDeprecatedSheets_() {
+// ※ 関数名を末尾「_」にしないこと。GAS は末尾「_」を private 扱いにし、
+//    メニュー(addItem)から呼ぶと「Script function not found」で失敗する。
+function removeDeprecatedSheets() {
   const ss = SpreadsheetApp.getActive();
   const names = ['ML学習データ', 'ML重み(参考)', 'AI推奨（参考）'];
   const removed = [];
@@ -394,11 +403,15 @@ function removeDeprecatedSheets_() {
 
 // タブの並びを人が実際に見る優先順に揃える。存在しないシートは無視するので、
 // 何度実行しても安全（実行するまでは何も変わらない）。
-function ensureSheetOrder_() {
+// ※ 関数名を末尾「_」にしないこと（private 扱いでメニューから呼べない）。
+// 「使い方」は一番右（全プロジェクト共通方針、2026-09-19）。onOpen の
+// UsageSheet.moveToLast() と並びが食い違うと、開くたびに位置が入れ替わって見える。
+function ensureSheetOrder() {
   const ss = SpreadsheetApp.getActive();
   const order = [
-    SK.SHEETS.USAGE, SK.SHEETS.PLAN, SK.SHEETS.SIGNALS,
+    SK.SHEETS.PLAN, SK.SHEETS.SIGNALS,
     MACRO.INPUT_SHEET, MACRO.CALENDAR_SHEET, SK.SHEETS.UNIVERSE, SK.SHEETS.STATS,
+    SK.SHEETS.USAGE,
   ];
   let moved = 0;
   order.forEach((name, i) => {
@@ -1458,8 +1471,17 @@ function createUsageSheet() {
     ['   目安は月次〜四半期に1回（基準線が相場付きで変わり得るため）。自動実行はしません。', 'p'],
     ['※これは「過去6ヶ月のこの相場で」の話です。相場付きが変われば結果も変わります。', 'note'],
     ['', 'p'],
+    ['■ メニューの構成', 'h'],
+    ['メニュー「酒田五法」の一番上は、日常的に押す2つだけにしてあります。', 'p'],
+    ['・シグナル走査/続行 … 全銘柄を走査して「シグナル」「売買プラン」を作り直します', 'p'],
+    ['・売買プランを作成/更新 … 走査はやり直さず、プランだけ引き直します', 'p'],
+    ['残りは2つのサブメニューに畳んであります。', 'p'],
+    ['・「個別に更新」… 相場マクロ／決算カレンダー／決算発表列／AI推奨／パターン成績', 'p'],
+    ['・「設定とメンテナンス」… セットアップ／銘柄取得／自動実行の設定／使い方シート／後片付け', 'p'],
+    ['※平日18時の走査トリガーが動いていれば、上の2つも普段は押す必要がありません。', 'note'],
+    ['', 'p'],
     ['■ 自動実行（トリガー）', 'h'],
-    ['メニュー「自動実行を設定」で以下の3つを設定します。', 'p'],
+    ['メニュー「設定とメンテナンス」→「自動実行を設定」で以下の3つを設定します。', 'p'],
     ['① 相場マクロ更新 … 毎日17時、地合いと急落サインを更新（走査の前に走らせる）', 'p'],
     ['② 全銘柄走査 … 平日18時に1回、全銘柄の株価を取得して酒田五法シグナルを走査（重い処理）', 'p'],
     ['③ 購入ポートフォリオ確認 … 毎時、SBI保有銘柄をシグナルシート上で最新のハイライトに更新（株価取得はしない）', 'p'],

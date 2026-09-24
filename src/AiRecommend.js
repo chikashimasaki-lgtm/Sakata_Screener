@@ -25,7 +25,9 @@
 const AI_MEMO_COL_ = 11;   // 「売買プラン」シートのメモ列（PLAN_HEADERS_ の11番目）
 
 // メニューから呼ぶ入口。「売買プラン」シートを読み、Geminiでコメントを生成してメモ欄へ書く。
-function generateAiSummary_() {
+// ※ 関数名を末尾「_」にしないこと。GAS は末尾「_」を private 扱いにし、
+//    メニュー(addItem)から呼ぶと「Script function not found」で失敗する。
+function generateAiSummary() {
   const ss = SpreadsheetApp.getActive();
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) throw new Error('GEMINI_API_KEY がスクリプトプロパティに未設定です');

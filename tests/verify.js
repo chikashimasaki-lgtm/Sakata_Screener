@@ -39,6 +39,7 @@ const EXPORTS = [
   'parseYahooBars_', 'avgBody_', 'atr_', 'medianTurnover_', 'isLiquidEnough_',
   'signalStrength_', 'parseSignalNames_', 'suggestWeight_', 'patternPoints_',
   'marginRegime_', 'regimeFactor_', 'nsRatioTrend_', 'vixMacdSignal_', 'checkMarketConditions_',
+  'marginRatioTrend_', 'shiftMarginRatioHistory_', 'marginRatioLabel_', 'parseYahooJpMarginDate_',
   'parseTseMarginGrid_', 'parseNikkeiEpsHtml_', 'selloffFrequency_', 'macroValueLabel_',
   'filterCalendarToUniverse_', 'calendarStatusLabel_', 'edinetExtractArray_', 'calendarMapFromEntries_',
   'pickForeignFlow_', 'extractProfit_',
@@ -331,22 +332,74 @@ console.log('\n【6】スコアと★（絶対しきい値）');
 
 console.log('\n【7】地合い判定と係数');
 {
-  const T = M.SK.MARGIN.SELL_THRESHOLD_OKU, P = M.SK.MARGIN.RATIO_PIVOT;
-  eq(M.marginRegime_(T, P - 0.01), 'SHORT_COVER', '売残潤沢＋倍率低 → ショートカバー好機');
-  eq(M.marginRegime_(T - 1, P), 'SUPPLY_RISK', '売残枯渇＋倍率高 → 需給悪化');
-  eq(M.marginRegime_(T, P), 'NEUTRAL', '境界の組み合わせは中立');
-  eq(M.marginRegime_('', 1.2), 'NEUTRAL', '売残が未入力なら中立（Number("")=0 を「売残枯渇」と読まない）');
-  eq(M.marginRegime_(9000, ''), 'NEUTRAL', '倍率が未入力でも中立（逆向きの誤判定も防ぐ）');
+  const T = M.SK.MARGIN.SELL_THRESHOLD_OKU;
+  eq(M.marginRegime_(T, 'DOWN'), 'SHORT_COVER', '売残潤沢＋倍率低下 → ショートカバー好機');
+  eq(M.marginRegime_(T - 1, 'UP'), 'SUPPLY_RISK', '売残枯渇＋倍率上昇 → 需給悪化');
+  eq(M.marginRegime_(T, 'UP'), 'NEUTRAL', '境界の組み合わせは中立');
+  eq(M.marginRegime_('', 'UP'), 'NEUTRAL', '売残が未入力なら中立（Number("")=0 を「売残枯渇」と読まない）');
+  eq(M.marginRegime_(9000, ''), 'NEUTRAL', '倍率トレンドが未判定でも中立（逆向きの誤判定も防ぐ）');
   eq(M.marginRegime_(null, null), 'NEUTRAL', '未取得も中立');
-  eq(M.marginRegime_('9000', '0.8'), 'SHORT_COVER', '数字の文字列は数値として扱う（シート入力はしばしば文字列）');
+  eq(M.marginRegime_('9000', 'DOWN'), 'SHORT_COVER', '数字の文字列は数値として扱う（シート入力はしばしば文字列）');
+  // 倍率が横ばいなら、売残の水準だけでは地合いを決めない。
+  // 旧仕様（水準判定）は 1570 の倍率が 10 倍前後で 1.0 を恒久的に上回るため、
+  // 売残が 8,000 億を割っている限り SUPPLY_RISK に張り付き、買いが永久に減点されていた。
+  eq(M.marginRegime_(T - 1, 'FLAT'), 'NEUTRAL', '倍率が横ばいなら売残が枯渇していても中立');
+  eq(M.marginRegime_(T + 1, 'FLAT'), 'NEUTRAL', '同上（買い側も同じ扱い）');
+  eq(M.marginRegime_(6814, 'FLAT'), 'NEUTRAL',
+    '実データ回帰: 売残6814億・倍率10.24倍でも、倍率が動かなければ SUPPLY_RISK に固定されない');
+}
+{
+  const W = M.SK.MARGIN.RATIO_TREND_BAND;
+  eq(M.marginRatioTrend_(10.24, 9.5), 'UP', '倍率が前回より上がれば UP（買い方過多が進行）');
+  eq(M.marginRatioTrend_(9.5, 10.24), 'DOWN', '下がれば DOWN（売残が積む＝ショートカバー燃料）');
+  eq(M.marginRatioTrend_(10.24, 10.24), 'FLAT', '同値は FLAT');
+  eq(M.marginRatioTrend_(10 * (1 + W / 2), 10), 'FLAT', '不感帯の内側は FLAT（丸め由来の微小変動で反転させない）');
+  eq(M.marginRatioTrend_(10 * (1 + W * 2), 10), 'UP', '不感帯を超えれば UP');
+  eq(M.marginRatioTrend_(10.24, null), 'FLAT', '前回値が無い初回は判定しない');
+  eq(M.marginRatioTrend_(10.24, 0), 'FLAT', '前回値が0なら割り算しない');
+  eq(M.marginRatioTrend_('', 10), 'FLAT', '未入力は判定しない');
+  // 水準に依存しないので、母集団を東証全体（9倍前後）に差し替えても同じ式で読める
+  eq(M.marginRatioTrend_(9.4, 9.0), 'UP', '東証全体の倍率（9倍前後）でも同じ判定式が使える');
+}
+{
+  // 週次公表なので、日次実行のたびにシフトすると「前週比」が「前日比」になり常に FLAT になる
+  const h0 = M.shiftMarginRatioHistory_({}, 9.8, '09/04');
+  eq(h0.cur.v, 9.8, '初回は cur に入る');
+  eq(h0.prev, null, '初回は prev が無い');
+  const h1 = M.shiftMarginRatioHistory_(h0, 9.8, '09/04');
+  eq(h1.prev, null, '同じ公表日で再実行してもシフトしない（日次実行で履歴を潰さない）');
+  const h2 = M.shiftMarginRatioHistory_(h1, 10.24, '09/11');
+  eq(h2.prev.v, 9.8, '公表日が変われば前回値へ送る');
+  eq(M.marginRatioTrend_(h2.cur.v, h2.prev.v), 'UP', '送った前回値で UP と判定できる');
+  const h3 = M.shiftMarginRatioHistory_(h2, null, '09/18');
+  eq(h3.cur.v, 10.24, '取得失敗(null)では履歴を汚さない');
+  eq(h3.prev.v, 9.8, '同上（prev も保つ）');
+  // 日付が取れないページ構造変更時のフォールバック
+  const d0 = M.shiftMarginRatioHistory_({}, 9.8, '');
+  const d1 = M.shiftMarginRatioHistory_(d0, 9.8, '');
+  eq(d1.prev, null, '日付が無いときは同値ならシフトしない');
+  const d2 = M.shiftMarginRatioHistory_(d1, 10.24, '');
+  eq(d2.prev.v, 9.8, '日付が無くても値が変われば送る');
+}
+{
+  eq(M.marginRatioLabel_(10.24, 9.8, 'UP'), '10.24（前回 9.8 → 上昇）', '値と前回値と方向を1セルに出す');
+  eq(M.marginRatioLabel_(10.24, null, 'FLAT'), '10.24（前回なし・初回）',
+    '初回は「横ばい」と書かない（比較した結果と区別できなくなるため）');
+  eq(M.marginRatioLabel_(null, 9.8, 'UP'), null, '値が無ければ null');
 }
 {
   const b = M.SK.MARGIN.BUY_BOOST, s = M.SK.MARGIN.SELL_BOOST;
   eq(M.regimeFactor_('SHORT_COVER', '買い'), b, 'ショートカバー局面は買いを増幅');
-  near(M.regimeFactor_('SHORT_COVER', '売り'), 1 / s, 1e-12, '同局面の売りは減衰');
   eq(M.regimeFactor_('SUPPLY_RISK', '売り'), s, '需給悪化局面は売りを増幅');
   eq(M.regimeFactor_('NEUTRAL', '買い'), 1, '中立は等倍');
   eq(M.regimeFactor_('SHORT_COVER', '混在'), 1, '方向が混在なら等倍（順位を歪めない）');
+  // 逆風方向は等倍。除算すると★★★に必要な生スコアが倍になり、重み上限3では到達不能になる。
+  eq(M.regimeFactor_('SUPPLY_RISK', '買い'), 1, '需給悪化局面でも買いは減点しない（等倍）');
+  eq(M.regimeFactor_('SHORT_COVER', '売り'), 1, 'ショートカバー局面でも売りは減点しない（等倍）');
+  // 実データ由来の回帰: 2026-09-18 の最強の買い（三川(逆三尊)3＋RSIダイバ(強気)1＋包み線(強気)2＋毛抜き底1＝7点）は
+  // SUPPLY_RISK でも★★★（しきい値5）に届く。旧実装では 7/1.5=4.67 で★★に落ちていた。
+  eq(7 * M.regimeFactor_('SUPPLY_RISK', '買い') >= M.SK.STAR3, true,
+    '需給悪化局面でも生スコア7点の買いは★★★になる');
 }
 {
   const up = n => Array.from({ length: n }, (_, i) => 100 * Math.pow(1.01, i));
@@ -381,18 +434,32 @@ console.log('\n【8】急落の7条件 — 未取得の項目で点灯させな�
 }
 {
   const all = M.checkMarketConditions_({
-    sell_margin_oku: 5000, margin_ratio: 1.2, ns_ratio_trend: 'DOWN', nikkei_eps_trend: 'DOWN',
+    sell_margin_oku: 5000, margin_ratio: 10.24, margin_ratio_prev: 9.5, margin_ratio_trend: 'UP',
+    ns_ratio_trend: 'DOWN', nikkei_eps_trend: 'DOWN',
     foreign_net_oku: -1200, vix_macd_signal: 'GOLDEN_CROSS', earnings_selloff: 'YES',
   });
   eq(all.filter(c => c.alert).length, 7, '全条件が揃えば7/7点灯');
+  eq(all[1].value, '10.24（前回 9.5 → 上昇）', '倍率は値・前回値・方向をまとめて出す');
 }
 {
   const none = M.checkMarketConditions_({
-    sell_margin_oku: 9000, margin_ratio: 0.8, ns_ratio_trend: 'UP', nikkei_eps_trend: 'UP',
+    sell_margin_oku: 9000, margin_ratio: 10.24, margin_ratio_prev: 11.0, margin_ratio_trend: 'DOWN',
+    ns_ratio_trend: 'UP', nikkei_eps_trend: 'UP',
     foreign_net_oku: 500, vix_macd_signal: 'DEAD_CROSS', earnings_selloff: 'NO',
   });
   eq(none.filter(c => c.alert).length, 0, '良好な地合いでは0/7');
   eq(M.checkMarketConditions_({ foreign_net_oku: 0 })[4].alert, false, '海外投資家フラットは売り越しではない');
+  // 水準では点灯しない＝旧仕様との決別。10.24倍でも、動いていなければ買い方過多の「進行」ではない
+  eq(M.checkMarketConditions_({ margin_ratio: 10.24, margin_ratio_trend: 'FLAT' })[1].alert, false,
+    '倍率が高水準でも横ばいなら点灯しない（水準判定をやめた）');
+  eq(M.checkMarketConditions_({ margin_ratio: 0.8, margin_ratio_prev: 0.7, margin_ratio_trend: 'UP' })[1].alert, true,
+    '倍率が1.0未満でも上昇していれば点灯する（同上）');
+}
+{
+  // ページ構造変更で静かに壊れると「前回比」が出せなくなるため、実ページの形を固定する
+  const html = '信用倍率\\",\\"primary\\":{\\"value\\":\\"10.24\\",\\"move\\":\\"even\\",\\"suffix\\":\\"倍\\"},\\"updateDate\\":\\"09/11\\"}';
+  eq(M.parseYahooJpMarginDate_(html), '09/11', 'Yahooページから信用残の更新日(MM/DD)を取る');
+  eq(M.parseYahooJpMarginDate_('信用倍率 10.24'), null, '日付が無ければ null（値の変化でシフト判断に落ちる）');
 }
 
 /* ── 9. 東証信用残（mtseisan）の読み取り ─────────────────────────────────── */

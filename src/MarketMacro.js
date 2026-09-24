@@ -19,6 +19,9 @@ const MACRO = {
   INPUT_ROWS: 6,          // 入力欄の行数（見出し1行＋項目5行）。この範囲だけを手入力として読み書きする
   ALERT_START_ROW: 8,     // 急落サイン表の開始行（INPUT_ROWS+2、間に1行あける）
   REGIME_PROP: 'SK_MARGIN_REGIME',
+  // 信用倍率の前回公表値（{cur:{v,d},prev:{v,d}}）。前回比を出すには履歴が要るが、
+  // 入力欄は INPUT_ROWS で行数固定の前提なのでシートには足さず、スクリプトプロパティに持つ。
+  RATIO_HIST_PROP: 'SK_MARGIN_RATIO_HIST',
   NS_WINDOW:   20,      // NS倍率トレンド判定窓（営業日）
   YAHOO_RANGE: '6mo',
   // 好決算sell-on-news(条件7): 直近WINDOW_DAYS営業日の黒字決算のうち翌日DROP_PCT超下落の
@@ -35,36 +38,90 @@ const MACRO = {
 // ── 純ロジック（GAS非依存・ヘッドレステスト可能） ───────────────────────────
 
 /**
- * 地合い：東証 売残(億円) と 信用倍率 から3区分。
+ * 信用倍率の方向：前回公表値からの変化率を不感帯つきで UP/DOWN/FLAT に分ける。
+ *
+ * 水準（倍率 >= 1.0 など）で見ないのは、基準にしている日経レバ1570の倍率が
+ * 実測10.24倍（2026-09、買残2,144,098口/売残209,290口）で、「空売りが積めば1.0を割る」という
+ * 設計当時の前提が今の市場で成立しないため。水準判定は恒久点灯し、地合いが片側に張り付く。
+ * 変化率なら母集団の絶対値に依存せず、東証全体の倍率（9倍前後）に差し替えても同じ式で読める。
+ *
+ * UP   … 買残が売残に対して増えた＝買い方過多が進行（need: 将来の戻り売り圧力）
+ * DOWN … 売残が積んだ＝ショートカバーの燃料が増えた
+ * 不感帯 RATIO_TREND_BAND を置くのは、公表値の丸め（小数2桁）とごく小さな変動で
+ * 地合いが毎週ぱたぱた反転するのを防ぐため。
+ */
+function marginRatioTrend_(cur, prev, band) {
+  const toNum = v => (v === '' || v == null) ? NaN : Number(v);
+  const c = toNum(cur), p = toNum(prev);
+  const w = (band == null) ? SK.MARGIN.RATIO_TREND_BAND : Number(band);
+  if (!isFinite(c) || !isFinite(p) || p <= 0) return 'FLAT';   // 前回値が無い初回は判定材料にしない
+  const chg = c / p - 1;
+  if (chg >  w) return 'UP';
+  if (chg < -w) return 'DOWN';
+  return 'FLAT';
+}
+
+/**
+ * 信用倍率の履歴を1つ進める。{ cur: {v,d}, prev: {v,d} } を返す（純関数）。
+ *
+ * updateMarketMacro は毎日走るが 1570 の信用残は週次公表なので、呼ばれるたびに
+ * シフトすると cur と prev が同じ公表回の値になり、「前週比」が常に FLAT になる。
+ * 公表日(d)が変わったときだけ進める。日付が取れない場合は値の変化で代用する。
+ */
+function shiftMarginRatioHistory_(hist, ratio, date) {
+  const h = (hist && typeof hist === 'object') ? hist : {};
+  const cur = h.cur || null;
+  // Number(null) と Number('') は 0 になる。そのまま通すと取得失敗の回に
+  // 「倍率0倍」が履歴へ入り、次回の前回比が -100% になって DOWN が張り付く。
+  const r = (ratio === '' || ratio == null) ? NaN : Number(ratio);
+  if (!isFinite(r)) return { cur: cur, prev: h.prev || null };   // 取得失敗時は履歴を汚さない
+  const key = String(date || '');
+  const sameRelease = cur && (key ? String(cur.d || '') === key : Number(cur.v) === r);
+  return sameRelease
+    ? { cur: { v: r, d: key }, prev: h.prev || null }
+    : { cur: { v: r, d: key }, prev: cur };
+}
+
+/**
+ * 地合い：東証 売残(億円) と 信用倍率の方向 から3区分。
  *
  * 【注意・既知の非整合】この2つは母集団が違う。売残は東証全体（金額ベース・億円）だが、
  * 信用倍率は日経レバ1570というETF単体の値（買残株÷売残株）を使っている。
- * 1570を使っているのは、東証全体の倍率（9倍前後）では RATIO_PIVOT=1.0 の条件が
- * 成立しないため。異なる母集団を1つの判定に混ぜている点は承知の上の割り切りで、
+ * 異なる母集団を1つの判定に混ぜている点は承知の上の割り切りで、
  * 「東証全体の需給」と読むと誤るので、シート上でも1570表記のまま出している。
  * SELL_THRESHOLD_OKU=8000 も名目円の固定値で、時価総額・売買代金による正規化はしていない。
  */
-function marginRegime_(sellBalOku, ratio) {
-  const T = SK.MARGIN.SELL_THRESHOLD_OKU, P = SK.MARGIN.RATIO_PIVOT;
+function marginRegime_(sellBalOku, ratioTrend) {
+  const T = SK.MARGIN.SELL_THRESHOLD_OKU;
   // 空セルは getValues() が '' を返し Number('') は 0 になる。そのまま判定すると
-  // 「売残が未入力」＝「売残0億円＝枯渇」と読まれ、倍率が1.0以上なら SUPPLY_RISK が立って
-  // 全ての売りシグナルが1.5倍に増幅される（倍率が未入力なら逆に SHORT_COVER）。
-  // 手入力運用なので未入力は普通に起きる。未入力は判定材料にせず中立へ落とす。
-  const toNum = v => (v === '' || v == null) ? NaN : Number(v);
-  const s = toNum(sellBalOku), r = toNum(ratio);
-  if (isFinite(s) && isFinite(r)) {
-    if (s >= T && r <  P) return 'SHORT_COVER';   // 売残潤沢＋倍率低 ＝ ショートカバー好機（買い追い風）
-    if (s <  T && r >= P) return 'SUPPLY_RISK';    // 売残枯渇＋倍率高 ＝ 需給悪化・投げ売り警戒（売り追い風）
+  // 「売残が未入力」＝「売残0億円＝枯渇」と読まれ、倍率が上昇していれば SUPPLY_RISK が立って
+  // 全ての売りシグナルが1.5倍に増幅される。手入力運用なので未入力は普通に起きる。
+  // 未入力は判定材料にせず中立へ落とす。
+  const s = (sellBalOku === '' || sellBalOku == null) ? NaN : Number(sellBalOku);
+  const t = String(ratioTrend || 'FLAT');
+  if (isFinite(s)) {
+    if (s >= T && t === 'DOWN') return 'SHORT_COVER';   // 売残潤沢＋倍率低下 ＝ ショートカバー好機（買い追い風）
+    if (s <  T && t === 'UP')   return 'SUPPLY_RISK';   // 売残枯渇＋倍率上昇 ＝ 需給悪化・投げ売り警戒（売り追い風）
   }
-  return 'NEUTRAL';
+  return 'NEUTRAL';   // 倍率が横ばい（FLAT）なら、売残の水準だけでは地合いを決めない
 }
 
-// 地合い係数：地合いと方向でスコアを増減（買い/売りで逆方向に効かせる）。
+/**
+ * 地合い係数：追い風の方向だけを増幅する。逆風の方向は等倍（ペナルティを課さない）。
+ *
+ * 以前は逆風側を 1/BOOST で割っていたが、★の判定は絶対しきい値（SK.STAR3）なので
+ * 除算は「★★★に必要な生スコア」をそのまま押し上げる。BOOST=1.5 だと
+ * 追い風側 5/1.5=3.34→4点 に対し逆風側 5×1.5=7.5→8点 となり、必要点数が2倍になる。
+ * 重みの上限は3なので、逆風側は重み3のパターンが出ても★★★に届かない。
+ * 実際 2026-09-18 の走査では、1578銘柄中もっとも強い買い（三川(逆三尊)＋確認3つ＝7点）が
+ * 4.67 に減点されて★★に落ち、★3買いが0件・売買プランも通知メールも空になっていた。
+ * 地合いは「追い風を押し上げる」だけに使い、逆風は素点のまま評価する。
+ */
 function regimeFactor_(regime, dir) {
   const b = SK.MARGIN.BUY_BOOST, s = SK.MARGIN.SELL_BOOST;
   const buy = String(dir).indexOf('買い') >= 0, sell = String(dir).indexOf('売り') >= 0;
-  if (regime === 'SHORT_COVER') return buy ? b : sell ? 1 / s : 1;
-  if (regime === 'SUPPLY_RISK') return sell ? s : buy ? 1 / b : 1;
+  if (regime === 'SHORT_COVER') return buy ? b : 1;
+  if (regime === 'SUPPLY_RISK') return sell ? s : 1;
   return 1;
 }
 
@@ -93,6 +150,15 @@ function vixMacdSignal_(vixCloses) {
   return a > 0 ? 'ABOVE' : 'BELOW';
 }
 
+// 信用倍率の表示ラベル「10.24（前回 9.80 → 上昇）」。前回値が無い初回は方向を出さない
+// （「横ばい」と書くと、比較した結果そうだったのか比較していないのかが区別できない）。
+function marginRatioLabel_(cur, prev, trend) {
+  if (cur == null || cur === '') return null;
+  if (prev == null || prev === '') return String(cur) + '（前回なし・初回）';
+  const dict = { UP: '上昇', DOWN: '低下', FLAT: '横ばい' };
+  return String(cur) + '（前回 ' + prev + ' → ' + (dict[String(trend)] || String(trend)) + '）';
+}
+
 // Sho「日本株急落の7条件」判定（提供Pythonと同型）。data は数値/状態のマップ。
 // 各要素 { key, condition, value, alert }（alert=true が急落サイン点灯）。
 function checkMarketConditions_(data) {
@@ -100,8 +166,12 @@ function checkMarketConditions_(data) {
   return [
     { key: '1_short_margin', condition: '東証 売残 8,000億円未満', value: g('sell_margin_oku', null),
       alert: Number(g('sell_margin_oku', 9e9)) < SK.MARGIN.SELL_THRESHOLD_OKU },
-    { key: '2_margin_ratio', condition: '信用倍率 1.0倍以上（買い方過多）', value: g('margin_ratio', null),
-      alert: Number(g('margin_ratio', 0)) >= SK.MARGIN.RATIO_PIVOT },
+    // 水準（>=1.0）ではなく前回公表比の方向で見る。理由は marginRatioTrend_ のコメント参照。
+    // 値は「今回（前回→方向）」の形で出す。方向だけだと元の数字が追えず、
+    // 数字だけだと何と比べて上昇なのかが分からないため、両方を1セルに入れる。
+    { key: '2_margin_ratio', condition: '信用倍率 前回公表比 上昇（買い方過多が進行）',
+      value: marginRatioLabel_(g('margin_ratio', null), g('margin_ratio_prev', null), g('margin_ratio_trend', 'FLAT')),
+      alert: g('margin_ratio_trend') === 'UP' },
     { key: '3_ns_ratio', condition: 'NS倍率（日経/ S&P500）低下・米国株優位', value: g('ns_ratio_trend', null),
       alert: g('ns_ratio_trend') === 'DOWN' },
     { key: '4_nikkei_eps', condition: '日経平均EPS 下落（理論株価の低下）', value: g('nikkei_eps_trend', null),
@@ -189,19 +259,23 @@ function pickForeignFlow_(rows) {
 }
 
 // 日経レバ(1570)の信用倍率を Yahoo Finance Japan から取得（J-Quantsではない。コメントが古かった）。
-// 買残÷売残(株数)。1570は空売りが積むと倍率<1.0になり得る＝ショートカバー燃料の指標。
-// 市場全体の信用倍率は常に買残>>売残で約9倍固定のため、動画の「信用倍率<1.0」判定には1570を使う。
+// 買残÷売残(株数)。市場全体の倍率（9倍前後）より値動きが大きく、需給の変化が早く出る。
+// 水準ではなく前回公表比の方向で使う（marginRatioTrend_）。公表は週次なので、
+// 前回との比較には「どの公表回の値か」が要る → ページ上の更新日(MM/DD)も一緒に返す。
 function fetch1570MarginRatio_() {
-  var errors = {};
-  var m = fetchYahooJpMarginRatios_(['1570'], errors);
-  return (m['1570'] != null) ? { ratio: m['1570'], date: '' } : { error: errors['1570'] || '信用倍率(1570)の取得に失敗' };
+  var errors = {}, dates = {};
+  var m = fetchYahooJpMarginRatios_(['1570'], errors, dates);
+  return (m['1570'] != null)
+    ? { ratio: m['1570'], date: dates['1570'] || '' }
+    : { error: errors['1570'] || '信用倍率(1570)の取得に失敗' };
 }
 
 // Yahoo Finance Japan の各銘柄ページから信用倍率(合計)を取得し code→倍率 マップを返す。
 // J-Quantsの信用残がプラン外/空のときの代替。制度/一般の内訳は無く合計倍率のみ。
 // 点灯銘柄など少数を渡す想定（fetchAllでバッチ）。取得不可の銘柄は欠落。
 // errorsOut を渡すと、取得できなかった銘柄ごとに { code: 失敗理由 } を書き込む（呼び出し元が任意で使う）。
-function fetchYahooJpMarginRatios_(codes, errorsOut) {
+// datesOut を渡すと、ページ上の更新日(MM/DD)を { code: '09/11' } の形で書き込む（前回公表比の判定に使う）。
+function fetchYahooJpMarginRatios_(codes, errorsOut, datesOut) {
   var map = {};
   var uniq = Array.from(new Set((codes || []).map(function (c) { return to4_(String(c).trim()); }).filter(Boolean)));
   for (var i = 0; i < uniq.length; i += 25) {
@@ -218,9 +292,12 @@ function fetchYahooJpMarginRatios_(codes, errorsOut) {
     resps.forEach(function (res, j) {
       try {
         if (res.getResponseCode() === 200) {
-          var r = parseYahooJpMarginRatio_(res.getContentText());
-          if (r != null) map[slice[j]] = r;
-          else if (errorsOut) errorsOut[slice[j]] = '解析失敗（ページ構造が変わった可能性）';
+          var html = res.getContentText();
+          var r = parseYahooJpMarginRatio_(html);
+          if (r != null) {
+            map[slice[j]] = r;
+            if (datesOut) { var d = parseYahooJpMarginDate_(html); if (d) datesOut[slice[j]] = d; }
+          } else if (errorsOut) errorsOut[slice[j]] = '解析失敗（ページ構造が変わった可能性）';
         } else if (errorsOut) {
           errorsOut[slice[j]] = 'HTTP ' + res.getResponseCode();
         }
@@ -241,6 +318,16 @@ function parseYahooJpMarginRatio_(html) {
   var b = html.match(/信用買残[^0-9]{0,60}?([0-9,]+)/), s = html.match(/信用売残[^0-9]{0,60}?([0-9,]+)/);
   if (b && s) { var bv = parseFloat(b[1].replace(/,/g, '')), sv = parseFloat(s[1].replace(/,/g, '')); if (sv > 0) return Math.round(bv / sv * 100) / 100; }
   return null;
+}
+
+// Yahoo Japanのページから信用残の更新日(MM/DD)を抽出。信用残は週次公表なので、
+// 「前回公表比」を出すには値そのものより先に『どの回の値か』が要る。
+// 実測のHTMLは "信用倍率\",\"primary\":{\"value\":\"10.24\",…},\"updateDate\":\"09/11\"" の形で、
+// 同じ形が信用買残・信用売残にも並ぶ。信用倍率に最も近い updateDate を取る。
+// 取れなければ null（呼び出し元は値の変化でシフトを判断するフォールバックに落ちる）。
+function parseYahooJpMarginDate_(html) {
+  var m = String(html).match(/信用倍率[\s\S]{0,400}?updateDate\\?"\s*:\s*\\?"([0-9]{1,2}\/[0-9]{1,2})/);
+  return m ? m[1] : null;
 }
 
 // 全銘柄の「制度信用倍率」(制度買残÷制度売残) を J-Quants /markets/margin-interest から取得。
@@ -699,7 +786,7 @@ function updateMarketMacro() {
   } catch (e) { /* 営業日判定が使えない環境でも更新自体は続行する */ }
 
   const tse = importTseMarginFile_();                          // 東証 mtseisan*.xls（売残億円）を自動取込
-  const r1570 = fetch1570MarginRatio_();                       // 信用倍率は日経レバ1570（<1.0になり得る）。取得不可時は { error }
+  const r1570 = fetch1570MarginRatio_();                       // 信用倍率は日経レバ1570。取得不可時は { error }
   const marginRatio = (r1570 && r1570.ratio != null) ? r1570.ratio : null;   // 取得不可時は手入力値を使う（東証全体9.21は使わない）
   const eps = fetchNikkeiEps_();                               // 日経EPS(加重平均)トレンドを自動取得
   const flow = fetchForeignFlow_();                            // 海外投資家 現物ネット（J-Quants）。取得不可時は { error }
@@ -723,6 +810,14 @@ function updateMarketMacro() {
   if (flow && flow.netOku != null) manual.foreign_net_oku = flow.netOku;
   if (earn && earn.alert != null) manual.earnings_selloff = earn.alert ? 'YES' : 'NO';
 
+  // 信用倍率は水準ではなく前回公表比で見る（marginRatioTrend_）。比較相手はスクリプトプロパティに
+  // 持つ。シートに列を足さないのは、入力欄が MACRO.INPUT_ROWS で行数固定の前提だから。
+  const ratioNow  = (manual.margin_ratio === '' || manual.margin_ratio == null) ? null : Number(manual.margin_ratio);
+  const ratioHist = shiftMarginRatioHistory_(readMarginRatioHistory_(), ratioNow, (r1570 && r1570.date) || '');
+  if (ratioNow != null) writeMarginRatioHistory_(ratioHist);
+  const ratioPrev  = ratioHist.prev ? ratioHist.prev.v : null;
+  const ratioTrend = marginRatioTrend_(ratioNow, ratioPrev);
+
   let ns = 'FLAT', vix = 'NONE';
   try {
     const n225 = fetchIndexCloses_('^N225'), spx = fetchIndexCloses_('^GSPC');
@@ -730,17 +825,21 @@ function updateMarketMacro() {
   } catch (e) { Logger.log('NS倍率取得失敗: ' + e.message); }
   try { vix = vixMacdSignal_(fetchIndexCloses_('^VIX')); } catch (e) { Logger.log('VIX取得失敗: ' + e.message); }
 
-  const data = Object.assign({}, manual, { ns_ratio_trend: ns, vix_macd_signal: vix });
+  const data = Object.assign({}, manual, {
+    ns_ratio_trend: ns, vix_macd_signal: vix,
+    margin_ratio_prev: ratioPrev, margin_ratio_trend: ratioTrend,
+  });
   const conds = checkMarketConditions_(data);
   const lit = conds.filter(c => c.alert).length;
 
   writeAlertSheet_(conds, lit, data);
 
-  const regime = marginRegime_(data.sell_margin_oku, data.margin_ratio);
+  const regime = marginRegime_(data.sell_margin_oku, ratioTrend);
   PropertiesService.getScriptProperties().setProperty(MACRO.REGIME_PROP, regime);
   Logger.log('相場マクロ更新: 点灯 ' + lit + '/7 ・地合い=' + regime + ' ・NS=' + ns + ' ・VIX=' + vix +
     ' ・東証売残=' + (tse ? tse.sellOku + '億' : '未取込') +
     ' ・信用倍率(1570)=' + (marginRatio != null ? marginRatio + '(' + r1570.date + ')' : (r1570 && r1570.error ? '取得失敗:' + r1570.error : '手入力')) +
+    ' ・倍率トレンド=' + ratioTrend + '(前回' + (ratioPrev == null ? 'なし' : ratioPrev) + ')' +
     ' ・日経EPS=' + (eps ? eps.eps + '(' + eps.date + ')→' + eps.trend : '手入力') +
     ' ・海外投資家=' + ((flow && flow.netOku != null) ? flow.netOku + '億(' + flow.week + ')' : (flow && flow.error ? '取得失敗:' + flow.error : '手入力')) +
     ' ・好決算sell=' + ((earn && earn.alert != null) ? (earn.alert ? 'YES' : 'NO') + '(' + earn.drops + '/' + earn.total + ')' : (earn && earn.error ? '取得失敗:' + earn.error : '手入力')));
@@ -750,10 +849,31 @@ function updateMarketMacro() {
     SpreadsheetApp.getActive().toast(
       (tse ? '東証売残' + tse.sellOku + '億' : '⚠ mtseisan未取込') +
       '・倍率' + (marginRatio != null ? marginRatio + '(1570)' : '手入力') +
+      '→' + macroValueLabel_(ratioTrend) + (ratioPrev == null ? '(前回なし)' : '(前回' + ratioPrev + ')') +
       ' ・急落' + lit + '/7 ・地合い' + regime +
       (stale.length ? '\n⚠ 古い入力: ' + stale.join('、') : ''), '相場マクロ', stale.length ? 15 : 8);
   } catch (e) { Logger.log('トースト表示に失敗: ' + e.message); }
   if (stale.length) Logger.log('⚠ 更新が古い/日付未記入の項目: ' + stale.join('、'));
+}
+
+// 信用倍率の履歴（前回公表値）をスクリプトプロパティから読む。壊れたJSONでも落とさない
+// （相場マクロの更新全体が止まると、地合いが古いまま走査だけ走ってしまうため）。
+function readMarginRatioHistory_() {
+  try {
+    const raw = PropertiesService.getScriptProperties().getProperty(MACRO.RATIO_HIST_PROP);
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    Logger.log('信用倍率の履歴を読めませんでした（初回扱いにします）: ' + e.message);
+    return {};
+  }
+}
+
+function writeMarginRatioHistory_(hist) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(MACRO.RATIO_HIST_PROP, JSON.stringify(hist));
+  } catch (e) {
+    Logger.log('信用倍率の履歴を保存できませんでした: ' + e.message);
+  }
 }
 
 // finalizeSignals_(Code.js) が参照する現在の地合い。未更新時は NEUTRAL。
@@ -831,7 +951,7 @@ function calendarMapFromEntries_(entries) {
 function writeAlertSheet_(conds, lit, data) {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(MACRO.INPUT_SHEET) || setupMacroSheets_().input;
-  const regime = marginRegime_(data.sell_margin_oku, data.margin_ratio);
+  const regime = marginRegime_(data.sell_margin_oku, data.margin_ratio_trend);
   // 点灯数だけでは強弱が読み取れないため、目安を併記する
   const scale = lit >= 5 ? '（5件以上＝警戒領域）' : lit >= 3 ? '（3〜4件＝注意）' : '（2件以下＝落ち着いている）';
   const rows = [

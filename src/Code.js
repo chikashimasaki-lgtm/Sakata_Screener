@@ -202,7 +202,9 @@ function fetchPrimeUniverse() {
 // ============================================================================
 //  シグナル走査（時間分割・自動再開）
 // ============================================================================
-function scanSignals() {
+// 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は scanSignalsRun_
+function scanSignals() { return runLogged_('シグナル走査', () => scanSignalsRun_()); }
+function scanSignalsRun_() {
   // 自動再開トリガーと手動実行が重なった場合の二重追記を防ぐ（多重実行排他）
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
@@ -457,7 +459,9 @@ function installDailyScanTrigger() {
 // 平日18時に発火。全銘柄の株価取得＋シグナル走査（重い処理・1日1回）。
 // 引け後にYahoo日足の当日終値が確定するのを待つため18時。立会時間外なので営業日判定(isBusinessDay_)のみ。
 // isBusinessDay_() は共通モジュール MarketCalendar.js で定義。
-function scheduledScan() {
+// 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は scheduledScanRun_
+function scheduledScan() { return runLogged_('定時スキャン', () => scheduledScanRun_()); }
+function scheduledScanRun_() {
   const now = new Date();
   if (!isBusinessDay_(now)) { Logger.log('休場日のため走査をスキップ: ' + now); return; }
   scanSignals();
@@ -465,7 +469,9 @@ function scheduledScan() {
 
 // 毎時発火。購入ポートフォリオ(SBI保有銘柄)の確認 = 既存シグナルシートの保有ハイライトを最新の保有状況で更新する。
 // 株価取得は行わない（全銘柄走査は scheduledScan 側の役割）。立会対象（営業日 9:00-17:00）のみ実行。
-function scheduledHeldCheck() {
+// 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は scheduledHeldCheckRun_
+function scheduledHeldCheck() { return runLogged_('保有チェック', () => scheduledHeldCheckRun_()); }
+function scheduledHeldCheckRun_() {
   const now = new Date();
   if (!isMarketOpen_(now)) { Logger.log('立会時間外のため保有確認をスキップ: ' + now); return; }
   const sig = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.SIGNALS);
@@ -1677,7 +1683,9 @@ function extractMlRow_(params) {
 }
 
 // 過去6ヶ月バックテスト（時間分割・自動再開）。各パターンの N日後リターン実績を集計し成績DBを自動更新。
-function backtestWeights() {
+// 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は backtestWeightsRun_
+function backtestWeights() { return runLogged_('重みバックテスト', () => backtestWeightsRun_()); }
+function backtestWeightsRun_() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
     // 以前はログだけで黙って return しており、自動再開トリガーが scanSignals 等と衝突すると
@@ -2264,4 +2272,14 @@ function buildPlans() {
   const ok = Object.keys(plans).filter(k => plans[k].ok).length;
   ss.toast('売買プランを更新しました（算出できた銘柄 ' + ok + '件 / 対象 '
     + Object.keys(plans).length + '件）', APP_NAME_, 6);
+}
+
+/**
+ * トリガーの入口を共通モジュール RunLog.js で包む（「実行記録」シートに 秒・結果・エラー種別 を1回1行）。
+ * Geminiマネージャーが読み、6分の上限に近い処理・失敗の多い処理・1日のトリガー合計時間を出す。
+ * RunLog が無い環境（テストなど）では本体をそのまま呼ぶ。
+ */
+function runLogged_(label, fn, opts) {
+  if (typeof RunLog === 'undefined') return fn();
+  return RunLog.wrap(() => SpreadsheetApp.getActive(), label, fn, opts);
 }

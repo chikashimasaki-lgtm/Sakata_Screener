@@ -774,7 +774,9 @@ function readMacroInputSheet_() {
 }
 
 // メニュー本体：手入力＋自動(NS/VIX)から7条件を判定し「急落サイン」へ出力、地合いをキャッシュ。
-function updateMarketMacro() {
+// 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は updateMarketMacroRun_
+function updateMarketMacro() { return runLogged_('市場マクロ', () => updateMarketMacroRun_()); }
+function updateMarketMacroRun_() {
   // 休場日は各種データが更新されないため、古い値で地合いを計算し直して上書きしても意味がない。
   // scheduledScan には営業日ガードがあるのに、こちらには無く土日祝も走っていた。
   // 手動実行（メニュー）は確認のため回したいこともあるので、トリガー起動時のみ止める。
@@ -1011,7 +1013,9 @@ function writeEarningsCalendarSheet_(entries, nameMap, note) {
 // メニュー本体：edinetdb.jp から向こう CALENDAR_LOOKAHEAD_DAYS 日分の決算発表予定を取得し、
 // 「銘柄」シートの対象コードに絞って「決算カレンダー」シートへ出力する。
 // EDINETDB_API_KEY 未設定でも他の機能に影響しないよう早期returnする（任意機能）。
-function updateEarningsCalendar() {
+// 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は updateEarningsCalendarRun_
+function updateEarningsCalendar() { return runLogged_('決算カレンダー', () => updateEarningsCalendarRun_()); }
+function updateEarningsCalendarRun_() {
   try {
     if (!isBusinessDay_(new Date()) && !isUserTriggered_()) {
       Logger.log('休場日のため決算カレンダーの更新をスキップ');

@@ -1,25 +1,24 @@
 // ============================================================================
-//  酒田五法 シグナル・スクリーナー
+//  短期売買支援（ダウ理論×フィボナッチの買い推奨）
 //  ---------------------------------------------------------------------------
-//  株価API（Yahoo Finance 日足）から多銘柄をスキャンし、酒田五法のシグナルが
-//  点灯した銘柄を一覧化する。UI はスプレッドシートのみ（公開ページ・JSON出力は廃止）。
-//  ※ 投資助言ではなく、シグナル抽出の補助ツール。
-//  ※ シグナルの重みは静的（SIGNAL_WEIGHT_）。「パターン成績」の集計値は参考表示のみで
-//    順位付けには使わない（統計的裏付けを欠くため。suggestWeight_ のコメント参照）。
+//  株価API（Yahoo Finance 日足）でプライム全銘柄を走査し、ダウ理論の上昇トレンドの押し目が
+//  フィボナッチの押し幅で止まって反転した銘柄を、1日最大5件の買い推奨として出す。
+//  判定の本体は DowFib.js（純ロジック）。根拠の検証は tools/backtest_dowfib.js（README 参照）。
+//  UI はスプレッドシート「売買プラン」1枚（買い推奨＋保有株）。※投資助言ではなく抽出の補助。
 //
-//  実装パターン: 赤三兵 / 三羽烏(黒三兵) / 三空踏み上げ / 三空叩き込み /
-//               上げ三法 / 下げ三法 / 三山(三尊天井) / 三川(逆三尊) /
-//               明けの明星 / 宵の明星 / 捨て子線
+//  旧・酒田五法のローソク足判定（detectSakata_ ほか）は、旧ロジックとの比較
+//  （backtest_dowfib.js --old）と tools/calc_weights.js のために残しているが、走査には使っていない。
 //
 //  使い方:
-//   1) メニュー「酒田五法」→ 設定とメンテナンス → セットアップ
+//   1) メニュー「短期売買支援」→ 設定とメンテナンス → セットアップ
 //   2) 「銘柄」シートにコード(4桁)を入れる（または「プライム銘柄を取得」でJ-Quantsから取得）
-//   3) 「シグナル走査」を実行 → 「シグナル」シートに結果
+//   3) 「走査」を実行 → 「売買プラン」シートに結果
 // ============================================================================
 
 const SK = {
   SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方', STATS: 'パターン成績', PLAN: '売買プラン' },
-  YAHOO_RANGE: '6mo',
+  YAHOO_RANGE: '6mo',   // 保有株の売買プラン・旧集計用
+  SCAN_RANGE: '1y',     // 買い推奨の走査用。主要トレンドの山谷（左右10本）を2組そろえるのに半年では足りない
   BATCH: 40,
   TIME_BUDGET_MS: 4.5 * 60 * 1000,
   // 信用需給フィルター（動画の閾値）。地合いと係数の単一ソース。MarketMacro.js が参照。
@@ -81,8 +80,8 @@ const SK = {
   },
 };
 
-// 共通モジュール ConfirmUi.js がトーストの見出しに使うプロジェクト名
-const APP_NAME_ = '酒田五法';
+// プロジェクト名（メニュー名・トーストの見出し。共通モジュール ConfirmUi.js も参照）
+const APP_NAME_ = '短期売買支援';
 
 // 実績スコアリング設定（バックテスト学習・自動修正）
 // バックテスト対象期間 = 過去6ヶ月（SK.YAHOO_RANGE '6mo'）
@@ -101,20 +100,19 @@ function onOpen() {
   // 日常的に押すのは上の2つだけ。残りは「たまに個別に更新したいもの」と
   // 「初回設定・後片付け」なので、サブメニューへ畳んで最初の画面を短く保つ。
   // 平日18時の走査トリガーが回っている限り、上の2つも押す必要はない。
-  ui.createMenu('酒田五法')
-    .addItem('シグナル走査/続行（売買プランも更新）', 'scanSignals')
-    .addItem('売買プランを作成/更新（★3買い＋保有株）', 'buildPlans')
+  ui.createMenu(APP_NAME_)
+    .addItem('走査/続行（買い推奨と売買プランを更新）', 'scanSignals')
+    .addItem('売買プランだけ作り直す（買い推奨＋保有株）', 'buildPlans')
     .addSeparator()
     .addSubMenu(ui.createMenu('個別に更新')
       .addItem('相場マクロ/急落サインを更新',   'updateMarketMacro')
       .addItem('決算カレンダーを更新',          'updateEarningsCalendar')
-      .addItem('決算発表列だけ更新（シグナル）', 'refreshSignalEarningsColumn')
-      .addItem('AI推奨コメントを生成（参考・投資助言ではありません）', 'generateAiSummary')
-      .addItem('パターン成績を集計（参考値・順位には未使用）', 'backtestWeights'))
+      .addItem('Bloombergニュースを取り込む（投資デイリー分析へ）', 'updateBloombergNews')
+      .addItem('AI推奨コメントを生成（参考・投資助言ではありません）', 'generateAiSummary'))
     .addSubMenu(ui.createMenu('設定とメンテナンス')
       .addItem('セットアップ',                  'setup')
       .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
-      .addItem('自動実行を設定（走査:平日18時/保有確認:毎時）', 'installDailyScanTrigger')
+      .addItem('自動実行を設定（Bloomberg:7時半/相場マクロ:17時/走査:平日18時）', 'installDailyScanTrigger')
       .addSeparator()
       .addItem('使い方シートを作成/更新', 'createUsageSheet')
       .addItem('シート順序を整える',      'ensureSheetOrder')
@@ -149,8 +147,8 @@ function setup() {
   if (u.getLastRow() > 1) u.getRange(2, 1, u.getLastRow() - 1, 1).setHorizontalAlignment('right');  // コード右寄せ
   autoFit_(u, 2);
   u.setTabColor('#5b6bd6');
-  ss.getSheetByName(SK.SHEETS.SIGNALS).setTabColor('#e0567a');
-  ss.toast('シートを準備しました。「銘柄」にコードを入れて走査してください', '酒田五法', 6);
+  hideWorkSheets_();   // 「シグナル」は走査の作業場所なので見せない
+  ss.toast('シートを準備しました。「銘柄」にコードを入れて走査してください', APP_NAME_, 6);
 }
 
 // ============================================================================
@@ -194,16 +192,22 @@ function fetchPrimeUniverse() {
   autoFit_(uni, 2);
   uni.setTabColor('#5b6bd6');
   Logger.log('プライム銘柄: ' + collect.length + '件');
-  SpreadsheetApp.getActive().toast('プライム ' + collect.length + '件を取得', '酒田五法', 5);
+  SpreadsheetApp.getActive().toast('プライム ' + collect.length + '件を取得', APP_NAME_, 5);
 }
 
 // to4_() の本体は共通モジュール StockCode.js（gas-shared/modules/StockCode.js の symlink）
 
 // ============================================================================
-//  シグナル走査（時間分割・自動再開）
+//  走査（時間分割・自動再開）
+//  全銘柄の日足を取り、dfSetup_（DowFib.js）が成立した銘柄を「シグナル」シートに候補として貯める。
+//  「シグナル」シートは時間分割をまたいで候補を持ち越すための作業場所で、走査完了後は非表示にする。
+//  人が見るのは「売買プラン」シート（買い推奨 最大5件＋保有株）だけ。
 // ============================================================================
+// 候補シートの列（作業用。人が見る前提ではないので数値のまま持つ）
+const CAND_HEADERS_ = ['コード', '銘柄名', '終値', '確度', 'スコア', '損切り', '利確', '押し率', '出来高倍率', '根拠', '日付'];
+
 // 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は scanSignalsRun_
-function scanSignals() { return runLogged_('シグナル走査', () => scanSignalsRun_()); }
+function scanSignals() { return runLogged_('買い推奨走査', () => scanSignalsRun_()); }
 function scanSignalsRun_() {
   // 自動再開トリガーと手動実行が重なった場合の二重追記を防ぐ（多重実行排他）
   const lock = LockService.getScriptLock();
@@ -218,7 +222,8 @@ function scanSignalsRun_() {
 
   const ss  = SpreadsheetApp.getActive();
   const uni = ss.getSheetByName(SK.SHEETS.UNIVERSE);
-  const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
+  let sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
+  if (!sig) sig = ss.insertSheet(SK.SHEETS.SIGNALS);
   if (!uni || uni.getLastRow() < 2) throw new Error('「銘柄」シートにコードを入れてください');
 
   // 進捗は「銘柄シートの何行目まで処理したか」だけを持つ。
@@ -233,22 +238,13 @@ function scanSignalsRun_() {
   let failed = Number(props.getProperty('SK_FAILED') || 0);
 
   if (!cursor) {
-    // 新規走査はシグナルシートを消して作り直す。前回の結果を見ている最中に
-    // 誤って実行すると消えてしまうため、既存結果があるときだけ確認する。
-    if (sig.getLastRow() > 1 && !confirmDestructive_('シグナル走査',
-        '現在の「シグナル」シートの結果（' + (sig.getLastRow() - 1) + '件）を消して、'
-        + total + '銘柄を新たに走査します。続行しますか？\n'
-        + '（中断した走査を再開したい場合は「いいえ」を選び、そのまま再実行してください）')) {
-      lock.releaseLock();
-      return;
-    }
+    // 新規走査は候補シートを作り直す（前回の候補は売買プランに反映済みなので確認は不要）
     const oldFilter = sig.getFilter(); if (oldFilter) oldFilter.remove();
     sig.clear();
-    sig.getRange(1, 1, 1, 11).setValues([['保有', '強さ', '日付', 'コード', '銘柄名', '終値', '方向', 'シグナル', 'シグナル解説', '信用倍率', '決算発表']]);
-    // コード列は最初からテキスト書式にする。既定(自動)のままだと "5602" を数値と解釈して
-    // 5,602 と桁区切りで表示され、コードに見えなくなる。新形式の英数字コード(130A)と
-    // 表示がちぐはぐになるうえ、先頭0のコードも0が落ちる。
-    sig.getRange(2, 4, sig.getMaxRows() - 1, 1).setNumberFormat('@');
+    sig.setConditionalFormatRules([]);
+    sig.getRange(1, 1, 1, CAND_HEADERS_.length).setValues([CAND_HEADERS_]);
+    // コード列はテキスト書式（"5602" が 5,602 と表示されたり、先頭0が落ちたりしないように）
+    sig.getRange(2, 1, sig.getMaxRows() - 1, 1).setNumberFormat('@');
     failed = 0;
   }
 
@@ -256,13 +252,7 @@ function scanSignalsRun_() {
   while (cursor < total) {
     if (Date.now() - start > SK.TIME_BUDGET_MS) break;
     const slice = universe.slice(cursor, cursor + SK.BATCH);
-    const reqs = slice.map(([code]) => ({
-      url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(code) +
-           '.T?range=' + SK.YAHOO_RANGE + '&interval=1d',
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      muteHttpExceptions: true,
-    }));
-    const resps = fetchAllWithRetry_(reqs);
+    const resps = fetchAllWithRetry_(slice.map(([code]) => yahooChartRequest_(code, SK.SCAN_RANGE)));
     if (!resps) break;   // ネットワークごと落ちている。カーソルは進めず次回に持ち越す。
 
     const buffer = [];
@@ -270,25 +260,18 @@ function scanSignalsRun_() {
       const [code, name] = slice[i];
       if (!res || res.getResponseCode() !== 200) { failed++; return; }  // 取得失敗を数える
       const bars = parseYahooBars_(res);
-      if (bars.length < 5) return;
-      if (!isLiquidEnough_(bars)) return;   // 薄商い銘柄は気配だけの窓を拾うため除外
-      const signals = detectSakata_(bars);
-      if (signals.length === 0) return;
-      const last = bars[bars.length - 1];
-      const dirs = new Set(signals.map(s => s.dir));
-      const dir  = dirs.size > 1 ? '混在' : [...dirs][0];
-      const names = signals.map(s => s.name);
-      buffer.push([
-        '', '',   // 保有・強さ は finalizeSignals_ で埋める
-        Utilities.formatDate(new Date(last.t * 1000), 'JST', 'yyyy/MM/dd'),
-        code, name, last.c, dir, names.map(s => '・' + s).join('\n'), signalExplain_(names),
-      ]);
+      if (bars.length < DF.MIN_BARS) return;
+      if (!isLiquidEnough_(bars)) return;   // 薄商い銘柄は実際にその値段で売買できない
+      const s = dfSetup_(bars);
+      if (!s) return;
+      buffer.push([code, name, s.close, s.grade, s.score, s.stop, s.target, s.retr, s.volRatio,
+        dfReason_(s), Utilities.formatDate(new Date(bars[bars.length - 1].t * 1000), 'JST', 'yyyy/MM/dd')]);
     });
 
     // バッチごとに「書き込み → カーソル確定」の順で確定させる。
     // 以前は全バッチ終了後にまとめて書いていたため、最後のバッチ中に6分制限で強制終了すると
     // 未書込のbufferと処理済みの分がまとめて失われ、再実行で重複追記が起きていた。
-    if (buffer.length) sig.getRange(sig.getLastRow() + 1, 1, buffer.length, 9).setValues(buffer);
+    if (buffer.length) sig.getRange(sig.getLastRow() + 1, 1, buffer.length, CAND_HEADERS_.length).setValues(buffer);
     cursor += slice.length;
     props.setProperty('SK_CURSOR', String(cursor));
     props.setProperty('SK_FAILED', String(failed));
@@ -300,40 +283,73 @@ function scanSignalsRun_() {
   if (cursor < total) {
     ScriptApp.newTrigger('scanSignals').timeBased().after(90 * 1000).create();
     Logger.log('一時停止: ' + cursor + '/' + total + '銘柄。90秒後に自動再開。');
-    ss.toast(cursor + '/' + total + '銘柄まで完了。90秒後に自動再開します', '酒田五法', 8);
-  } else {
-    props.deleteProperty('SK_CURSOR');
-    props.deleteProperty('SK_FAILED');
-    const n = finalizeSignals_(sig);   // 並べ替え・強さ評価・保有マーキングまで（メール送信に必要な内容を確定）
-    const hit = Math.max(sig.getLastRow() - 1, 0);
-    writeScanStatus_(sig, total, total, failed);
-    Logger.log('走査完了: シグナル ' + hit + '件 / 取得失敗 ' + failed + '件');
-    // 取得失敗は「シグナル0件」と紛らわしいので必ず件数を出す。
-    ss.toast('走査完了: ' + hit + '件のシグナル'
-      + (failed ? '（' + failed + '銘柄は取得できず未判定）' : ''), '酒田五法', 8);
-    // ★3買い＋保有株のダウ理論ベース売買プラン（買い・利確・損切り・株数）。
-    // ここで落ちても走査結果とメールは残したいので、失敗しても通知は続ける。
-    let plans = {};
-    try {
-      plans = buildPlansFromSignals_(sig);
-    } catch (e) {
-      Logger.log('売買プランの作成に失敗（シグナル一覧は正常）: ' + e.message);
-      ss.toast('売買プランを作成できませんでした: ' + e.message, '酒田五法', 8);
-    }
-    sendTopBuySignalsEmail_(sig, plans);   // 強さ★★★・買いだけを走査完了直後にメール通知
-    sendHeldStockDirectionEmail_(sig, plans);   // 保有銘柄の方向を走査完了直後にメール通知
-
-    // 信用倍率・決算発表列・ハイパーリンク・書式設定などの見た目の仕上げはメール送信の後で行う。
-    // 全銘柄走査が時間バジェットぎりぎりで終わった日にここで6分上限を超えて強制終了しても、
-    // 通知メールは既に送信済みのため実害はない（以前は仕上げまで含めて1関数で行っており、
-    // 強制終了時にその日の通知メールが一通も送られないまま気づかれないことがあった）。
-    try {
-      finalizeSignalsCosmetic_(sig, n);
-    } catch (e) {
-      Logger.log('シグナルシートの仕上げ処理に失敗（通知メールは送信済み）: ' + e.message);
-      ss.toast('シート仕上げでエラー: ' + e.message + '（通知メールは送信済みです）', '酒田五法', 8);
-    }
+    ss.toast(cursor + '/' + total + '銘柄まで完了。90秒後に自動再開します', APP_NAME_, 8);
+    return;
   }
+
+  props.deleteProperty('SK_CURSOR');
+  props.deleteProperty('SK_FAILED');
+  const nCand = Math.max(sig.getLastRow() - 1, 0);
+  Logger.log('走査完了: 候補 ' + nCand + '件 / 取得失敗 ' + failed + '件');
+
+  // 売買プラン（買い推奨＋保有株）→ 通知メール → 投資デイリー分析への連動、の順。
+  // メールは発注に使うので先に出し、連動と後片付けは失敗しても走査結果を壊さない。
+  let result = { plans: {}, targets: [] };
+  try {
+    result = buildPlansFromSignals_(sig);
+  } catch (e) {
+    Logger.log('売買プランの作成に失敗: ' + e.message);
+    ss.toast('売買プランを作成できませんでした: ' + e.message, APP_NAME_, 8);
+  }
+  writeScanStatus_(sig, total, total, failed);   // 売買プランを書いた後（clear で消えないように）
+  sendBuyPicksEmail_(result.targets, result.plans);
+  sendHeldWarningEmail_(result.targets, result.plans);
+  try {
+    writeBriefingPicks_(result.targets, result.plans);
+    const id = briefingSpreadsheetId_();
+    if (id) writeBloombergSheet_(SpreadsheetApp.openById(id), (bloombergTexts_() || [])[0] || null);
+  } catch (e) { Logger.log('投資デイリー分析への書き込みに失敗（売買プランは正常）: ' + e.message); }
+  hideWorkSheets_();
+
+  const picks = result.targets.filter(t => t.pick);
+  // 取得失敗は「推奨0件」と紛らわしいので必ず件数を出す。
+  ss.toast('走査完了: 買い推奨 ' + picks.length + '件（確度A ' + picks.filter(t => t.grade === 'A').length + '件）'
+    + (failed ? '／' + failed + '銘柄は取得できず未判定' : ''), APP_NAME_, 8);
+}
+
+// Yahoo Finance 日足（調整後終値つき）の取得リクエスト
+function yahooChartRequest_(code, range) {
+  return {
+    url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(code) +
+         '.T?range=' + range + '&interval=1d',
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    muteHttpExceptions: true,
+  };
+}
+
+// 候補シートの行を読み、スコア順に並べる（純関数部分は topPicks_）
+function readCandidates_(sig) {
+  if (!sig || sig.getLastRow() < 2) return [];
+  return sig.getRange(2, 1, sig.getLastRow() - 1, CAND_HEADERS_.length).getValues()
+    .filter(r => r[0])
+    .map(r => ({
+      code: to4_(String(r[0]).trim()).toUpperCase(), name: r[1] || '',
+      setup: { close: Number(r[2]), grade: String(r[3]), score: Number(r[4]), stop: Number(r[5]),
+               target: Number(r[6]), retr: Number(r[7]), volRatio: Number(r[8]) },
+      reason: String(r[9] || ''),
+    }));
+}
+
+/**
+ * 候補から1日の推奨（最大 DF.TOP_N 件）を選ぶ。確度Aが先、同じ確度なら出来高倍率の大きい順
+ * （dfSetup_ の score がその順になるように作ってある）。保有中の銘柄は新規の推奨から外す
+ * （保有行のメモに「買い推奨にも該当」と書く）。
+ */
+function topPicks_(cands, heldCodes) {
+  const held = heldCodes || new Set();
+  return cands.filter(c => !held.has(c.code))
+    .sort((a, b) => b.setup.score - a.setup.score)
+    .slice(0, DF.TOP_N);
 }
 
 /**
@@ -375,9 +391,15 @@ function writeScanStatus_(sig, done, total, failed) {
       ? '走査完了 ' + stamp + '時点（' + total + '銘柄' + (failed ? ' / 取得失敗' + failed + '件' : '') + '）'
       : '走査中 ' + done + '/' + total + '（' + Math.floor(done / total * 100) + '%）'
         + (failed ? ' / 取得失敗' + failed + '件' : '') + ' … 最終更新 ' + stamp;
-    // 12列目（L1）に置く。11列目（K1）は決算発表フラグ列のヘッダーになったため使えない。
-    sig.getRange(1, 12).setValue(msg)
-      .setFontColor(finished ? '#1a7f37' : '#b26a00').setFontWeight('bold');
+    // 作業用の候補シートは非表示なので、人が見る「売買プラン」の右上（L1）にも出す。
+    // 走査が終われば writePlanSheet_ が要約で上書きする。取得失敗の件数はM1に残す。
+    sig.getRange(1, 12).setValue(msg);
+    const plan = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.PLAN);
+    if (plan) {
+      if (!finished) plan.getRange(1, 12).setValue(msg).setFontColor('#b26a00').setFontWeight('bold');
+      plan.getRange(1, 13).setValue(finished && failed ? '（' + failed + '銘柄は株価を取得できず未判定）' : '')
+        .setFontColor('#8a3a3a');
+    }
   } catch (e) { /* 進捗表示は失敗しても走査自体は続ける */ }
 }
 
@@ -387,7 +409,7 @@ function resetScanQueue() {
   props.deleteProperty('SK_FAILED');
   props.deleteProperty('SK_QUEUE');   // 旧方式の残骸があれば併せて掃除
   clearResumeTriggers_();
-  SpreadsheetApp.getActive().toast('走査の進捗をリセットしました', '酒田五法', 5);
+  SpreadsheetApp.getActive().toast('走査の進捗をリセットしました', APP_NAME_, 5);
 }
 
 function clearResumeTriggers_() {
@@ -408,7 +430,7 @@ function removeDeprecatedSheets() {
   });
   const msg = removed.length ? removed.join('・') + ' を削除しました' : '対象のシートはありませんでした';
   Logger.log('廃止シート削除: ' + msg);
-  ss.toast(msg, '酒田五法', 6);
+  ss.toast(msg, APP_NAME_, 6);
 }
 
 // タブの並びを人が実際に見る優先順に揃える。存在しないシートは無視するので、
@@ -419,8 +441,7 @@ function removeDeprecatedSheets() {
 function ensureSheetOrder() {
   const ss = SpreadsheetApp.getActive();
   const order = [
-    SK.SHEETS.PLAN, SK.SHEETS.SIGNALS,
-    MACRO.INPUT_SHEET, MACRO.CALENDAR_SHEET, SK.SHEETS.UNIVERSE, SK.SHEETS.STATS,
+    SK.SHEETS.PLAN, MACRO.INPUT_SHEET, MACRO.CALENDAR_SHEET, SK.SHEETS.UNIVERSE,
     SK.SHEETS.USAGE,
   ];
   let moved = 0;
@@ -431,7 +452,7 @@ function ensureSheetOrder() {
     ss.moveActiveSheet(i + 1);
     moved++;
   });
-  ss.toast('シート順序を整えました（' + moved + '件）', '酒田五法', 5);
+  ss.toast('シート順序を整えました（' + moved + '件）', APP_NAME_, 5);
 }
 
 // ---- 定期実行（平日18時・土日祝／年末年始はスキップ） ----
@@ -444,16 +465,17 @@ function installDailyScanTrigger() {
 
   // 定期トリガーに加え、走査/集計の「自動再開」トリガーも掃除する。
   // 以前は再開トリガーが対象外で、中断状態のまま残った再開トリガーが後から発火していた。
-  clearTriggersFor_(['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest', 'updateMarketMacro',
+  clearTriggersFor_(['scheduledScan', 'scheduledHeldCheck', 'scheduledBacktest', 'updateMarketMacro', 'updateBloombergNews',
                      'updateEarningsCalendar', 'scanSignals', 'backtestWeights']);   // 共通モジュール TriggerUtils.js
   ScriptApp.newTrigger('updateMarketMacro').timeBased().everyDays(1).atHour(17).create();    // 相場マクロ/急落サイン・地合い更新（走査の前）
   ScriptApp.newTrigger('updateEarningsCalendar').timeBased().everyDays(1).atHour(17).create(); // 決算カレンダー更新（EDINETDB_API_KEY未設定なら早期return）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
-  ScriptApp.newTrigger('scheduledHeldCheck').timeBased().everyHours(1).create();            // 購入ポートフォリオ確認（毎時）
+  ScriptApp.newTrigger('updateBloombergNews').timeBased().everyDays(1).atHour(7).nearMinute(30).create(); // Bloomberg朝刊（6時着）を投資デイリー分析へ
+  // 旧「保有チェック（毎時）」は廃止。保有株は走査時に売買プランへ載る（上の clearTriggersFor_ で消える）。
   // 月次の自動学習トリガーは設定しない。集計結果を順位付けに使わなくなったため、
   // 全銘柄分のYahoo取得を毎月自動で走らせる必要がない（必要ならメニューから手動実行する）。
-  SpreadsheetApp.getActive().toast('自動実行を設定しました（走査:平日18時 / 保有確認:毎時）', '酒田五法', 6);
-  Logger.log('トリガー設定: scheduledScan(平日18時) / scheduledHeldCheck(毎時) / updateMarketMacro(17時) / updateEarningsCalendar(17時)');
+  SpreadsheetApp.getActive().toast('自動実行を設定しました（Bloomberg:7時半 / 相場マクロ:17時 / 走査:平日18時）', APP_NAME_, 6);
+  Logger.log('トリガー設定: scheduledScan(平日18時) / updateMarketMacro(17時) / updateEarningsCalendar(17時)');
 }
 
 // 平日18時に発火。全銘柄の株価取得＋シグナル走査（重い処理・1日1回）。
@@ -467,254 +489,31 @@ function scheduledScanRun_() {
   scanSignals();
 }
 
-// 毎時発火。購入ポートフォリオ(SBI保有銘柄)の確認 = 既存シグナルシートの保有ハイライトを最新の保有状況で更新する。
-// 株価取得は行わない（全銘柄走査は scheduledScan 側の役割）。立会対象（営業日 9:00-17:00）のみ実行。
-// 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は scheduledHeldCheckRun_
-function scheduledHeldCheck() { return runLogged_('保有チェック', () => scheduledHeldCheckRun_()); }
-function scheduledHeldCheckRun_() {
-  const now = new Date();
-  if (!isMarketOpen_(now)) { Logger.log('立会時間外のため保有確認をスキップ: ' + now); return; }
-  const sig = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.SIGNALS);
-  if (!sig || sig.getLastRow() < 2) { Logger.log('シグナル未生成のため保有確認をスキップ'); return; }
-  const n = finalizeSignals_(sig);
-  finalizeSignalsCosmetic_(sig, n);   // メール送信を伴わない経路なので、従来通り仕上げまで一括で行う
-  Logger.log('購入ポートフォリオ確認: 保有ハイライトを更新');
-}
-
-// 列構成: 1保有 2強さ 3日付 4コード 5銘柄名 6終値 7方向 8シグナル 9解説
-// 「シグナル」シートの11列目（決算発表）を書く。EDINETDB_API_KEY設定時は edinetdb.jp の
-// 決算カレンダーから発表(予定)日＋確度を表示（例: "2026-08-05(確定)"）。未設定/取得失敗時は
-// J-Quants /equities/earnings-calendar（「翌営業日分」しか返せない仕様）の「明日発表予定」フラグにフォールバック。
-// finalizeSignals_（走査完了時）とメニュー「決算発表列だけ更新」の両方から呼ぶ共通処理。
-function writeSignalEarningsColumn_(sig, n) {
-  const codes = sig.getRange(2, 4, n, 1).getValues().map(r => to4_(String(r[0] || '').trim()));
-  const calRows = fetchEarningsCalendarRows_();
-  const calMap = calRows ? calendarMapFromEntries_(filterCalendarToUniverse_(calRows, codes)) : null;
-  Logger.log('決算発表列: API生取得 ' + (calRows ? calRows.length : 'null(未設定/失敗)') +
-    '件 / 対象' + codes.length + '銘柄中 ' + (calMap ? Object.keys(calMap).length : 0) + '件マッチ');
-  const tomorrowAnnouncements = fetchTomorrowAnnouncementCodes_();
-  sig.getRange(2, 11, n, 1).setValues(codes.map(c => {
-    if (calMap && calMap[c]) return [calMap[c].date + '(' + calendarStatusLabel_(calMap[c].dateStatus) + ')'];
-    return [tomorrowAnnouncements && tomorrowAnnouncements[c] ? '明日発表予定' : ''];
-  }));
-}
-
-// メニュー用：全銘柄の再走査（Yahoo取得）をせず、既存の「シグナル」シートの決算発表列だけ更新する。
-// フル走査は時間がかかる（1578銘柄で複数回の自動再開）ため、決算カレンダー側だけ確認・再取得したい
-// ときに使う。
-function refreshSignalEarningsColumn() {
-  const ss = SpreadsheetApp.getActive();
-  const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
-  if (!sig || sig.getLastRow() < 2) { ss.toast('「シグナル」シートが空です。先に走査してください', '酒田五法', 6); return; }
-  const n = sig.getLastRow() - 1;
-  writeSignalEarningsColumn_(sig, n);
-  ss.toast('決算発表列（K列）を更新しました（' + n + '銘柄・詳細はログ参照）', '酒田五法', 6);
-}
-
-// 並べ替え・強さ評価・保有マーキングまでを行う「メール送信に必要な内容」の確定処理。
-// 信用倍率取得・決算発表列・ハイパーリンク・書式設定などの見た目の仕上げは
-// finalizeSignalsCosmetic_ に分離し、メール送信（scanSignals側）より後で行う。
-// 以前はこれら全てを1関数で行っていたため、全銘柄走査が4.5分の時間バジェットぎりぎりで
-// 終わった日、仕上げ処理まで含めた合計がGASの6分ハード上限を超えて強制終了し、
-// その日の通知メールが一通も送られないまま気づかれない、という実害が起きた。
-function finalizeSignals_(sig) {
-  if (sig.getLastRow() < 2) return 0;
-  const n = sig.getLastRow() - 1;
-
-  // 「傾向が強い順」に並べ替え（8列目=シグナル箇条書き）。重みは静的（SIGNAL_WEIGHT_）。
-  const regime = getMarketRegime_();   // 信用需給の地合い（MarketMacro.js）。買い/売りスコアに反映。
-  const data = sig.getRange(2, 1, n, 9).getValues();
-  // 強さ = 静的重み合計 × 地合い係数（row[6]=方向 買い/売り。地合いで順位が動く）
-  const scoreOf = row => signalStrength_(row[7]) * regimeFactor_(regime, row[6]);
-  data.sort((a, b) => scoreOf(b) - scoreOf(a));
-
-  // 強さ★は絶対しきい値で付与する。以前は相対順位（上位1/3=★★★）だったため、
-  // 全銘柄が弱いシグナルしか出ていない日でも必ず★★★が並び、強さを誤認させていた。
-  const scores = data.map(scoreOf);
-  data.forEach((row, i) => {
-    const s = scores[i];
-    row[1] = s >= SK.STAR3 ? '★★★' : s >= SK.STAR2 ? '★★' : '★';    // 方向(7列目)を矢印付きバッジに整形
-    const d = String(row[6] || '');
-    row[6] = d === '買い' ? '▲ 買い' : d === '売り' ? '▼ 売り' : d === '混在' ? '◆ 混在' : d;
-  });
-  sig.getRange(2, 1, n, 9).setValues(data);
-
-  // 保有銘柄: 保有列に○を立てる（行のハイライトは条件付き書式が○を見て行う）。
-  // sendHeldStockDirectionEmail_ はこの列（r[0]==='○'）で対象行を絞り込むため、
-  // メール送信より前にここで確定させる必要がある。
-  try {
-    const held = getSbiHeldCodes_();
-    const marks = [];
-    for (let i = 0; i < n; i++) {
-      const code = to4_(String(data[i][3] || '').trim()).toUpperCase();
-      marks.push([held.codes.has(code) ? '○' : '']);
-    }
-    sig.getRange(2, 1, n, 1).setValues(marks).setFontColor('#c0392b').setFontWeight('bold');
-    // 未設定・アクセス不可のときは例外を投げないため、ここで明示的に知らせる
-    // （以前は0件のまま静かに終わり、「なぜか保有マークが出ない」原因が分からなかった）。
-    if (held.reason) {
-      Logger.log('保有ハイライトが機能していません: ' + held.reason);
-      SpreadsheetApp.getActive().toast('保有ハイライトが機能していません: ' + held.reason, '酒田五法', 10);
-    }
-  } catch (e) {
-    // 参照元スプレッドシートの権限切れ等で落ちることがある。以前はログのみで、
-    // ハイライトが消えた理由が利用者に伝わらなかった。
-    Logger.log('SBI保有ハイライト失敗: ' + e.message);
-    SpreadsheetApp.getActive().toast('保有銘柄のハイライトを取得できませんでした: ' + e.message, '酒田五法', 8);
-  }
-
-  return n;
-}
-
-// finalizeSignals_ の続き（見た目の仕上げ）。メール送信の後に呼ぶ。
-// ここで6分上限に達して強制終了しても、通知メールは既に送信済みのため実害はない。
-function finalizeSignalsCosmetic_(sig, n) {
-  if (n <= 0) return;
-  const data = sig.getRange(2, 1, n, 9).getValues();   // 並べ替え・保有マーキング確定後の内容を読み直す
-
-  // 信用倍率(合計)を Yahoo Finance Japan から結合（10列目）。点灯銘柄のみ取得。
-  // 取得不可のときは空欄ではなく失敗理由を表示する（Stackdriverを見なくても原因が分かるように）。
-  const marginErrors = {};
-  const marginMap = fetchYahooJpMarginRatios_(data.map(row => row[3]), marginErrors);
-  sig.getRange(2, 10, n, 1).setValues(data.map(row => {
-    const c = to4_(String(row[3] || '').trim());
-    if (marginMap[c] != null) return [marginMap[c]];
-    return [marginErrors[c] || ''];
-  }));
-  sig.setColumnWidth(10, 96);
-  sig.getRange(2, 10, n, 1).setNumberFormat('0.00').setHorizontalAlignment('center').setVerticalAlignment('middle');
-
-  // 決算発表予定（11列目）
-  writeSignalEarningsColumn_(sig, n);
-  sig.setColumnWidth(11, 110);
-  sig.getRange(2, 11, n, 1).setHorizontalAlignment('center').setVerticalAlignment('middle');
-
-  // コード(4列目)を TradingView 日足チャートへのリンク付きテキストにする。
-  // 個人のチャートレイアウトIDはスクリプトプロパティ TRADINGVIEW_LAYOUT_ID で差し替えられる。
-  // 未設定ならレイアウト指定なしの汎用チャートを開く（tvChartUrl_）。
-  //
-  // =HYPERLINK() ではなく RichTextValue のリンクを使う。HYPERLINK だとセルの中身は
-  // 「数式」であって文字列ではなく、"5602" が数値として評価されるため書式しだいで
-  // 5,602 と桁区切り表示になる（実際そうなっていた）。RichTextValue なら
-  // セルの値そのものが文字列 "5602" になり、getValues()・コピー・XLOOKUP のいずれでも
-  // テキストとして扱える。リンクは見た目どおりクリックできる。
-  sig.getRange(2, 4, n, 1).setNumberFormat('@').setRichTextValues(data.map(row => {
-    const code = to4_(String(row[3] || '').trim()).toUpperCase();
-    return [codeLinkRichText_(code)];
-  }));
-
-  // 全体スタイル: 濃紺ヘッダ＋淡色の行帯＋ヘッダ固定
-  styleSheet_(sig, 11, '#141a33', '#eef1fb');
-  autoFit_(sig, 7);                                          // 保有〜方向まで内容にフィット
-  sig.setColumnWidth(8, 210);                                // シグナル（箇条書き・折返し）
-  sig.getRange(2, 8, n, 1).setWrap(true).setVerticalAlignment('top');
-  sig.setColumnWidth(9, 460);                                // 解説（折返し）
-  sig.getRange(2, 9, n, 1).setWrap(true).setVerticalAlignment('top');
-
-  sig.getRange(2, 6, n, 1).setNumberFormat('#,##0');         // 終値カンマ
-  sig.getRange(2, 4, n, 1).setHorizontalAlignment('right');  // コード右寄せ
-  sig.getRange(2, 1, n, 2).setHorizontalAlignment('center').setVerticalAlignment('middle'); // 保有・強さ
-  sig.getRange(2, 7, n, 1).setHorizontalAlignment('center').setVerticalAlignment('middle'); // 方向
-  sig.getRange(2, 2, n, 1).setFontColor('#e8a200').setFontWeight('bold');                    // 強さ=金
-
-  // 明示背景をいったんリセット（売却済み銘柄のハイライトを残さないため）
-  sig.getRange(2, 1, n, 11).setBackground(null);
-
-  // 方向・保有の色分けは条件付き書式で持たせる。
-  // 直接 setBackground で塗ると、利用者がフィルタで並べ替えたときに色だけ元の行位置に
-  // residual として残り、方向と色がずれて見える。条件付き書式なら値に追従する。
-  applySignalFormatRules_(sig, n);
-
-  // フィルタを張り直し（保有=○ で絞り込み可能に）
-  const old = sig.getFilter(); if (old) old.remove();
-  sig.getRange(1, 1, n + 1, 11).createFilter();
-  sig.setTabColor('#e0567a');
-}
-
-// sendTopBuySignalsEmail_ / sendHeldStockDirectionEmail_ 共通の骨格
-// （行フィルタ→件名/本文生成→送信→ログ→アーカイブ）をまとめたヘルパー。
-// finalizeSignals_ が完了した直後に呼ぶ。該当が無い日は送らない
-// （Asset_Status_Notifyのstockドロップ通知と同じ「該当がある時だけ送る」方針）。
-// コード(4列目)は finalizeSignalsCosmetic_ が TradingView へのリンク付きテキストにするが、
-// セルの値は文字列型のままなので（RichTextValue、数式ではない）ここでは素のコード文字列として読める。
-function sendSignalEmail_(sig, opts) {
-  try {
-    if (sig.getLastRow() < 2) return;
-    const n = sig.getLastRow() - 1;
-    const rows = sig.getRange(2, 1, n, 9).getValues();   // 保有〜解説（1〜9列）
-    const matched = rows.filter(opts.filterFn);
-    if (!matched.length) { Logger.log(opts.emptyLogMsg); return; }
-
-    const subject = opts.subjectFn(matched.length);
-    const body = matched.map(opts.rowFn).join('\n');
-
-    sendMail_(subject, body, Session.getActiveUser().getEmail());
-    Logger.log(opts.successLogMsgFn(matched.length));
-    labelAndArchiveSentMail_(subject);
-  } catch (e) {
-    Logger.log(opts.errLogPrefix + 'でエラー: ' + e.message);
-  }
-}
-
-// 強さ★★★・方向「買い」のシグナルだけを抜き出し、簡潔な日次メールで通知する。
-// plans（コード→売買プラン）があれば、ダウ理論ベースの買い・利確・損切りも1行添える。
-function sendTopBuySignalsEmail_(sig, plans) {
-  sendSignalEmail_(sig, {
-    filterFn: isTopBuyRow_,
-    subjectFn: count => `酒田五法_★3買い_${count}件`,
-    // コード_銘柄名_終値_シグナル名（＋売買プラン）
-    rowFn: r => `${r[3]}_${r[4]}_${r[5]}_${String(r[7]).replace(/\n/g, '/')}`
-      + planMailLine_(plans, r[3]),
-    emptyLogMsg: '★★★買いシグナル無し。メール送信スキップ',
-    successLogMsgFn: count => '★★★買いシグナルメールを送信しました（' + count + '件）',
-    errLogPrefix: 'sendTopBuySignalsEmail_',
-  });
-}
+// 旧: 毎時、シグナルシートの保有ハイライトを更新していた。保有株は売買プランに走査時点で載るようになり
+// 不要になった。既存のトリガーが残っていても害がないよう、入口だけ残して何もしない。
+// 「自動実行を設定」をやり直すとトリガー自体も消える。
+function scheduledHeldCheck() { Logger.log('保有チェックは廃止しました（保有株は走査時に売買プランへ載ります）'); }
 
 /**
- * 「売買プラン」シートと同じ数字をメール本文に1行で添える。
- * メールだけ見て発注できるようにするのが目的なので、シートと数字がずれてはいけない。
- * 該当プランが無ければ空文字（行そのものは従来どおり出す）。
+ * 走査が終わったら作業用・旧形式のシートを非表示にする（削除はしない＝いつでも再表示できる）。
+ *  - シグナル … 走査の途中経過（候補）を貯める作業場所
+ *  - パターン成績 … 旧・酒田五法の集計（判定には使っていない）
+ *  - 急落サイン … 「相場マクロ」へ統合済みの古いシート
  */
-function planMailLine_(plans, code) {
-  const p = plans && plans[to4_(String(code || '').trim()).toUpperCase()];
-  if (!p) return '';
-  // 保有株に「見送り」は無い（持っている以上、見送るという選択肢が無い）。
-  if (!p.ok) return '\n  └ 売買プラン: ' + (p.held ? '算出不可' : '見送り') + '（' + p.reason + '）';
-  // 保有中の銘柄には新規の買値が無い（返済売の2値だけを出す）。
-  // 空の買値を書くと、いくらで買えばいいのか分からないメールになる。
-  const entry = p.held ? '保有中' : (p.entryType + '買 ' + fmtNum_(p.entry));
-  // 保有株はトレンドが崩れた時点で、押し安値割れを待たずに手仕舞いを検討してほしい
-  // （シートの警告ハイライトと同じ判断材料を、メールだけ見ても分かるようにする）。
-  const trendWarn = (p.held && p.trend !== '上昇') ? ' ／トレンド崩れ・早期手仕舞い検討' : '';
-  return '\n  └ ' + entry
-    + ' / 利確 ' + fmtNum_(p.target) + ' / 損切 ' + fmtNum_(p.stop)
-    + (p.shares ? ' / ' + fmtNum_(p.shares) + '株 / 損切り額 ' + fmtNum_(p.lossYen) + '円' : '')
-    + trendWarn;
-}
-
-// 保有銘柄のうち、今回のシグナル一覧に載った銘柄の方向をすべて通知する（★の絞り込みなし）。
-// 保有株のプランは返済売の2値（利確・損切り）なので、シグナルが出た日に置き直せる。
-// 保有マーク自体が機能していないと該当0件になる点に注意（getSbiHeldCodes_のreasonで原因が分かる）。
-function sendHeldStockDirectionEmail_(sig, plans) {
-  sendSignalEmail_(sig, {
-    filterFn: r => r[0] === '○',
-    subjectFn: count => `酒田五法_保有銘柄シグナル_${count}件`,
-    // コード_銘柄名_方向_シグナル名（＋売買プラン＝いま置くべき利確・損切り）
-    rowFn: r => `${r[3]}_${r[4]}_${String(r[6]).trim()}_${String(r[7]).replace(/\n/g, '/')}`
-      + planMailLine_(plans, r[3]),
-    emptyLogMsg: '保有銘柄のシグナル無し。メール送信スキップ',
-    successLogMsgFn: count => '保有銘柄シグナルメールを送信しました（' + count + '件）',
-    errLogPrefix: 'sendHeldStockDirectionEmail_',
+function hideWorkSheets_() {
+  const ss = SpreadsheetApp.getActive();
+  [SK.SHEETS.SIGNALS, SK.SHEETS.STATS, '急落サイン'].forEach(name => {
+    const sh = ss.getSheetByName(name);
+    try { if (sh && !sh.isSheetHidden()) sh.hideSheet(); } catch (e) { /* 表示中のシートが1枚だけ等。実害なし */ }
   });
 }
 
-// 酒田五法の通知メール（★3買い・保有銘柄シグナル）に付けるラベル。
+// 通知メール（買い推奨・保有株の警告）に付けるラベル。
 // 受信トレイに残さず、後で累計損益を振り返るときにこのラベルで一覧できるようにする。
 const SAKATA_PROFIT_LABEL_ = '利益累計';
 
 /**
- * 直前に送った酒田五法の通知メールへ SAKATA_PROFIT_LABEL_ を付けて受信トレイからアーカイブする。
+ * 直前に送った通知メールへ SAKATA_PROFIT_LABEL_ を付けて受信トレイからアーカイブする。
  * 送信直後（sendMail_ の直後）に呼ぶ想定。件名でスレッドを特定するため、
  * 送信からラベル付けまでの間にGmail側の検索インデックスが追いつくよう少し待つ。
  * ここで失敗してもメール送信自体は既に成功しているので、ログに残すだけで通知は止めない。
@@ -727,34 +526,68 @@ function labelAndArchiveSentMail_(subject) {
     threads.forEach(t => { t.addLabel(label); t.moveToArchive(); });
     if (threads.length) Logger.log(`「${SAKATA_PROFIT_LABEL_}」ラベルを付けてアーカイブしました（${threads.length}スレッド）`);
   } catch (e) {
-    // GmailAppは新しい権限（gmail.modify相当）を要求するため、pushだけしてまだ再認証していない
-    // 場合はここで例外になる。その場合もメール本体は届いているので実害は無い。
-    Logger.log('酒田五法メールのラベル付け/アーカイブに失敗（メール送信自体は成功しています）: ' + e.message);
+    Logger.log('通知メールのラベル付け/アーカイブに失敗（メール送信自体は成功しています）: ' + e.message);
   }
 }
 
-/**
- * シグナルシートの色分けを条件付き書式で設定する（値に追従するので並べ替えに強い）。
- * 方向列: 買い=緑 / 売り=赤 / 混在=橙、保有行: 淡赤。
- */
-function applySignalFormatRules_(sig, n) {
-  const dir = sig.getRange(2, 7, n, 1);
-  const all = sig.getRange(2, 1, n, 11);
-  const textRule = (range, text, bg, fc) =>
-    SpreadsheetApp.newConditionalFormatRule()
-      .whenTextContains(text).setBackground(bg).setFontColor(fc).setBold(true)
-      .setRanges([range]).build();
-  // 保有行は A列が「○」かどうかで行全体を塗る（$A で列を固定した数式）
-  const heldRule = SpreadsheetApp.newConditionalFormatRule()
-    .whenFormulaSatisfied('=$A2="○"').setBackground('#fbe3e3')
-    .setRanges([all]).build();
+// 件名・本文を作って送る。該当が無い日は送らない（Asset_Status_Notify と同じ方針）。
+function sendPlanMail_(subject, lines) {
+  if (!lines.length) return;
+  try {
+    sendMail_(subject, lines.join('\n'), Session.getActiveUser().getEmail());
+    Logger.log('メール送信: ' + subject);
+    labelAndArchiveSentMail_(subject);
+  } catch (e) {
+    Logger.log('メール送信に失敗（' + subject + '）: ' + e.message);
+  }
+}
 
-  sig.setConditionalFormatRules([
-    heldRule,   // 先に行全体、あとから方向セルが上書きする
-    textRule(dir, '買い', '#e3f5ea', '#1b7a3d'),
-    textRule(dir, '売り', '#fce4e4', '#c0392b'),
-    textRule(dir, '混在', '#fff3da', '#b8860b'),
-  ]);
+// 買い推奨（最大5件）。メールだけ見て発注できるよう「売買プラン」シートと同じ数字を載せる。
+function sendBuyPicksEmail_(targets, plans) {
+  const picks = (targets || []).filter(t => t.pick);
+  const a = picks.filter(t => t.grade === 'A').length;
+  if (!picks.length) return;
+  sendPlanMail_(`${APP_NAME_}_買い推奨_${picks.length}件（確度A ${a}件）`, [
+    '翌営業日の寄付で買い、利確・損切りをOCOで置く前提の数字です。',
+    '寄付が損切り以下／利確以上で始まったら見送ってください。',
+    '',
+  ].concat(...picks.map(t => [
+    `【確度${t.grade}】${t.code} ${t.name}`,
+    `  根拠: ${t.reason}` + planMailLine_(plans, t.code),
+    ...(t.extra || []).map(x => '  ' + x),
+    '',
+  ])).concat(['確度A=押し38.2%以上かつ出来高1.5倍以上（過去10年で基準を上回った型）／確度B=条件の一部のみ',
+              '※投資助言ではありません。詳細は「売買プラン」シート']));
+}
+
+// 保有株のうち、ダウ理論の上昇トレンドが崩れたもの（押し安値割れを待たず手仕舞いを検討）。
+function sendHeldWarningEmail_(targets, plans) {
+  const warn = (targets || []).filter(t => t.kind === '保有').filter(t => {
+    const p = plans[t.code];
+    return p && p.ok && p.trend !== '上昇';
+  });
+  if (!warn.length) return;
+  sendPlanMail_(`${APP_NAME_}_保有株トレンド崩れ_${warn.length}件`,
+    ['高値・安値の切り上げが崩れた保有株です。押し安値割れを待たず手仕舞いも検討してください。', '']
+      .concat(warn.map(t => `${t.code} ${t.name}` + planMailLine_(plans, t.code))));
+}
+
+/**
+ * 「売買プラン」シートと同じ数字をメール本文に1行で添える。
+ * 該当プランが無ければ空文字（行そのものは出す）。
+ */
+function planMailLine_(plans, code) {
+  const p = plans && plans[to4_(String(code || '').trim()).toUpperCase()];
+  if (!p) return '';
+  // 保有株に「見送り」は無い（持っている以上、見送るという選択肢が無い）。
+  if (!p.ok) return '\n  └ ' + (p.held ? '算出不可' : '見送り') + '（' + p.reason + '）';
+  // 保有中の銘柄には新規の買値が無い（返済売の2値だけを出す）。
+  const entry = p.held ? '保有中' : ('翌朝寄付で買い（目安 ' + fmtNum_(p.entry) + '）');
+  const trendWarn = (p.held && p.trend !== '上昇') ? ' ／トレンド崩れ・早期手仕舞い検討' : '';
+  return '\n  └ ' + entry
+    + ' / 利確 ' + fmtNum_(p.target) + ' / 損切 ' + fmtNum_(p.stop)
+    + (p.shares ? ' / ' + fmtNum_(p.shares) + '株 / 損切り額 ' + fmtNum_(p.lossYen) + '円' : '')
+    + trendWarn;
 }
 
 // SBI証券の保有銘柄コードを参照元スプレッドシート（Asset_Status）から収集する。
@@ -1395,152 +1228,72 @@ function detectHeadShoulders_(bars, rsi) {
 function createUsageSheet() {
   // [テキスト, 種別]  種別: title / h(見出し) / p(本文) / note
   const rows = [
-    ['酒田五法 シグナル・スクリーナー　使い方', 'title'],
+    ['短期売買支援　使い方', 'title'],
     ['', 'p'],
     ['■ これは何？', 'h'],
-    ['株価API（Yahoo日足）から多銘柄をスキャンし、酒田五法のシグナルが点灯した銘柄を一覧化します。投資助言ではありません。', 'p'],
+    ['プライム全銘柄の日足を毎営業日の引け後に調べ、ダウ理論の上昇トレンドの押し目が', 'p'],
+    ['フィボナッチの押し幅で止まって反転した銘柄を、1日最大5件の「買い推奨」として出します。', 'p'],
+    ['見るのは「売買プラン」シート1枚だけです（買い推奨＋保有株）。投資助言ではありません。', 'note'],
     ['', 'p'],
-    ['■ 使い方', 'h'],
-    ['1. セットアップ（シート作成）', 'p'],
-    ['2. 「銘柄」シートにコード(4桁)を入力。または「プライム銘柄を取得（J-Quants）」で自動取得', 'p'],
-    ['   ※J-Quants取得を使う場合はスクリプトプロパティ JQUANTS_API_KEY が必要', 'p'],
-    ['3. 「シグナル走査/続行」を実行（銘柄数が多いと時間分割で自動再開）', 'p'],
-    ['4. 「シグナル」シートに結果（傾向が強い順に並ぶ）', 'p'],
-    ['   ・保有列 … SBI保有銘柄は○＋淡赤ハイライト。ヘッダのフィルタで「○」を選ぶと保有だけ表示', 'p'],
-    ['   ・強さ列 … 点灯パターンの重み合計×地合い係数を、絶対しきい値で★★★/★★/★に分類', 'p'],
-    ['     パターンの重み(1〜3)は実データで検証済み（詳細は「■ パターンの重みの決め方」）', 'p'],
-    ['     （相対順位ではないので、弱いシグナルしか出ていない日は★★★が0件になります）', 'p'],
-    ['   ・方向列 … ▲買い(緑)/▼売り(赤)/◆混在(橙)。コードはTradingViewチャートへのリンク', 'p'],
-    ['   ・K1セル … 走査の進捗と最終更新時刻を表示（走査中／完了・取得失敗件数）', 'p'],
-    ['5. 走査完了時に「売買プラン」シートが自動生成されます（★3買い＋保有株）', 'p'],
+    ['■ 買い推奨の条件（すべて満たしたもの）', 'h'],
+    ['① 主要トレンドが上昇 … 大きな山谷（左右10日で確定）で安値が切り上がり、直近の上昇で高値を更新', 'p'],
+    ['② 押しの深さ … 直近の上昇幅に対する押しが 23.6%〜78.6%（フィボナッチ）。78.6%超はトレンド否定に近い', 'p'],
+    ['③ 押しの終わり … 押しの途中にできた小さな戻り高値を、当日の終値で初めて上抜けた', 'p'],
+    ['④ 売買代金 … 直近20日の中央値が5,000万円以上（薄商いは除外）', 'p'],
+    ['確度A … さらに「押し38.2%以上」かつ「当日の出来高が20日平均の1.5倍以上」のもの', 'p'],
+    ['   （ダウ理論「出来高はトレンドを確認する」）。確度Aを先に、残りを出来高の多い順に最大5件。', 'p'],
     ['', 'p'],
-    ['■ 「売買プラン」シート（ダウ理論の買い・利確・損切り）', 'h'],
-    ['日々これ1枚を見れば発注できるように、今日さわる銘柄だけを並べたシートです。', 'p'],
-    ['・区分「★3買い」（緑）… これから建てる銘柄。買い・利確・損切りと株数を出します', 'p'],
-    ['・区分「保有」（橙）… いま持っている全銘柄。買値と株数は実際の建玉で、', 'p'],
-    ['   これから置くべき返済売の2値（利確・損切り）を計算します', 'p'],
-    ['   ※保有銘柄はシグナルが点灯していなくても載ります（損切りの置き直しのため）', 'p'],
-    ['価格の見出しに付いている OCO1/OCO2 は、SBI証券アプリの注文画面の欄名です。', 'p'],
-    ['・損切り（OCO2）… 押し安値の1ティック下。ここを割ると上昇トレンドが否定されるため', 'p'],
-    ['・買い（価格）… 上昇トレンド継続中なら現値の指値。転換がまだ確定していなければ、', 'p'],
-    ['   直近の戻り高値を上抜けた逆指値（＝ダウ理論で転換が確定する水準）。保有行は建値', 'p'],
-    ['・利確（OCO1）… 買い＋損切り幅×2.0（ダウ理論に利確の水準は無いため固定比率）', 'p'],
-    ['・株数 … ★3買いは許容損失（既定3万円）に収まる最大株数を100株単位で。建玉上限は既定100万円', 'p'],
-    ['   ※許容損失と建玉上限はスクリプトプロパティ SAKATA_RISK_BUDGET_YEN / SAKATA_MAX_POSITION_YEN で変更', 'p'],
-    ['・損切り額 … その損切りに当たったときに失う金額。保有行は現在値からの下落分', 'p'],
-    ['・メモ列が「見送り」「算出不可」の行（淡赤）は発注しないでください。理由も同じ列に出ます', 'p'],
-    ['   （価格欄には算出できた水準を参考として出しますが、株数が無いので発注はできません）', 'p'],
-    ['・保有行でメモが「トレンド崩れ」（橙）… 高値・安値の切り上げが揃わなくなった状態です。', 'p'],
-    ['   損切り価格自体は動かしませんが、押し安値割れを待たずに早期の手仕舞いも検討してください', 'p'],
-    ['・メニュー「売買プランを作成/更新」で、走査をやり直さずにプランだけ引き直せます', 'p'],
-    ['   （許容損失額を変えたときや、保有銘柄を入れ替えたとき）', 'p'],
-    ['・メニュー「AI推奨コメントを生成」で、メモ列をGeminiによる参考コメントに書き換えます。', 'p'],
-    ['   トレンド崩れ警告や注文根拠などの事実は消さず、地合い・決算近接などの文脈を足します。', 'p'],
-    ['   スクリプトプロパティ GEMINI_API_KEY が必要です。自動実行はしません（手動メニューのみ）。', 'p'],
-    ['※これは統計的な重み決定（SIGNAL_WEIGHT_）とは別物で、投資助言ではありません。', 'note'],
-    ['   Geminiに計算済みの結果を渡して解釈・要約させているだけです。最終判断はご自身で。', 'p'],
+    ['■ どのくらい当たるのか（過去10年・約1,200銘柄で検証）', 'h'],
+    ['比較の基準は「同じ日に全銘柄を買って20営業日持った平均」です（相場全体の上げ下げを差し引くため）。', 'p'],
+    ['・確度A … 基準より +0.4%（2016〜2021年）／ +1.8%（2022年〜）。10年中7年で基準を上回った', 'p'],
+    ['   損切り・利確つきの成績は 勝率44〜48%・1回平均 +0.8%〜+2.6%（損益比が大きく、勝率5割未満でも残る型）', 'p'],
+    ['・確度B … 基準とほぼ同じ（2016〜2021年は下回った）。5件に満たない日の穴埋めと考えてください', 'p'],
+    ['・旧・酒田五法の★3買い … 基準より −0.4%〜−0.5%（両期間とも下回っていたため作り直しました）', 'p'],
+    ['確度Aは平均すると1日0.5件（週2〜3件）です。出ない日もあります。', 'note'],
+    ['※過去の成績は将来を保証しません。現在の上場銘柄だけで検証しているため、やや甘めに出ます。', 'note'],
     ['', 'p'],
-    ['■ 通知メール', 'h'],
-    ['走査完了時に2通のメールを自動送信します（該当が無い日は送りません）。', 'p'],
-    ['・酒田五法_★3買い_N件 … ★★★かつ買いのシグナル', 'p'],
-    ['・酒田五法_保有銘柄シグナル_N件 … 保有銘柄に出たシグナル（方向を問わず）', 'p'],
-    ['どちらも各銘柄の下に売買プラン（買い・利確・損切り・株数・損切り額）が1行付きます。', 'p'],
-    ['メールだけ見て発注できるように、「売買プラン」シートと同じ数字を載せています。', 'p'],
+    ['■ 「売買プラン」シート', 'h'],
+    ['・区分「買い推奨A／B」… これから建てる銘柄。翌営業日の寄付で買い、利確と損切りをOCOで置きます', 'p'],
+    ['   寄付が損切り以下、または利確以上で始まったら見送ってください（検証もそうしています）', 'p'],
+    ['・区分「保有」… いま持っている全銘柄。これから置くべき返済売の2値（利確・損切り）を出します', 'p'],
+    ['・損切り（OCO2）… 押し目の安値の少し下。割れたら安値切り上げが崩れる＝ダウ理論の否定', 'p'],
+    ['・利確（OCO1）… 押し安値＋上昇幅×1.618（フィボナッチ・エクステンション）', 'p'],
+    ['   どちらにも届かなければ40営業日で手仕舞い（検証の前提）', 'p'],
+    ['・株数 … 損切りに当たったときの損失が許容額（既定3万円）に収まる最大株数。建玉上限は既定100万円', 'p'],
+    ['   ※スクリプトプロパティ SAKATA_RISK_BUDGET_YEN / SAKATA_MAX_POSITION_YEN で変更できます', 'p'],
+    ['・根拠 … 押しの深さと出来高倍率。メモには決算予定とBloombergの関連記事（あれば）も添えます', 'p'],
+    ['・メモが「見送り」「算出不可」の行（淡赤）は発注しないでください。理由も同じ列に出ます', 'p'],
+    ['・保有行でメモが「トレンド崩れ」（橙）… 押し安値割れを待たずに早期の手仕舞いも検討してください', 'p'],
+    ['・コードを押すとTradingViewの日足チャートが開きます', 'p'],
+    ['', 'p'],
+    ['■ 通知メール（該当がある日だけ）', 'h'],
+    ['・短期売買支援_買い推奨_N件 … 売買プランと同じ数字（買い・利確・損切り・株数）を載せます', 'p'],
+    ['・短期売買支援_保有株トレンド崩れ_N件 … 上昇トレンドが崩れた保有株', 'p'],
     ['送信後は「利益累計」ラベルを付けて受信トレイからアーカイブします。', 'p'],
-    ['   （後で損益を振り返るときに、このラベルで一覧できるようにするため）', 'p'],
-    ['ここに出る価格は「シグナルの前提が崩れる水準」であって、値上がりの保証ではありません。', 'note'],
     ['', 'p'],
-    ['■ 「相場マクロ」シート（地合いの入力＋急落サイン判定）', 'h'],
-    ['上段（1〜6行目）が急落サインの判定材料を入れる手入力欄です。B列が値、C列が最終更新日です。', 'p'],
-    ['・東証 売残／信用倍率 … JPXの信用取引現在高ファイル(mtseisan*.xls)から自動取込', 'p'],
-    ['   ※JPXのサイトからDLした mtseisan*.xls を、このスプレッドシートと同じGoogleドライブに置いてください', 'p'],
-    ['   （JPXはボットからの直接ダウンロードを拒否するため、ファイルの入手だけは手作業になります）', 'p'],
-    ['・日経EPS／海外投資家／好決算sell-on-news … 自動取得を試み、取れないときは手入力', 'p'],
-    ['・C列の最終更新日が10日以上前、または空欄だと「更新が古い」と警告します', 'p'],
-    ['   値だけ見ていると更新忘れに気づけず、古い需給のまま判定してしまうためです', 'p'],
-    ['下段（8行目〜）が急落サインの判定結果です。相場全体の急落リスクを7つの条件で判定し、', 'p'],
-    ['点灯数をN/7で表示します（2026-08-21、旧「急落サイン」シートをここへ統合しました）。', 'p'],
-    ['目安 … 2件以下=落ち着いている / 3〜4件=注意 / 5件以上=警戒領域', 'p'],
-    ['・信用倍率は「1.0倍以上か」ではなく「前回公表からどちらへ動いたか」で見ます', 'p'],
-    ['   基準にしている日経レバ1570の倍率は10倍前後で、1.0を割る前提が今の市場では成立せず、', 'p'],
-    ['   水準で判定すると条件が永久に点灯して地合いが片側に固定されてしまうためです', 'p'],
-    ['判定結果は個別シグナルの強さ(★)にも反映されます（追い風の方向を1.5倍。逆風側は減点しません）。', 'p'],
+    ['■ ほかのシート・連動', 'h'],
+    ['・投資デイリー分析 … 同じ買い推奨を「日本株_買い推奨」シートに書き込みます', 'p'],
+    ['   （書き込み先はドライブ上の「投資デイリー分析」を自動で探します。名前が重複するときは', 'p'],
+    ['    スクリプトプロパティ MARKET_BRIEFING_SS_ID にスプレッドシートIDを入れてください）', 'p'],
+    ['・Bloomberg … Gmailに届く朝のニュースレター（直近3日）に推奨・保有銘柄の社名があれば、メモに見出しを添えます', 'p'],
+    ['   最新号の5本は投資デイリー分析の「ニュース_Bloomberg」シートにも書き出します（毎朝7時半・走査完了時）', 'p'],
+    ['   推奨の判定そのものには使っていません（ニュースは過去に遡って検証できないため）', 'p'],
+    ['・相場マクロ … 地合いの参考表示（手入力＋自動取得）。推奨の判定には使っていません', 'p'],
+    ['   （日経平均のトレンドで絞っても成績が変わらなかったため）', 'p'],
+    ['・決算カレンダー … 14日先までの決算発表予定（edinetdb.jp、EDINETDB_API_KEY が必要）', 'p'],
+    ['・「シグナル」「パターン成績」… 走査の作業用と旧集計。走査後は自動で非表示になります', 'p'],
     ['', 'p'],
-    ['■ 「パターン成績」シート（参考値）', 'h'],
-    ['メニュー「パターン成績を集計」で、過去6ヶ月の全銘柄を対象に', 'p'],
-    ['各パターンが「発生後にどれだけ騰落したか」を集計します。', 'p'],
-    ['評価は時間軸別 … 短期系は3営業日後、中期系(三山/三川/三法)は20営業日後の騰落率で判定。', 'p'],
-    ['※この集計はシグナルの順位付けには使っていません（あくまで傾向を眺めるための参考値）。', 'note'],
-    ['   生の騰落率のみでベンチマークを控除しておらず、上昇相場では買いパターンが軒並み', 'p'],
-    ['   高勝率と出ます。また件数20件では勝率60%と50%を統計的に区別できません。', 'p'],
-    ['', 'p'],
-    ['■ パターンの重みの決め方（★の元になる数字）', 'h'],
-    ['各パターンの重み(1〜3)は、過去6ヶ月・約1200銘柄の実データで検証して決めています。', 'p'],
-    ['比較の基準は「勝率50%」ではなく「シグナル無しで同じ売買をした場合の勝率」です。', 'p'],
-    ['   実測すると、日経平均を差し引いた後でも 3日後で買い42.5%／売り57.5% になります。', 'p'],
-    ['   日経平均は値がさ株に偏った指数のため、個別株の中央値はこれに負けやすいからです。', 'p'],
-    ['   50%と比べると「売りは何でも当たる」と読めてしまい、指数の作りをパターンの実力と', 'p'],
-    ['   取り違えます（実際、その誤りだと★★★が4倍に増えてしまいました）。', 'p'],
-    ['重みを動かすのは、次の3つを全て満たしたパターンだけです。', 'p'],
-    ['   ①30件以上ある  ②信頼区間が基準線を外れる  ③基準線との差が5ポイント以上', 'p'],
-    ['   ③が要るのは、件数が数千あると1〜2ポイントの差でも②を通ってしまうためです。', 'p'],
-    ['   「統計的に検出できる差」と「実務で意味のある差」は別物として扱っています。', 'p'],
-    ['条件を満たさなかったパターンは、従来どおり形の強弱で決めた値のままにしてあります。', 'p'],
-    ['再計算は開発者向けコマンド npm run calc-weights で、いつでもやり直せます。', 'p'],
-    ['   目安は月次〜四半期に1回（基準線が相場付きで変わり得るため）。自動実行はしません。', 'p'],
-    ['※これは「過去6ヶ月のこの相場で」の話です。相場付きが変われば結果も変わります。', 'note'],
-    ['', 'p'],
-    ['■ メニューの構成', 'h'],
-    ['メニュー「酒田五法」の一番上は、日常的に押す2つだけにしてあります。', 'p'],
-    ['・シグナル走査/続行 … 全銘柄を走査して「シグナル」「売買プラン」を作り直します', 'p'],
-    ['・売買プランを作成/更新 … 走査はやり直さず、プランだけ引き直します', 'p'],
-    ['残りは2つのサブメニューに畳んであります。', 'p'],
-    ['・「個別に更新」… 相場マクロ／決算カレンダー／決算発表列／AI推奨／パターン成績', 'p'],
-    ['・「設定とメンテナンス」… セットアップ／銘柄取得／自動実行の設定／使い方シート／後片付け', 'p'],
-    ['※平日18時の走査トリガーが動いていれば、上の2つも普段は押す必要がありません。', 'note'],
-    ['', 'p'],
-    ['■ 自動実行（トリガー）', 'h'],
-    ['メニュー「設定とメンテナンス」→「自動実行を設定」で以下の3つを設定します。', 'p'],
-    ['① 相場マクロ更新 … 毎日17時、地合いと急落サインを更新（走査の前に走らせる）', 'p'],
-    ['② 全銘柄走査 … 平日18時に1回、全銘柄の株価を取得して酒田五法シグナルを走査（重い処理）', 'p'],
-    ['③ 購入ポートフォリオ確認 … 毎時、SBI保有銘柄をシグナルシート上で最新のハイライトに更新（株価取得はしない）', 'p'],
-    ['   ※いずれも休場日（土日祝・年末年始）はスキップします', 'p'],
-    ['   ※パターン成績の集計は自動実行しません（必要なときにメニューから実行）', 'p'],
-    ['', 'p'],
-    ['■ 検出する酒田五法', 'h'],
-    ['赤三兵 … 陽線3本の切り上げ（買い）', 'p'],
-    ['三羽烏(黒三兵) … 陰線3本の切り下げ（売り）', 'p'],
-    ['三空踏み上げ … 上の窓が3連続＝買われ過ぎ（売り）', 'p'],
-    ['三空叩き込み … 下の窓が3連続＝売られ過ぎ（買い）', 'p'],
-    ['上げ三法 … 長陽→値幅内の調整→上抜け陽線（買い・上昇継続）', 'p'],
-    ['下げ三法 … 長陰→値幅内の調整→下抜け陰線（売り・下落継続）', 'p'],
-    ['三山(三尊天井) … 中央が最高の3山でネックライン割れ（売り）', 'p'],
-    ['三山(三点天井) … 頭が突出せず3山ほぼ同値でネックライン割れ（売り）', 'p'],
-    ['三川(逆三尊) … 中央が最安の3谷でネックライン上抜け（買い）', 'p'],
-    ['明けの明星 … 長大陰線→窓開けの星→陽線で中心回復（買い・底の転換）', 'p'],
-    ['宵の明星 … 長大陽線→窓開けの星→陰線で中心割れ（売り・天井の転換）', 'p'],
-    ['捨て子線 … 中央が同事線で両側に窓＝より強い反転（明け=買い/宵=売り）', 'p'],
-    ['先詰まり赤三兵 … 赤三兵だが3本目失速・上ヒゲ長＝買われ過ぎ警戒（売り）', 'p'],
-    ['上放れ二羽烏 … 上昇中に窓開け陰線2本、2本目が1本目を包む（売り）', 'p'],
-    ['', 'p'],
-    ['■ 三川系の2本足 反転パターン', 'h'],
-    ['かぶせ線 … 大陽線の翌日、上放れも前日実体中心より下で引ける陰線（売り）', 'p'],
-    ['切り込み線 … 大陰線の翌日、下放れも前日実体中心より上で引ける陽線（買い）', 'p'],
-    ['包み線(抱き線) … 当日の実体が前日の実体を包む（強気=買い/弱気=売り）', 'p'],
-    ['はらみ線 … 当日の小実体が前日の大実体に収まる（強気=買い/弱気=売り）', 'p'],
-    ['毛抜き天井/底 … 高値/安値がほぼ同値で2本並ぶ（天井=売り/底=買い）', 'p'],
-    ['', 'p'],
-    ['■ 注意', 'h'],
-    ['・シグナルは補助情報です。だましもあります。必ず自身で確認してください。', 'note'],
-    ['・★は「形の強さ」であって期待収益ではありません。', 'note'],
-    ['・損切り・利確・株数は★3買いと保有株だけ「売買プラン」シートで出します。', 'note'],
-    ['   それ以外の銘柄と、銘柄分散・総リスク量の管理はこのツールの対象外です。', 'note'],
-    ['・株価は分割・配当調整済み。売買代金が細い銘柄（直近20日の中央値5,000万円未満）は対象外です。', 'p'],
+    ['■ 自動実行', 'h'],
+    ['メニュー「設定とメンテナンス」→「自動実行を設定」で設定します（休場日はスキップ）。', 'p'],
+    ['・Bloombergニュース … 毎日7時半（朝6時ごろ届くニュースレターを投資デイリー分析へ）', 'p'],
+    ['・相場マクロ・決算カレンダー … 毎日17時', 'p'],
+    ['・全銘柄の走査 … 平日18時（引け後の確定値で判定。6分制限のため自動で分割・再開します）', 'p'],
     ['', 'p'],
     ['■ 用語', 'h'],
-    ['J-Quants … 日本取引所グループ系のマーケットデータ配信サービス。プライム銘柄一覧や', 'p'],
-    ['   海外投資家の売買動向の取得に使います。利用にはAPIキーの登録が必要です。', 'p'],
-    ['スクリプトプロパティ … Apps Scriptに秘密の設定値（APIキー等）を保存する場所。', 'p'],
+    ['ダウ理論 … 高値と安値がそろって切り上がっていれば上昇トレンド、とみなす考え方。', 'p'],
+    ['   トレンドは転換のはっきりした合図が出るまで続く、とします。', 'p'],
+    ['フィボナッチ … 上昇幅に対する押しの深さを 23.6%・38.2%・61.8%・78.6% などの比率で測る方法。', 'p'],
+    ['スクリプトプロパティ … Apps Scriptに設定値（APIキー等）を保存する場所。', 'p'],
     ['   Apps Scriptエディタ → 左の歯車（プロジェクトの設定） → スクリプト プロパティ から設定します。', 'p'],
   ];
 
@@ -1711,7 +1464,7 @@ function backtestWeightsRun_() {
   if (!cursor || !acc) {
     cursor = 0;
     acc = {};   // name -> [n, wins, retSum]
-    ss.toast('パターン成績の集計を開始（自動再開で完走します）', '酒田五法', 5);
+    ss.toast('パターン成績の集計を開始（自動再開で完走します）', APP_NAME_, 5);
   }
 
   const start = Date.now();
@@ -1757,7 +1510,7 @@ function backtestWeightsRun_() {
   if (cursor < total) {
     ScriptApp.newTrigger('backtestWeights').timeBased().after(90 * 1000).create();
     Logger.log('成績集計 一時停止: ' + cursor + '/' + total + '銘柄。90秒後に自動再開。');
-    ss.toast('成績集計 ' + cursor + '/' + total + '銘柄。自動再開します', '酒田五法', 8);
+    ss.toast('成績集計 ' + cursor + '/' + total + '銘柄。自動再開します', APP_NAME_, 8);
   } else {
     const map = {};
     Object.keys(acc).forEach(name => {
@@ -1768,7 +1521,7 @@ function backtestWeightsRun_() {
     props.deleteProperty('BT_CURSOR'); props.deleteProperty('BT_ACC');
     props.deleteProperty('BT_QUEUE');   // 旧方式の残骸があれば掃除
     Logger.log('成績集計 完了: ' + Object.keys(map).length + 'パターン（参考値。順位付けには未使用）');
-    ss.toast('パターン成績を更新しました（参考値・順位には未使用）', '酒田五法', 8);
+    ss.toast('パターン成績を更新しました（参考値・順位には未使用）', APP_NAME_, 8);
   }
 }
 
@@ -1787,14 +1540,13 @@ function scheduledBacktest() {
 // ============================================================================
 //  売買プラン（ダウ理論ベースの 買い / 利確 / 損切り）
 //  ---------------------------------------------------------------------------
-//  ★★★かつ方向「買い」のシグナルと、いま保有している全銘柄を対象に、
-//  ダウ理論の押し安値・戻り高値から 買い・利確・損切り の3価格と株数を出し、
+//  買い推奨（DowFib.js、最大5件）と、いま保有している全銘柄を
 //  「売買プラン」シート1枚に並べる。価格の見出しには対応するSBI注文画面の欄名
 //  （OCO1/OCO2）を添えてあるので、画面を見ながらそのまま転記できる。
 //
-//  ★3買い … これから建てる銘柄。買い・利確・損切りと、許容損失から逆算した株数。
-//  保有   … すでに建っている銘柄。買値と株数は実際の建玉を出し、
-//           これから置くべき返済売の2値（利確・損切り）を計算する。
+//  買い推奨 … これから建てる銘柄。値は dfOrderPlan_（DowFib.js）が出す。
+//  保有     … すでに建っている銘柄。以下の buildOrderPlan_ で、
+//             これから置くべき返済売の2値（利確・損切り）を計算する。
 //
 //  なぜダウ理論か:
 //    ダウ理論では上昇トレンドを「高値切り上げ・安値切り上げ」で定義し、
@@ -2048,20 +1800,16 @@ function buildOrderPlan_(bars, cfg, pos) {
 }
 
 // ---------------------------------------------------------------------------
-//  シート出力（★3買い＋保有株の1枚）
+//  シート出力（買い推奨＋保有株の1枚）
 // ---------------------------------------------------------------------------
 
 // 「売買プラン」シートの列。日々これ1枚を見れば発注できる粒度に絞る。
 // 価格3つの見出しには対応するSBI注文画面の欄名を添える（転記先を迷わないため）。
+// 11列目（メモ）は AiRecommend.js が書き換える列なので、列の並びは変えないこと。
 const PLAN_HEADERS_ = [
   '区分', 'コード', '銘柄名', '現在値', '株数',
-  '買い(価格)', '利確(OCO1)', '損切り(OCO2)', '損切り額', 'シグナル', 'メモ',
+  '買い(価格)', '利確(OCO1)', '損切り(OCO2)', '損切り額', '根拠', 'メモ',
 ];
-
-// ★★★かつ買いの行か（シグナルシートの1〜9列を受け取る）。メールと売買プランで同じ条件を使う。
-function isTopBuyRow_(r) {
-  return r[1] === '★★★' && String(r[6]).indexOf('買い') !== -1;
-}
 
 /**
  * コードを「TradingViewへのリンクが張られた文字列セル」にする RichTextValue を作る。
@@ -2090,88 +1838,97 @@ function fmtNum_(v) {
   return Number(v).toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
 
-// シグナル列（「・赤三兵\n・切り込み線」）を1行の読み物に。
-function signalText_(cell) {
-  return String(cell || '').replace(/・/g, '').replace(/\n/g, ' / ');
-}
-
 /**
- * 売買プランの対象を組み立てる。★3買いが先、保有株が後。
+ * 売買プランの対象を組み立てる。買い推奨（最大5件）が先、保有株が後。
  *
- * 同じ銘柄が両方に該当したら「保有」1行にまとめる。すでに持っている銘柄で
+ * 保有中の銘柄は買い推奨から外し「保有」1行にまとめる。すでに持っている銘柄で
  * まずやることは新規建てではなく返済売の置き直しなので、買いプランを併記すると
  * どちらを実行すべきか迷う。買い増し候補であることはメモに残す。
  */
-function planTargets_(rows, held) {
+function planTargets_(cands, held) {
   const codes = held && held.codes ? held.codes : new Set();
   const positions = (held && held.positions) || {};
   const byCode = {};
-  rows.forEach(r => { byCode[to4_(String(r[3] || '').trim()).toUpperCase()] = r; });
+  cands.forEach(c => { byCode[c.code] = c; });
 
-  const buys = rows.filter(isTopBuyRow_)
-    .map(r => ({ kind: '★3買い', code: to4_(String(r[3] || '').trim()).toUpperCase(),
-                 name: r[4] || '', signal: signalText_(r[7]), pos: null }))
-    .filter(t => t.code && !codes.has(t.code));
+  const buys = topPicks_(cands, codes).map(c => ({
+    kind: '買い推奨' + c.setup.grade, pick: true, grade: c.setup.grade,
+    code: c.code, name: c.name, setup: c.setup, reason: c.reason, pos: null, extra: [],
+  }));
 
   const holds = [];
   codes.forEach(code => {
-    const r = byCode[code];
+    const c = byCode[code];
     holds.push({
-      kind: '保有', code: code,
-      name: r ? (r[4] || '') : '',
-      signal: r ? signalText_(r[7]) : '',
-      note: (r && isTopBuyRow_(r)) ? '★3買いシグナルあり（買い増し候補）' : '',
-      pos: positions[code] || { shares: 0, cost: null },
+      kind: '保有', pick: false, code: code, name: c ? c.name : '', reason: c ? c.reason : '',
+      note: c ? '買い推奨の条件にも該当（買い増し候補・確度' + c.setup.grade + '）' : '',
+      pos: positions[code] || { shares: 0, cost: null }, extra: [],
     });
   });
   holds.sort((a, b) => String(a.code).localeCompare(String(b.code)));
   return buys.concat(holds);
 }
 
-// 1銘柄ぶんのシート行。算出できなかった場合も、そこまでで計算できた価格
-// （買い・利確・損切り）はメモの理由とあわせて出す。株数だけは0にせず空にする
-// （見送りの原因は株数側にあるため、価格まで隠す理由はない）。
+// 1銘柄ぶんのシート行。算出できなかった場合も、そこまでで計算できた価格はメモの理由とあわせて出す。
 function planRow_(t, p) {
   const held = t.kind === '保有';
   const pos = t.pos || {};
+  const extra = t.extra || [];
   if (!p || !p.ok) {
     const why = (p && p.reason) ? p.reason : '株価を取得できず未計算';
     return [t.kind, t.code, t.name, p ? p.close : '', held ? (pos.shares || '') : '',
       held ? (pos.cost || '') : (p && p.entry != null ? p.entry : ''),
       (p && p.target != null) ? p.target : '',
       (p && p.stop != null) ? p.stop : '',
-      '', t.signal,
-      (held ? '算出不可：' : '見送り：') + why];
+      '', t.reason || '',
+      [(held ? '算出不可：' : '見送り：') + why].concat(extra).join('／')];
   }
   const notes = [];
-  // 保有株はトレンドが崩れた時点（高値・安値の切り上げが揃わなくなった時点）で、
-  // 押し安値割れを待たずに手仕舞いを検討する材料として先頭に出す。損切り価格自体は
-  // 押し安値基準のまま動かさない（ダウ理論上の撤退水準を勝手に動かすと根拠が崩れる）。
-  if (held && p.trend !== '上昇') {
-    notes.push('トレンド崩れ（' + p.trend + '）: 押し安値を待たず早期手仕舞いも検討');
+  if (held) {
+    // 保有株はトレンドが崩れた時点（高値・安値の切り上げが揃わなくなった時点）で、
+    // 押し安値割れを待たずに手仕舞いを検討する材料として先頭に出す。
+    if (p.trend !== '上昇') notes.push('トレンド崩れ（' + p.trend + '）: 押し安値を待たず早期手仕舞いも検討');
+    if (t.note) notes.push(t.note);
+    notes.push('押し安値' + fmtNum_(p.pullbackLow) + '割れで手仕舞い');
+  } else {
+    notes.push('翌朝の寄付で買い・最長' + DF.HOLD_DAYS + '営業日');
   }
-  if (t.note) notes.push(t.note);
-  // 買い方はトレンドではなく実際の注文種別で書く。トレンド未確定でも戻り高値を
-  // 既に上抜けていれば指値になるので、トレンドだけで文言を決めると実態とずれる。
-  notes.push(held ? '押し安値' + fmtNum_(p.pullbackLow) + '割れで手仕舞い'
-    : p.entryType === '逆指値' ? '転換初動（戻り高値の上抜けを逆指値で待つ）'
-    : p.trend === '上昇' ? '上昇トレンド継続（押し目を指値で待つ）'
-    : '戻り高値を上抜け済み（現値の指値）');
   p.notes.forEach(n => notes.push(n));
+  extra.forEach(n => notes.push(n));
 
   return [t.kind, t.code, t.name, p.close,
     p.shares || '',
     held ? (pos.cost || '') : p.entry,
-    p.target, p.stop, p.lossYen || '', t.signal, notes.join('／')];
+    p.target, p.stop, p.lossYen || '', t.reason || '', notes.join('／')];
 }
 
 /**
- * 対象銘柄の日足を取り直して売買プランを計算し、「売買プラン」シートへ書き出す。
- * 戻り値は コード→plan のマップ（★3買いメールが同じ数字を載せるために使う）。
- *
- * 走査時の bars を使い回さず取り直しているのは、走査が時間分割・自動再開で
- * 複数回の実行にまたがるため、最後の実行に全銘柄の bars が残っていないから。
- * 保有株はそもそもシグナルが点灯しなくても載せるので、いずれにせよ取り直しが要る。
+ * 決算発表の予定と Bloomberg の記事を、該当銘柄のメモに添える材料として集める。
+ * どちらも取れなければ何も足さない（推奨の判定そのものには使っていない）。
+ */
+function attachPlanExtras_(targets) {
+  if (!targets.length) return;
+  const codes = targets.map(t => t.code);
+  try {
+    const calRows = fetchEarningsCalendarRows_();
+    const cal = calRows ? calendarMapFromEntries_(filterCalendarToUniverse_(calRows, codes)) : null;
+    if (cal) targets.forEach(t => {
+      if (cal[t.code]) t.extra.push('決算 ' + cal[t.code].date + '(' + calendarStatusLabel_(cal[t.code].dateStatus) + ')');
+    });
+  } catch (e) { Logger.log('決算予定の取得に失敗（メモに載せずに続行）: ' + e.message); }
+  try {
+    const texts = bloombergTexts_();
+    targets.forEach(t => {
+      const hit = bloombergMention_(texts, t.name);
+      if (hit) t.extra.push('Bloomberg: ' + hit);
+    });
+  } catch (e) { Logger.log('Bloombergメールの読み込みに失敗（メモに載せずに続行）: ' + e.message); }
+}
+
+/**
+ * 対象銘柄の売買プランを計算し、「売買プラン」シートへ書き出す。
+ * 買い推奨は走査時の値（候補シート）から計算し、保有株は日足を取り直して buildOrderPlan_ で計算する。
+ * 戻り値は コード→plan のマップ（メールが同じ数字を載せるために使う）。
  */
 function writePlanSheet_(targets) {
   const ss = SpreadsheetApp.getActive();
@@ -2181,37 +1938,40 @@ function writePlanSheet_(targets) {
   sh.clear();
   sh.getRange(1, 1, 1, PLAN_HEADERS_.length).setValues([PLAN_HEADERS_]);
   sh.setTabColor('#1b7a3d');
-  // 12列目（L1）。ヘッダーは11列目（メモ）までなので空いている列に置く（シグナルシートのL1と同じ流儀）。
-  sh.getRange(1, 12).setValue('更新 ' + Utilities.formatDate(new Date(), 'JST', 'MM/dd HH:mm'))
+  // 12列目（L1）に要約。ヘッダーは11列目（メモ）までなので空いている列に置く。
+  // 開いた瞬間に「今日は何件あって、そのうち確度Aは何件か」が分かるようにする。
+  sh.getRange(1, 12).setValue(planSummary_(targets))
     .setFontColor('#1a7f37').setFontWeight('bold');
+  // 売買プランを一番左のタブにする（毎日見るのはこの1枚だけ）
+  try { ss.setActiveSheet(sh); ss.moveActiveSheet(1); } catch (e) { /* 並び替えに失敗しても内容は正しい */ }
 
   const plans = {};
   if (!targets.length) {
-    sh.getRange(2, 1).setValue('★★★の買いシグナルも保有銘柄もありません');
+    sh.getRange(2, 1).setValue('本日の買い推奨はありません（保有銘柄もありません）');
     styleSheet_(sh, PLAN_HEADERS_.length, '#14331f', '#eaf6ee');
     return plans;
   }
 
   const cfg = orderConfig_();
-  const resps = fetchAllWithRetry_(targets.map(t => ({
-    url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(t.code) +
-         '.T?range=' + SK.YAHOO_RANGE + '&interval=1d',
-    headers: { 'User-Agent': 'Mozilla/5.0' },
-    muteHttpExceptions: true,
-  }))) || [];
-
-  const rows = targets.map((t, i) => {
+  const holds = targets.filter(t => !t.pick);
+  const resps = holds.length
+    ? (fetchAllWithRetry_(holds.map(t => yahooChartRequest_(t.code, SK.YAHOO_RANGE))) || []) : [];
+  const holdPlan = {};
+  holds.forEach((t, i) => {
     const res = resps[i];
     const bars = (res && res.getResponseCode() === 200) ? parseYahooBars_(res) : [];
-    if (!bars.length) return planRow_(t, null);
-    const p = buildOrderPlan_(bars, cfg, t.pos);
-    plans[t.code] = p;
+    holdPlan[t.code] = bars.length ? buildOrderPlan_(bars, cfg, t.pos) : null;
+  });
+
+  const rows = targets.map(t => {
+    const p = t.pick ? Object.assign({ held: false }, dfOrderPlan_(t.setup, cfg)) : holdPlan[t.code];
+    if (p) plans[t.code] = p;
     return planRow_(t, p);
   });
 
   const n = rows.length;
   sh.getRange(2, 1, n, PLAN_HEADERS_.length).setValues(rows);
-  // コード列は「シグナル」シートと同じくリンク付きテキスト（値は文字列型のまま）
+  // コード列はリンク付きテキスト（値は文字列型のまま）
   sh.getRange(2, 2, n, 1).setNumberFormat('@')
     .setRichTextValues(targets.map(t => [codeLinkRichText_(t.code)]));
 
@@ -2222,8 +1982,8 @@ function writePlanSheet_(targets) {
   sh.getRange(2, 1, n, 1).setHorizontalAlignment('center').setVerticalAlignment('middle');
   sh.getRange(2, 2, n, 1).setHorizontalAlignment('right');
   sh.getRange(2, 9, n, 1).setFontColor('#c0392b');    // 損切り額は赤（失う側の金額だと分かるように）
-  sh.setColumnWidth(10, 200); sh.getRange(2, 10, n, 1).setWrap(true).setVerticalAlignment('top');
-  sh.setColumnWidth(11, 300); sh.getRange(2, 11, n, 1).setWrap(true).setVerticalAlignment('top');
+  sh.setColumnWidth(10, 220); sh.getRange(2, 10, n, 1).setWrap(true).setVerticalAlignment('top');
+  sh.setColumnWidth(11, 320); sh.getRange(2, 11, n, 1).setWrap(true).setVerticalAlignment('top');
 
   const all = sh.getRange(2, 1, n, PLAN_HEADERS_.length);
   const kind = sh.getRange(2, 1, n, 1);
@@ -2232,47 +1992,125 @@ function writePlanSheet_(targets) {
     SpreadsheetApp.newConditionalFormatRule()
       .whenFormulaSatisfied('=OR(LEFT($K2,3)="見送り",LEFT($K2,4)="算出不可")')
       .setBackground('#f6e3e3').setFontColor('#8a3a3a').setRanges([all]).build(),
-    // 保有株でトレンドが崩れた行（押し安値割れ前でも早期手仕舞いを検討してほしい）を橙で目立たせる
+    // 保有株でトレンドが崩れた行を橙で目立たせる
     SpreadsheetApp.newConditionalFormatRule()
       .whenFormulaSatisfied('=LEFT($K2,6)="トレンド崩れ"')
       .setBackground('#fde9d9').setFontColor('#b35900').setBold(true).setRanges([all]).build(),
     SpreadsheetApp.newConditionalFormatRule()
-      .whenTextEqualTo('★3買い').setBackground('#e3f5ea').setFontColor('#1b7a3d').setBold(true)
+      .whenTextEqualTo('買い推奨A').setBackground('#c9ecd5').setFontColor('#0f5a2b').setBold(true)
+      .setRanges([kind]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo('買い推奨B').setBackground('#eef7f1').setFontColor('#1b7a3d')
       .setRanges([kind]).build(),
     SpreadsheetApp.newConditionalFormatRule()
       .whenTextEqualTo('保有').setBackground('#fff3da').setFontColor('#8a6100').setBold(true)
       .setRanges([kind]).build(),
   ]);
   sh.getRange(1, 1, n + 1, PLAN_HEADERS_.length).createFilter();
+  // 横に長いので、見出し行と「区分・コード・銘柄名」を固定してスクロールしても行が分かるようにする
+  sh.setFrozenRows(1);
+  sh.setFrozenColumns(3);
+  sh.setRowHeightsForced(2, n, 42);
   return plans;
 }
 
-// シグナルシートと保有銘柄から売買プランを作り直す（走査完了時とメニューの両方から呼ぶ）。
+// 売買プランの要約（L1セル）。純関数。
+function planSummary_(targets) {
+  const picks = (targets || []).filter(t => t.pick);
+  const a = picks.filter(t => t.grade === 'A').length;
+  const holds = (targets || []).length - picks.length;
+  return Utilities.formatDate(new Date(), 'JST', 'MM/dd HH:mm') + ' 更新｜買い推奨 ' + picks.length + '件'
+    + (picks.length ? '（確度A ' + a + '件）' : '（本日は条件を満たす銘柄なし）')
+    + '｜保有 ' + holds + '件';
+}
+
+// 候補シートと保有銘柄から売買プランを作り直す（走査完了時とメニューの両方から呼ぶ）。
+// 戻り値 { targets, plans }（メールと投資デイリー分析への連動が同じ内容を使う）。
 function buildPlansFromSignals_(sig) {
-  const rows = (sig && sig.getLastRow() >= 2)
-    ? sig.getRange(2, 1, sig.getLastRow() - 1, 9).getValues() : [];
+  const cands = readCandidates_(sig);
   let held = { codes: new Set(), positions: {}, reason: null };
   try {
     held = getSbiHeldCodes_();
     if (held.reason) Logger.log('保有株を売買プランに載せられません: ' + held.reason);
   } catch (e) {
-    // 参照元の権限切れ等。★3買いだけでもプランは出したいので止めない。
-    Logger.log('保有銘柄の取得に失敗（★3買いのみで継続）: ' + e.message);
+    // 参照元の権限切れ等。買い推奨だけでもプランは出したいので止めない。
+    Logger.log('保有銘柄の取得に失敗（買い推奨のみで継続）: ' + e.message);
   }
-  return writePlanSheet_(planTargets_(rows, held));
+  const targets = planTargets_(cands, held);
+  attachPlanExtras_(targets);
+  return { targets: targets, plans: writePlanSheet_(targets) };
 }
 
-// メニュー「売買プランを作成/更新」。走査をやり直さずにプランだけ引き直せるようにしておく
+// メニュー「売買プランだけ作り直す」。走査をやり直さずにプランだけ引き直せるようにしておく
 // （許容損失額を変えて株数を見直したいときや、保有銘柄を入れ替えたとき）。
 function buildPlans() {
   const ss = SpreadsheetApp.getActive();
   const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
-  if (!sig || sig.getLastRow() < 2) throw new Error('先に「シグナル走査」を実行してください');
-  const plans = buildPlansFromSignals_(sig);
-  const ok = Object.keys(plans).filter(k => plans[k].ok).length;
-  ss.toast('売買プランを更新しました（算出できた銘柄 ' + ok + '件 / 対象 '
-    + Object.keys(plans).length + '件）', APP_NAME_, 6);
+  if (!sig) throw new Error('先に「走査」を実行してください');
+  const r = buildPlansFromSignals_(sig);
+  const ok = Object.keys(r.plans).filter(k => r.plans[k].ok).length;
+  ss.toast('売買プランを更新しました（算出できた銘柄 ' + ok + '件 / 対象 ' + r.targets.length + '件）', APP_NAME_, 6);
 }
+
+// ---------------------------------------------------------------------------
+//  投資デイリー分析（MarketBriefing）への連動
+// ---------------------------------------------------------------------------
+const BRIEFING_SHEET_ = '日本株_買い推奨';
+
+const BRIEFING_FILE_NAME_ = '投資デイリー分析';
+
+/**
+ * 投資デイリー分析のスプレッドシートID。スクリプトプロパティ MARKET_BRIEFING_SS_ID を優先し、
+ * 無ければドライブをファイル名で探して見つかったIDを保存する（個人のシートIDをソースに書かないため）。
+ */
+function briefingSpreadsheetId_() {
+  const props = PropertiesService.getScriptProperties();
+  const saved = props.getProperty('MARKET_BRIEFING_SS_ID');
+  if (saved) return saved;
+  const res = Drive.Files.list({
+    q: "name = '" + BRIEFING_FILE_NAME_ + "' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false and 'me' in owners",
+    fields: 'files(id,name)', pageSize: 2,
+  });
+  const files = (res && res.files) || [];
+  if (files.length !== 1) {
+    Logger.log('「' + BRIEFING_FILE_NAME_ + '」が' + files.length + '件見つかったため連動をスキップ（MARKET_BRIEFING_SS_ID で指定してください）');
+    return null;
+  }
+  props.setProperty('MARKET_BRIEFING_SS_ID', files[0].id);
+  return files[0].id;
+}
+
+/**
+ * 買い推奨を「投資デイリー分析」スプレッドシートの専用シートへ書き出す。
+ * このシートは本スクリプトだけが書く（MarketBriefing 側は触らない）。
+ */
+function writeBriefingPicks_(targets, plans) {
+  const id = briefingSpreadsheetId_();
+  if (!id) return;
+  const ss = SpreadsheetApp.openById(id);
+  const sh = ss.getSheetByName(BRIEFING_SHEET_) || ss.insertSheet(BRIEFING_SHEET_);
+  sh.clear();
+  sh.getRange(1, 1).setValue('更新: ' + Utilities.formatDate(new Date(), 'JST', 'yyyy/MM/dd HH:mm') + ' JST（' + APP_NAME_ + 'の走査結果）');
+  const header = ['確度', 'コード', '銘柄名', '終値', '買い', '利確', '損切り', '根拠'];
+  sh.getRange(2, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#14331f').setFontColor('#ffffff');
+  const rows = briefingRows_(targets, plans);
+  if (rows.length) sh.getRange(3, 1, rows.length, header.length).setValues(rows);
+  else sh.getRange(3, 1).setValue('本日の買い推奨はありません');
+  sh.getRange(3 + Math.max(rows.length, 1) + 1, 1).setValue('【免責】情報提供目的です。投資助言ではありません。');
+  if (rows.length) [4, 6, 7].forEach(col => sh.getRange(3, col, rows.length, 1).setNumberFormat('#,##0.##'));
+  sh.getRange(3, 2, Math.max(rows.length, 1), 1).setNumberFormat('@');
+  sh.setTabColor('#1b7a3d');
+}
+
+// 投資デイリー分析に出す行（純関数）。発注できる推奨だけを載せる。
+function briefingRows_(targets, plans) {
+  return (targets || []).filter(t => t.pick && plans[t.code] && plans[t.code].ok).map(t => {
+    const p = plans[t.code];
+    return [t.grade, t.code, t.name, p.close, '翌朝寄付', p.target, p.stop, t.reason];
+  });
+}
+
+// Bloomberg ニュースレターの読み込み・社名照合は Bloomberg.js
 
 /**
  * トリガーの入口を共通モジュール RunLog.js で包む（「実行記録」シートに 秒・結果・エラー種別 を1回1行）。

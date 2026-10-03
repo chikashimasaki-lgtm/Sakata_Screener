@@ -56,8 +56,11 @@ const EXPORTS = [
   'filterCalendarToUniverse_', 'calendarStatusLabel_', 'edinetExtractArray_', 'calendarMapFromEntries_',
   'pickForeignFlow_', 'extractProfit_',
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
-  'planRow_', 'PLAN_HEADERS_', 'isTopBuyRow_', 'planTargets_', 'signalText_', 'toNum_',
+  'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
   'planMailLine_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
+  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_',
+  // ダウ理論×フィボナッチの買い推奨（DowFib.js）
+  'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
   // SIGNAL_WEIGHT_ 算出の統計コア（MLWeights.js）。tools/calc_weights.js から呼ばれる純粋関数。
   'ML',
   'benchmarkReturn_', 'extractMlRow_', 'buildDateCloseMap_', 'barDateKey_',
@@ -69,6 +72,8 @@ ${read('FetchRetry.js')}
 ${read('ConfirmUi.js')}
 ${read('StockCode.js')}
 ${read('Code.js')}
+${read('DowFib.js')}
+${read('Bloomberg.js')}
 ${read('MarketMacro.js')}
 ${read('MLWeights.js')}
 return { ${EXPORTS.join(', ')} };
@@ -766,84 +771,163 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
   const h3 = M.buildOrderPlan_(over2, cfg(), { shares: 300, cost: 110 });
   eq(h3.trend, 'レンジ', 'トレンドが崩れているケースを用意');
 
-  console.log('\n【20】売買プランの行整形・対象抽出');
-  const buyT  = { kind: '★3買い', code: '8303', name: 'テスト', signal: '赤三兵', pos: null };
-  const heldT = { kind: '保有', code: '7203', name: 'トヨタ', signal: '', note: '', pos: { shares: 300, cost: 110 } };
-  eq(M.planRow_(buyT, p1).length, M.PLAN_HEADERS_.length, '★3買い行の列数がヘッダと一致する');
-  eq(M.planRow_(buyT, p3).length, M.PLAN_HEADERS_.length, '見送り行の列数もヘッダと一致する');
-  eq(M.planRow_(buyT, null).length, M.PLAN_HEADERS_.length, '株価が取れなかった行も列数は一致する');
-  eq(M.planRow_(buyT, p1)[5], 120, '★3買い行の「買い」は算出した買値');
-  eq(M.planRow_(heldT, h1)[5], 110, '保有行の「買い」は実際の建値');
-  eq([M.planRow_(buyT, p3)[5], M.planRow_(buyT, p3)[6], M.planRow_(buyT, p3)[7]], [120, 164, 98],
-    '見送り行でも算出できた買い・利確・損切りは表示する（隠すのは株数だけでよい）');
-  eq(M.planRow_(buyT, null)[5], '', '株価そのものが取れなければ価格欄も空');
+  console.log('\n【20】ダウ理論×フィボナッチの買い推奨（DowFib.js）');
+  {
+    // 主要トレンドの山谷: 30本目の安値80 → 55本目の高値120 → 80本目の安値95（切り上げ）→ 110本目の高値140（更新）
+    // そこから押し（小さな戻り高値132をはさんで118まで）→ 124本目に終値135で小さな戻り高値を上抜け
+    const path = [[0, 110], [30, 80], [55, 120], [80, 95], [110, 140], [114, 126], [117, 132], [121, 118], [123, 125], [124, 135]];
+    const mk = (pts, lastVol) => {
+      const out = [];
+      for (let k = 0; k < pts.length - 1; k++) {
+        const [i0, p0] = pts[k], [i1, p1] = pts[k + 1];
+        for (let i = i0; i < i1; i++) out.push(p0 + (p1 - p0) * (i - i0) / (i1 - i0));
+      }
+      out.push(pts[pts.length - 1][1]);
+      return out.map((c, i) => ({ o: i ? out[i - 1] : c, h: c + 1, l: c - 1, c, v: 1000, t: 1700000000 + i * 86400, cont: true }))
+        .map((b, i, a) => (i === a.length - 1 && lastVol ? Object.assign(b, { v: lastVol }) : b));
+    };
+    const bars = mk(path, 2000);
+    const s = M.dfSetup_(bars);
+    eq(s != null, true, '上昇トレンドの押し目から小さな戻り高値を上抜けた日に成立する');
+    near(s.retr, (141 - 117) / (141 - 94), 1e-9, '押しの深さ = (高値 − 押し目安値) / (高値 − 押し安値)');
+    eq(s.grade, 'A', '押し38.2%以上かつ出来高1.5倍以上なら確度A');
+    near(s.target, 94 + 47 * 1.618, 1e-9, '利確 = 押し安値 + 上昇幅 × 1.618');
+    eq(s.stop < 117 && s.stop > 116, true, '損切りは押し目の安値（117）の少し下');
+    eq(M.dfSetup_(mk(path, 1200)).grade, 'B', '出来高が増えていなければ確度B');
 
-  // トレンド未確定でも戻り高値を既に上抜けていれば買いは指値。
-  // メモをトレンドだけで決めると「逆指値で待つ」と書いてしまい、実際の注文と食い違う。
-  const over = zig([[0, 140], [8, 130], [14, 138], [22, 100], [30, 145]]);
-  const p6 = M.buildOrderPlan_(over, cfg());
-  eq([p6.trend, p6.entryType], ['レンジ', '指値'], '戻り高値を上抜け済みなら待たずに指値');
-  eq(String(M.planRow_(buyT, p6)[10]).split('／')[0], '戻り高値を上抜け済み（現値の指値）',
-    'メモの買い方は実際の注文種別に合わせる（トレンド名だけで決めない）');
-  eq(String(M.planRow_(buyT, p3)[10]).indexOf('見送り') === 0, true, '★3買いの不成立は「見送り」');
-  eq(String(M.planRow_(heldT, null)[10]).indexOf('算出不可') === 0, true,
-    '保有株は「見送り」ではなく「算出不可」（持っている以上、見送るという選択肢が無い）');
-  eq(M.planRow_(buyT, null)[10], '見送り：株価を取得できず未計算', '取得失敗も理由を残す');
-  eq(String(M.planRow_(heldT, h3)[10]).indexOf('トレンド崩れ（レンジ）') === 0, true,
-    '保有株はトレンドが崩れたら押し安値割れを待たず早期手仕舞いの警告をメモ先頭に出す');
-  eq([M.planRow_(heldT, h3)[6], M.planRow_(heldT, h3)[7]], [h3.target, h3.stop],
-    'トレンド崩れの警告があっても損切り・利確の価格は押し安値基準のまま動かさない');
-  eq(String(M.planRow_(heldT, h1)[10]).indexOf('トレンド崩れ') === -1, true,
-    '上昇トレンドが続いている保有株には警告を出さない');
+    // 前日すでに戻り高値を超えていたら「初めて上抜けた日」ではない
+    const p2 = path.slice(0, -2).concat([[123, 134], [124, 136]]);
+    eq(M.dfSetup_(mk(p2, 2000)), null, '前日に上抜け済みなら成立しない（初日だけ）');
+    // 押しが深すぎる（78.6%超）とトレンド否定に近い
+    const p3 = path.slice(0, -3).concat([[121, 100], [123, 110], [124, 135]]);
+    eq(M.dfSetup_(mk(p3, 2000)), null, '押しが78.6%を超えたら成立しない');
+    // 高値更新が無い（前回の山120を超えない）ならダウ理論の上昇トレンドではない
+    const p4 = [[0, 110], [30, 80], [55, 120], [80, 95], [110, 118], [114, 108], [117, 112], [121, 102], [123, 106], [124, 113]];
+    eq(M.dfSetup_(mk(p4, 2000)), null, '高値を更新していなければ成立しない');
 
-  console.log('\n【21】売買プランの対象組み立て');
-  const rows = [
-    ['', '★★★', '', '7203', 'トヨタ', 1000, '▲ 買い', '・赤三兵\n・切り込み線', ''],
-    ['', '★★★', '', '6758', 'ソニー', 2000, '▼ 売り', '・三羽烏', ''],
-    ['', '★★',   '', '9984', 'SBG',   3000, '▲ 買い', '・赤三兵', ''],
-    ['○', '★★★', '', '8306', '三菱UFJ', 1500, '▲ 買い', '・赤三兵', ''],
-  ];
-  eq(rows.filter(M.isTopBuyRow_).length, 2, '★★★かつ買いの行だけを対象にする');
-  eq(M.signalText_('・赤三兵\n・切り込み線'), '赤三兵 / 切り込み線', '箇条書き記号と改行を落として1行にする');
+    // 先読みしない: e より後の足（さらに安い安値）を足しても、e 時点の判定は変わらない
+    const future = mk(path.concat([[140, 60]]), 0);
+    future[124].v = 2000;
+    eq(JSON.stringify(M.dfSetup_(future, 124)), JSON.stringify(s), '未来の足を足しても過去の判定が変わらない（先読みなし）');
+    eq(M.dfSetup_(bars.slice(0, 100)), null, '履歴が足りなければ判定しない');
 
-  const held = { codes: new Set(['8306', '4502']), positions: { '8306': { shares: 200, cost: 1400 } } };
-  const targets = M.planTargets_(rows, held);
-  eq(targets.map(t => [t.kind, t.code]),
-    [['★3買い', '7203'], ['保有', '4502'], ['保有', '8306']],
-    '★3買いが先、保有はコード順。保有中の銘柄は買い側に重複させない');
-  eq(targets[2].note, '★3買いシグナルあり（買い増し候補）',
-    '保有中に★3買いが出たら1行にまとめ、買い増し候補としてメモに残す');
-  eq(targets[2].pos, { shares: 200, cost: 1400 }, '保有数量と建値を引き当てる');
-  eq(targets[1].pos, { shares: 0, cost: null }, '数量が取れない保有銘柄も落とさない');
-  eq(targets[1].signal, '', 'シグナルが出ていない保有銘柄も載せる');
+    // 注文値: 呼値に丸め、許容損失から株数を逆算する
+    const op = M.dfOrderPlan_(s, cfg());
+    eq([op.ok, op.entry, op.stop, op.target], [true, 135, Math.floor(s.stop), Math.floor(s.target)], '買い・損切り・利確を呼値に丸める');
+    eq(op.shares % 100, 0, '株数は100株単位');
+    eq(op.lossYen <= cfg().RISK_BUDGET_YEN, true, '損切りに当たっても許容損失に収まる');
+    eq(M.dfOrderPlan_(s, cfg({ RISK_BUDGET_YEN: 100 })).ok, false, '100株も建てられなければ見送り');
 
-  eq(M.planTargets_([], { codes: new Set(), positions: {} }), [], '対象が無ければ空');
+    // 推奨の選び方: 確度Aが先、保有中は外す、最大5件
+    const c = (code, grade, vr) => ({ code, name: code, setup: { grade, score: (grade === 'A' ? 100 : 0) + vr }, reason: '' });
+    const cands = [c('1111', 'B', 3), c('2222', 'A', 1.6), c('3333', 'B', 1), c('4444', 'A', 2.5), c('5555', 'B', 2),
+                   c('6666', 'B', 0.5), c('7777', 'B', 4)];
+    eq(M.topPicks_(cands).map(x => x.code), ['4444', '2222', '7777', '1111', '5555'], '確度A→出来高の多い順に最大5件');
+    eq(M.topPicks_(cands, new Set(['4444'])).map(x => x.code)[0], '2222', '保有中の銘柄は新規の推奨から外す');
+  }
+
+  console.log('\n【21】売買プランの行整形・対象組み立て');
+  {
+    const setup = { close: 135, grade: 'A', score: 102, stop: 116.5, target: 170.0, retr: 0.51, volRatio: 2 };
+    const cands = [
+      { code: '7203', name: 'トヨタ', setup, reason: '押し51%' },
+      { code: '8306', name: '三菱UFJ', setup: Object.assign({}, setup, { grade: 'B', score: 1 }), reason: '押し40%' },
+    ];
+    const held = { codes: new Set(['8306', '4502']), positions: { '8306': { shares: 200, cost: 1400 } } };
+    const targets = M.planTargets_(cands, held);
+    eq(targets.map(t => [t.kind, t.code]), [['買い推奨A', '7203'], ['保有', '4502'], ['保有', '8306']],
+      '買い推奨が先、保有はコード順。保有中の銘柄は買い側に重複させない');
+    eq(targets[2].note, '買い推奨の条件にも該当（買い増し候補・確度B）', '保有中に条件を満たしたら買い増し候補としてメモに残す');
+    eq(targets[2].pos, { shares: 200, cost: 1400 }, '保有数量と建値を引き当てる');
+    eq(targets[1].pos, { shares: 0, cost: null }, '数量が取れない保有銘柄も落とさない');
+    eq(M.planTargets_([], { codes: new Set(), positions: {} }), [], '対象が無ければ空');
+
+    const buyT = Object.assign(targets[0], { extra: ['決算 2026-10-28(予測)'] });
+    const op = Object.assign({ held: false }, M.dfOrderPlan_(setup, cfg()));
+    const row = M.planRow_(buyT, op);
+    eq(row.length, M.PLAN_HEADERS_.length, '買い推奨行の列数がヘッダと一致する');
+    eq([row[5], row[6], row[7]], [135, 170, 116], '買い・利確・損切り');
+    eq(String(row[10]).split('／')[0], '翌朝の寄付で買い・最長40営業日', 'メモの先頭は注文の仕方');
+    eq(String(row[10]).indexOf('決算 2026-10-28(予測)') > 0, true, '決算予定をメモに添える');
+    const ng = M.planRow_(buyT, Object.assign({}, op, { ok: false, reason: 'リスク過大' }));
+    eq(String(ng[10]).indexOf('見送り：リスク過大') === 0, true, '不成立は「見送り」と理由');
+    eq(M.planRow_(buyT, null).length, M.PLAN_HEADERS_.length, '株価が取れなかった行も列数は一致する');
+
+    const heldT = { kind: '保有', code: '7203', name: 'トヨタ', reason: '', note: '', pos: { shares: 300, cost: 110 } };
+    eq(M.planRow_(heldT, h1)[5], 110, '保有行の「買い」は実際の建値');
+    eq(String(M.planRow_(heldT, null)[10]).indexOf('算出不可') === 0, true,
+      '保有株は「見送り」ではなく「算出不可」（持っている以上、見送るという選択肢が無い）');
+    eq(String(M.planRow_(heldT, h3)[10]).indexOf('トレンド崩れ（レンジ）') === 0, true,
+      '保有株はトレンドが崩れたら早期手仕舞いの警告をメモ先頭に出す');
+    eq([M.planRow_(heldT, h3)[6], M.planRow_(heldT, h3)[7]], [h3.target, h3.stop],
+      'トレンド崩れの警告があっても損切り・利確の価格は押し安値基準のまま動かさない');
+    eq(String(M.planRow_(heldT, h1)[10]).indexOf('トレンド崩れ') === -1, true,
+      '上昇トレンドが続いている保有株には警告を出さない');
+
+    // 投資デイリー分析へは発注できる推奨だけを載せる
+    const plans = { '7203': op, '8306': h1 };
+    eq(M.briefingRows_(targets, plans), [['A', '7203', 'トヨタ', 135, '翌朝寄付', 170, 116, '押し51%']],
+      '投資デイリー分析には買い推奨（成立分）だけを書く');
+  }
 
   console.log('\n【22】メール本文の売買プラン行');
-  // メールだけ見て発注できるようにするのが目的なので、シートと同じ数字が出ること
-  eq(M.planMailLine_({ '8303': p1 }, '8303'),
-    '\n  └ 指値買 120 / 利確 164 / 損切 98 / 1,300株 / 損切り額 28,600円',
-    '★3買いは買い・利確・損切り・株数・損切り額を1行で添える');
-  eq(M.planMailLine_({ '7203': h1 }, '7203'),
-    '\n  └ 保有中 / 利確 164 / 損切 98 / 300株 / 損切り額 6,600円',
-    '保有株に新規の買値は出さず「保有中」と書く（空の買値を出さない）');
-  eq(M.planMailLine_({ '7203': h2 }, '7203'), '\n  └ 保有中 / 利確 164 / 損切 98',
-    '株数不明なら株数と損切り額は省く（0株0円と書かない）');
-  eq(M.planMailLine_({ '8303': p3 }, '8303').indexOf('\n  └ 売買プラン: 見送り（') === 0, true,
-    '不成立の★3買いは理由つきで「見送り」と書く');
-  eq(M.planMailLine_({ '7203': Object.assign({}, p3, { held: true }) }, '7203')
-    .indexOf('\n  └ 売買プラン: 算出不可（') === 0, true,
-    '保有株は「見送り」ではなく「算出不可」（持っている以上、見送るという選択肢が無い）');
-  eq(M.planMailLine_({}, '8303'), '', 'プランが無い銘柄は行を足さない');
-  eq(M.planMailLine_(null, '8303'), '', 'plans自体が無くても例外にならない');
-  eq(M.planMailLine_({ '7203': h1 }, '72030'), '\n  └ 保有中 / 利確 164 / 損切 98 / 300株 / 損切り額 6,600円',
-    '5桁コードでも4桁に正規化して引き当てる');
-  eq(M.planMailLine_({ '7203': h3 }, '7203').indexOf('／トレンド崩れ・早期手仕舞い検討') > 0, true,
-    'トレンドが崩れた保有株はメールにも早期手仕舞いの警告を添える');
+  {
+    const op = Object.assign({ held: false }, M.dfOrderPlan_({ close: 135, stop: 116.5, target: 170 }, cfg()));
+    eq(M.planMailLine_({ '7203': op }, '7203'),
+      '\n  └ 翌朝寄付で買い（目安 135） / 利確 170 / 損切 116 / ' + op.shares.toLocaleString('en-US') + '株 / 損切り額 '
+        + op.lossYen.toLocaleString('en-US') + '円',
+      '買い推奨は買い・利確・損切り・株数・損切り額を1行で添える');
+    eq(M.planMailLine_({ '7203': h1 }, '7203'),
+      '\n  └ 保有中 / 利確 164 / 損切 98 / 300株 / 損切り額 6,600円',
+      '保有株に新規の買値は出さず「保有中」と書く（空の買値を出さない）');
+    eq(M.planMailLine_({ '7203': h2 }, '7203'), '\n  └ 保有中 / 利確 164 / 損切 98',
+      '株数不明なら株数と損切り額は省く（0株0円と書かない）');
+    eq(M.planMailLine_({ '8303': Object.assign({}, op, { ok: false, reason: 'x' }) }, '8303'), '\n  └ 見送り（x）',
+      '不成立の推奨は理由つきで「見送り」と書く');
+    eq(M.planMailLine_({}, '8303'), '', 'プランが無い銘柄は行を足さない');
+    eq(M.planMailLine_(null, '8303'), '', 'plans自体が無くても例外にならない');
+    eq(M.planMailLine_({ '7203': h1 }, '72030'), '\n  └ 保有中 / 利確 164 / 損切 98 / 300株 / 損切り額 6,600円',
+      '5桁コードでも4桁に正規化して引き当てる');
+    eq(M.planMailLine_({ '7203': h3 }, '7203').indexOf('／トレンド崩れ・早期手仕舞い検討') > 0, true,
+      'トレンドが崩れた保有株はメールにも早期手仕舞いの警告を添える');
+  }
 
-  console.log('\n【23】通知メールのラベル');
-  eq(M.SAKATA_PROFIT_LABEL_, '利益累計',
-    '★3買い・保有銘柄シグナルのどちらのメールにもこのラベルを付けてアーカイブする');
+  console.log('\n【23】通知メールのラベル・Bloombergの社名照合');
+  eq(M.SAKATA_PROFIT_LABEL_, '利益累計', '通知メールにはこのラベルを付けてアーカイブする');
+  {
+    const texts = [{ body: 'ニデック上場維持に課題 https://example.com/x\n世界的な金利上昇なぜ\nＡＤＥＫＡが増産' }];
+    eq(M.companyKey_('ニデックホールディングス'), 'ニデック', '接尾辞「ホールディングス」を落として照合する');
+    eq(M.bloombergMention_(texts, 'ニデック'), 'ニデック上場維持に課題', '社名を含む行を返す（URLは落とす）');
+    eq(M.bloombergMention_(texts, 'ADEKA'), 'ADEKAが増産', '全角・半角の違いを吸収する');
+    eq(M.bloombergMention_(texts, 'トヨタ自動車'), '', '出ていなければ空');
+    eq(M.bloombergMention_(texts, 'JT'), '', '3文字未満の社名は誤検知が多いので照合しない');
+    eq(M.bloombergMention_([], 'ニデック'), '', 'メールが無くても例外にならない');
+
+    // 実物（2026-09-30受信）と同じ構造: スナップショット→「ウォッチリスト」の直後に見出し1、
+    // 段落は空行区切り、段落内はリンクの前後で行が切れる。最後に「その他の注目ニュース」とお知らせ。
+    const body = [
+      'マーケットスナップショット', 'S&P500種', '<https://www.bloomberg.com/quote/SPX:IND?x=1>', '7,651.54-0.3%',
+      '市場データ 05:54 AM JST. ウォッチリスト', '<https://www.bloomberg.com/markets/watchlist?x=1>', '1年ぶり大幅増', '',
+      '8月の米個人消費支出（PCE', '<https://www.bloomberg.com/jp/news/articles/a?x=1>', '）は約1年ぶりの大幅な伸びとなった。', '',
+      'AI需要堅調', '',
+      '米マイクロン・テクノロジーの売上高見通し', '<https://www.bloomberg.com/jp/news/articles/b?x=1>', 'が市場予想を上回った。', '',
+      'その他の注目ニュース', '',
+      'トヨタ、「センチュリー」で世界の超高級車市場へ', '<https://www.bloomberg.com/jp/news/features/c?x=1>', '',
+      'ニュースレターに関するお知らせ', '', '登録内容の変更',
+    ].join('\n');
+    const parsed = M.bloombergParse_(body);
+    eq(parsed.items, [
+      { head: '1年ぶり大幅増', body: '8月の米個人消費支出（PCE）は約1年ぶりの大幅な伸びとなった。' },
+      { head: 'AI需要堅調', body: '米マイクロン・テクノロジーの売上高見通しが市場予想を上回った。' },
+    ], '見出しと本文に分け、リンクで切れた文を元に戻す');
+    eq(parsed.others, ['トヨタ、「センチュリー」で世界の超高級車市場へ'], '「その他の注目ニュース」のタイトルを拾い、お知らせ以降は捨てる');
+    const t = [Object.assign({ body }, parsed)];
+    eq(M.bloombergMention_(t, 'マイクロン・テクノロジー'), 'AI需要堅調：米マイクロン・テクノロジーの売上高見通しが市場予想を上回った。',
+      '社名が出た記事は「見出し：本文」で返す');
+    eq(M.bloombergMention_(t, 'トヨタ自動車'), '', '社名が完全一致しなければ拾わない（トヨタ自動車≠トヨタ）');
+    eq(M.bloombergRows_(t[0]).length, 3, 'シートには5本（ここでは2本）＋その他を1行ずつ');
+    eq(M.bloombergParse_('本文に構造がないメール'), { items: [], others: [] }, '構造が違うメールでも例外にならない');
+  }
 
   console.log('\n【24】保有数量の読み取り');
   eq(M.toNum_('1,234'), 1234, '桁区切りを外して数値化する');

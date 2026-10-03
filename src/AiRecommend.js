@@ -96,8 +96,8 @@ function readMacroContextForAi_(ss) {
 // Geminiに渡す日本語プロンプトを組み立てる。JSON（コード→コメント）で返させる。
 function buildAiPrompt_(planRows, ctx) {
   const lines = [];
-  lines.push('あなたは個人投資家向けの分析アシスタントです。以下は酒田五法の統計的シグナルに基づいて');
-  lines.push('機械的に算出された売買プラン（買い候補・保有株）です。これは統計的シグナルの整理であり、');
+  lines.push('あなたは個人投資家向けの分析アシスタントです。以下はダウ理論（上昇トレンドの押し目）と');
+  lines.push('フィボナッチ（押しの深さ）で機械的に算出された売買プラン（買い推奨・保有株）です。これは機械的な判定の整理であり、');
   lines.push('投資助言ではありません。断定的な売買指示ではなく、注目点・リスク要因を客観的に整理してください。');
   lines.push('');
   lines.push('各銘柄には「既存メモ」として、注文種別やトレンド判定など機械的に算出された事実が');
@@ -112,7 +112,7 @@ function buildAiPrompt_(planRows, ctx) {
   planRows.forEach(r => {
     const earn = ctx.earningsByCode[String(r.code)];
     lines.push('- コード:' + r.code + ' 銘柄名:' + r.name + ' 区分:' + r.kind
-      + ' シグナル:' + (r.signal || 'なし') + ' 既存メモ:' + (r.note || 'なし')
+      + ' 根拠:' + (r.signal || 'なし') + ' 既存メモ:' + (r.note || 'なし')
       + (earn ? ' 決算:' + earn : ''));
   });
   lines.push('');

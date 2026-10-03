@@ -2,10 +2,11 @@
   "name": "sakata-screener",
   "version": "1.0.0",
   "private": true,
-  "description": "酒田五法シグナル・スクリーナー（Google Apps Script）の純ロジック検証",
+  "description": "短期売買支援（ダウ理論×フィボナッチの買い推奨、Google Apps Script）の純ロジック検証",
   "scripts": {
     "test": "node tests/verify.js",
-    "calc-weights": "node tools/calc_weights.js"
+    "calc-weights": "node tools/calc_weights.js",
+    "backtest": "node tools/backtest_dowfib.js"
   },
   "license": "UNLICENSED"
 }

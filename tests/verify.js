@@ -57,7 +57,7 @@ const EXPORTS = [
   'pickForeignFlow_', 'extractProfit_',
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
-  'planMailLine_', 'ifdocoRows_', 'ifdocoExpiry_', 'IFDOCO_HEADERS_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
+  'planMailLine_', 'webPlanRows_', 'ifdocoRows_', 'ifdocoExpiry_', 'IFDOCO_HEADERS_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
   'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_',
   // ダウ理論×フィボナッチの買い推奨（DowFib.js）
   'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
@@ -76,6 +76,7 @@ ${read('DowFib.js')}
 ${read('Bloomberg.js')}
 ${read('MarketMacro.js')}
 ${read('MLWeights.js')}
+${read('WebMenu.js')}
 return { ${EXPORTS.join(', ')} };
 `)(...Object.values(sandbox));
 
@@ -1080,6 +1081,24 @@ console.log('\n【30】IFDOCOの期間指定（発注日を含めて15営業日�
   eq(f(M.ifdocoExpiry_(new Date('2026-10-03T12:00:00Z'), 15, biz)), '2026-10-23', '休日は数えない');
   const noHoliday = d => biz(d) && f(d) !== '2026-10-12';
   eq(f(M.ifdocoExpiry_(new Date('2026-10-05T12:00:00Z'), 15, noHoliday)), '2026-10-26', '祝日を挟むと1日延びる');
+}
+
+console.log('\n【31】スマホ用Webメニューの表示行');
+{
+  const v = [
+    ['区分', 'コード', '銘柄名', '現在値', '株数', '買い(価格)', '利確(OCO1)', '損切り(OCO2)', '損切り額', '根拠', 'メモ', '10/05 18:40 更新'],
+    ['買い推奨A', '7203', 'トヨタ', 135, 200, 135, 170, 116, 3800, '押し51%', '翌朝の寄付で買い・最長40営業日／決算 2026-10-28(予測)', ''],
+    ['買い推奨B', '6814', '古野電気', 7900, '', 7900, 8900, 7400, '', '', '見送り：リスク過大', ''],
+    ['保有', '1329', '', 7104, 305, 6960.16, 7840, 6730, 112850, '', 'トレンド崩れ（レンジ）: 早期手仕舞いも検討／押し安値6,740割れで手仕舞い', ''],
+    ['本日の買い推奨はありません', '', '', '', '', '', '', '', '', '', '', ''],
+  ];
+  const r = M.webPlanRows_(v);
+  eq(r.length, 3, '見出しと「該当なし」の行は出さない');
+  eq([r[0].code, r[0].shares, r[0].buy, r[0].target, r[0].stop], ['7203', 200, 135, 170, 116], '価格と株数は数値で渡す');
+  eq(r[0].memo, '翌朝の寄付で買い・最長40営業日', 'メモは先頭の1項目だけ（スマホで読める長さ）');
+  eq([r[1].ng, r[1].shares], [true, null], '見送り行は ng、空の株数は null（0株と表示しない）');
+  eq([r[2].alert, r[2].ng], [true, false], 'トレンド崩れの保有行は alert');
+  eq(M.webPlanRows_([]), [], 'シートが空なら空');
 }
 
 console.log('\n' + '─'.repeat(62));

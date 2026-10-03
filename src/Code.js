@@ -2045,6 +2045,7 @@ function buildPlansFromSignals_(sig) {
     // 参照元の権限切れ等。買い推奨だけでもプランは出したいので止めない。
     Logger.log('保有銘柄の取得に失敗（買い推奨のみで継続）: ' + e.message);
   }
+  rememberSpreadsheetId_();   // スマホ用Webメニュー（WebMenu.js）が開けなかったときの予備
   const targets = planTargets_(cands, held);
   attachPlanExtras_(targets);
   const plans = writePlanSheet_(targets);

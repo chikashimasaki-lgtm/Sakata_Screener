@@ -60,7 +60,6 @@ function webScanRunning_() {
 function webStatus() {
   const ss = webSs_();
   const plan = ss.getSheetByName(SK.SHEETS.PLAN);
-  const ifd = ss.getSheetByName(SK.SHEETS.IFDOCO);
   const values = plan && plan.getLastRow() > 0 ? plan.getRange(1, 1, plan.getLastRow(), 13).getValues() : [];
   const rebuilding = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'webBuildPlansJob');
   return {
@@ -71,7 +70,6 @@ function webStatus() {
     rebuilding: rebuilding,
     url: ss.getUrl(),
     planGid: plan ? plan.getSheetId() : null,
-    ifdocoGid: ifd ? ifd.getSheetId() : null,
   };
 }
 
@@ -132,7 +130,6 @@ const WEB_MENU_HTML_ = `<!DOCTYPE html><html lang="ja"><head>
 <button class="btn gray" id="b2" onclick="act('plans')">↻ 売買プランだけ作り直す</button>
 <button class="btn link" id="b3" onclick="load()">状態を更新</button>
 <a class="btn link" id="lp" target="_blank">📊 売買プランを開く</a>
-<a class="btn link" id="li" target="_blank">🧾 IFDOCO入力を開く</a>
 <div id="rows"></div>
 <script>
   var BTNS = ['b1','b2','b3'], timer = null;
@@ -149,10 +146,8 @@ const WEB_MENU_HTML_ = `<!DOCTYPE html><html lang="ja"><head>
     var cls = (s.running || s.rebuilding) ? 'busy' : '';
     var msg = s.rebuilding ? '売買プランを作り直しています…' : (s.status || '（まだ走査していません）');
     setStatus(msg, cls, s.note);
-    var lp = document.getElementById('lp'), li = document.getElementById('li');
+    var lp = document.getElementById('lp');
     lp.href = s.url + (s.planGid != null ? '#gid=' + s.planGid : '');
-    li.href = s.url + (s.ifdocoGid != null ? '#gid=' + s.ifdocoGid : '');
-    li.style.display = s.ifdocoGid == null ? 'none' : 'block';
     var rows = s.rows || [];
     document.getElementById('rows').innerHTML = !rows.length ? '' : '<h2>売買プラン</h2>' + rows.map(function(r){
       var tagCls = r.kind === '保有' ? 'held' : (r.kind.slice(-1) === 'A' ? 'A' : '');

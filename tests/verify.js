@@ -57,7 +57,7 @@ const EXPORTS = [
   'pickForeignFlow_', 'extractProfit_',
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
-  'planMailLine_', 'webPlanRows_', 'ifdocoRows_', 'ifdocoExpiry_', 'IFDOCO_HEADERS_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
+  'planMailLine_', 'webPlanRows_', 'ifdocoExpiry_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
   'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_',
   // ダウ理論×フィボナッチの買い推奨（DowFib.js）
   'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
@@ -869,15 +869,13 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     const plans = { '7203': op, '8306': h1 };
     eq(M.briefingRows_(targets, plans), [['A', '7203', 'トヨタ', 135, '翌朝寄付', 170, 116, '押し51%']],
       '投資デイリー分析には買い推奨（成立分）だけを書く');
-    // IFDOCO入力: 発注できる買い推奨だけを、注文画面の入力順で
-    const ifd = M.ifdocoRows_(targets, Object.assign({}, plans, { '8306': h1 }), '2026/10/23');
-    eq(ifd.length, 1, 'IFDOCOは買い推奨（成立分）だけ。保有株は載せない');
-    eq(ifd[0].length, M.IFDOCO_HEADERS_.length, 'IFDOCO行の列数がヘッダと一致する');
-    eq([ifd[0][1], ifd[0][3], ifd[0][4], ifd[0][6], ifd[0][7], ifd[0][8], ifd[0][9]],
-      ['7203', '現物買', op.shares, '2026/10/23', 170, 116, '成行'], '株数・期間・OCO1利確・OCO2損切り・発動後成行');
-    eq(ifd[0][5], '成行（目安 135）', '新規は成行（検証の前提＝翌朝寄付）');
-    eq([ifd[0][10], ifd[0][11]], [op.lossYen, (170 - 135) * op.shares], '損切り額と利益額');
-    eq(M.ifdocoRows_(targets, { '7203': Object.assign({}, op, { ok: false }) }, 'x'), [], '見送りの推奨は載せない');
+    // SBIのIFDOCOで置くための入力を、別シートではなく買い推奨行のメモに書く
+    const ifd = String(M.planRow_(buyT, op, '2026/10/23')[10]).split('／');
+    eq(ifd[1], 'SBIはIFDOCO：新規 成行・期間指定 2026/10/23・損切りは発動後 成行', 'メモ2項目目にIFDOCOの入力（区切り記号は／と混ぜない）');
+    eq(String(M.planRow_(buyT, op, '2026/10/23')[10]).indexOf('期間指定 2026/10/23') > 0, true, '期間指定の日付をメモに書く');
+    eq(String(M.planRow_(buyT, op, '2026/10/23')[10]).indexOf('寄付が損切り以下か利確以上なら取消') > 0, true, '見送り条件もメモに書く');
+    eq(String(M.planRow_(heldT, h1, '2026/10/23')[10]).indexOf('IFDOCO') === -1, true, '保有株にはIFDOCOを書かない（OCOで置く）');
+    eq(String(M.planRow_(buyT, op)[10]).indexOf('IFDOCO') === -1, true, '期限が渡されなければ書かない（従来どおり）');
   }
 
   console.log('\n【22】メール本文の売買プラン行');

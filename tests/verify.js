@@ -57,7 +57,7 @@ const EXPORTS = [
   'pickForeignFlow_', 'extractProfit_',
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
-  'planMailLine_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
+  'planMailLine_', 'ifdocoRows_', 'ifdocoExpiry_', 'IFDOCO_HEADERS_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
   'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_',
   // ダウ理論×フィボナッチの買い推奨（DowFib.js）
   'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
@@ -868,6 +868,15 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     const plans = { '7203': op, '8306': h1 };
     eq(M.briefingRows_(targets, plans), [['A', '7203', 'トヨタ', 135, '翌朝寄付', 170, 116, '押し51%']],
       '投資デイリー分析には買い推奨（成立分）だけを書く');
+    // IFDOCO入力: 発注できる買い推奨だけを、注文画面の入力順で
+    const ifd = M.ifdocoRows_(targets, Object.assign({}, plans, { '8306': h1 }), '2026/10/23');
+    eq(ifd.length, 1, 'IFDOCOは買い推奨（成立分）だけ。保有株は載せない');
+    eq(ifd[0].length, M.IFDOCO_HEADERS_.length, 'IFDOCO行の列数がヘッダと一致する');
+    eq([ifd[0][1], ifd[0][3], ifd[0][4], ifd[0][6], ifd[0][7], ifd[0][8], ifd[0][9]],
+      ['7203', '現物買', op.shares, '2026/10/23', 170, 116, '成行'], '株数・期間・OCO1利確・OCO2損切り・発動後成行');
+    eq(ifd[0][5], '成行（目安 135）', '新規は成行（検証の前提＝翌朝寄付）');
+    eq([ifd[0][10], ifd[0][11]], [op.lossYen, (170 - 135) * op.shares], '損切り額と利益額');
+    eq(M.ifdocoRows_(targets, { '7203': Object.assign({}, op, { ok: false }) }, 'x'), [], '見送りの推奨は載せない');
   }
 
   console.log('\n【22】メール本文の売買プラン行');
@@ -1059,6 +1068,18 @@ console.log('\n【29】コード列はテキスト型（リンク付き文字列
   eq(e.text, '', '空コードは空文字');
   eq(e.link, null, '空コードにはリンクを張らない');
   eq(M.codeLinkRichText_(null).text, '', 'null も空文字（"null" と書かない）');
+}
+
+console.log('\n【30】IFDOCOの期間指定（発注日を含めて15営業日）');
+{
+  const biz = d => d.getDay() !== 0 && d.getDay() !== 6;
+  const f = d => d.toISOString().slice(0, 10);
+  // 2026-10-05(月)から: 1日目=10/05 … 15日目=10/23(金)
+  eq(f(M.ifdocoExpiry_(new Date('2026-10-05T12:00:00Z'), M.IFDOCO_MAX_DAYS_, biz)), '2026-10-23', '今日が営業日なら今日を1日目に数える');
+  // 土曜に作っても月曜から数える
+  eq(f(M.ifdocoExpiry_(new Date('2026-10-03T12:00:00Z'), 15, biz)), '2026-10-23', '休日は数えない');
+  const noHoliday = d => biz(d) && f(d) !== '2026-10-12';
+  eq(f(M.ifdocoExpiry_(new Date('2026-10-05T12:00:00Z'), 15, noHoliday)), '2026-10-26', '祝日を挟むと1日延びる');
 }
 
 console.log('\n' + '─'.repeat(62));

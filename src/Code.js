@@ -16,7 +16,8 @@
 // ============================================================================
 
 const SK = {
-  SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方', STATS: 'パターン成績', PLAN: '売買プラン' },
+  SHEETS: { UNIVERSE: '銘柄', SIGNALS: 'シグナル', USAGE: '使い方', STATS: 'パターン成績', PLAN: '売買プラン',
+            IFDOCO: 'IFDOCO入力' },
   YAHOO_RANGE: '6mo',   // 保有株の売買プラン・旧集計用
   SCAN_RANGE: '1y',     // 買い推奨の走査用。主要トレンドの山谷（左右10本）を2組そろえるのに半年では足りない
   BATCH: 40,
@@ -441,7 +442,7 @@ function removeDeprecatedSheets() {
 function ensureSheetOrder() {
   const ss = SpreadsheetApp.getActive();
   const order = [
-    SK.SHEETS.PLAN, MACRO.INPUT_SHEET, MACRO.CALENDAR_SHEET, SK.SHEETS.UNIVERSE,
+    SK.SHEETS.PLAN, SK.SHEETS.IFDOCO, MACRO.INPUT_SHEET, MACRO.CALENDAR_SHEET, SK.SHEETS.UNIVERSE,
     SK.SHEETS.USAGE,
   ];
   let moved = 0;
@@ -1266,6 +1267,14 @@ function createUsageSheet() {
     ['・保有行でメモが「トレンド崩れ」（橙）… 押し安値割れを待たずに早期の手仕舞いも検討してください', 'p'],
     ['・コードを押すとTradingViewの日足チャートが開きます', 'p'],
     ['', 'p'],
+    ['■ 「IFDOCO入力」シート（SBI証券で発注するとき）', 'h'],
+    ['・買い推奨（見送り以外）を、SBIの国内株 IFDOCO 注文画面の入力順に並べたものです。数字は売買プランと同じ', 'p'],
+    ['・新規は成行（翌朝寄付）、OCO1＝利確の指値、OCO2＝損切りの逆指値（以下）で発動後は成行', 'p'],
+    ['・期間は「期間指定」でSBIの上限（発注日を含めて15営業日）の日付を出します', 'p'],
+    ['   失効しても残っている株は保有株として売買プランに載るので、その値でOCOを置き直してください', 'p'],
+    ['・IFDOCOでは「寄付が損切り以下／利確以上なら見送る」が自動ではできません。気配を見て取り消してください', 'p'],
+    ['・SBIには個人向けの発注APIが無いため、発注は手入力です（画面の自動操作は規約違反のおそれ）', 'p'],
+    ['', 'p'],
     ['■ 通知メール（該当がある日だけ）', 'h'],
     ['・短期売買支援_買い推奨_N件 … 売買プランと同じ数字（買い・利確・損切り・株数）を載せます', 'p'],
     ['・短期売買支援_保有株トレンド崩れ_N件 … 上昇トレンドが崩れた保有株', 'p'],
@@ -2038,7 +2047,98 @@ function buildPlansFromSignals_(sig) {
   }
   const targets = planTargets_(cands, held);
   attachPlanExtras_(targets);
-  return { targets: targets, plans: writePlanSheet_(targets) };
+  const plans = writePlanSheet_(targets);
+  try { writeIfdocoSheet_(targets, plans); }
+  catch (e) { Logger.log('IFDOCO入力シートの作成に失敗（売買プランは正常）: ' + e.message); }
+  return { targets: targets, plans: plans };
+}
+
+// ---------------------------------------------------------------------------
+//  IFDOCO入力（SBI証券の国内株 IFDOCO 注文へそのまま転記する一覧）
+//  ---------------------------------------------------------------------------
+//  SBI証券には個人向けの発注APIが無いので、発注は人が注文画面で行う。
+//  買い推奨1件を IFDOCO 1本（新規の買い＋利確の指値＋損切りの逆指値）で出せば、
+//  あとは約定も手仕舞いも自動で進む。列は注文画面で入力する順に並べる。
+//  保有株は既に建っているので IFDOCO ではなく OCO（売買プランの利確・損切り）で置く。
+// ---------------------------------------------------------------------------
+
+// SBIの「期間指定」は発注日を含めて最長15営業日。
+const IFDOCO_MAX_DAYS_ = 15;
+
+const IFDOCO_HEADERS_ = [
+  '区分', 'コード', '銘柄名', '取引', '株数',
+  '新規 価格', '期間指定（最長）', 'OCO1 利確 指値', 'OCO2 損切り 逆指値（以下）', 'OCO2 発動後',
+  '損切り額', '利益額', '注意',
+];
+
+/**
+ * 期間指定に入れる最終日（発注日を含めて n 営業日目）。純関数（営業日判定は引数で受け取る）。
+ * 引け後に作るので、今日が営業日なら今日を1日目に数える。夜間の注文を SBI が
+ * 翌営業日扱いにしても、1日短くなるだけで画面ではじかれることはない（長く数えると拒否される）。
+ */
+function ifdocoExpiry_(from, n, isBiz) {
+  const d = new Date(from.getTime());
+  let count = 0;
+  for (let guard = 0; guard < 60; guard++) {
+    if (isBiz(d)) { count++; if (count >= n) return d; }
+    d.setDate(d.getDate() + 1);
+  }
+  return d;
+}
+
+/**
+ * IFDOCO入力シートの行。買い推奨のうち売買プランを算出できたものだけ（見送りは載せない）。純関数。
+ * 新規は成行: 検証は「翌朝の寄付で買い」の前提なので、指値にして約定しない日を作らない。
+ * 損切りの発動後も成行: 損切りは確実に逃げることを優先する（指値は急落で約定せず取り残される）。
+ */
+function ifdocoRows_(targets, plans, expiryLabel) {
+  return (targets || []).filter(t => t.pick && plans[t.code] && plans[t.code].ok).map(t => {
+    const p = plans[t.code];
+    const notes = ['寄付が' + fmtNum_(p.stop) + '以下か' + fmtNum_(p.target) + '以上で始まりそうなら取消（検証は見送り）'];
+    notes.push(IFDOCO_MAX_DAYS_ + '営業日で失効。残っていれば保有株として売買プランの値でOCOを置き直す（最長' + DF.HOLD_DAYS + '営業日）');
+    (p.notes || []).forEach(n => notes.push(n));
+    return [t.kind, t.code, t.name, '現物買', p.shares, '成行（目安 ' + fmtNum_(p.entry) + '）', expiryLabel,
+      p.target, p.stop, '成行', p.lossYen || '', Math.round((p.target - p.entry) * p.shares), notes.join('／')];
+  });
+}
+
+// 「IFDOCO入力」シートを作り直す。売買プランを作るたびに呼ぶ（中身は売買プランと同じ数字）。
+function writeIfdocoSheet_(targets, plans) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(SK.SHEETS.IFDOCO);
+  if (!sh) {
+    sh = ss.insertSheet(SK.SHEETS.IFDOCO, 1);   // 売買プランの右隣
+    // insertSheet は新しいシートを開いてしまうので、毎日見る売買プランに戻す
+    const plan = ss.getSheetByName(SK.SHEETS.PLAN);
+    if (plan) ss.setActiveSheet(plan);
+  }
+  sh.clear();
+  sh.getRange(1, 1, 1, IFDOCO_HEADERS_.length).setValues([IFDOCO_HEADERS_]);
+  sh.setTabColor('#1b7a3d');
+
+  const expiry = Utilities.formatDate(ifdocoExpiry_(new Date(), IFDOCO_MAX_DAYS_, isBusinessDay_), 'JST', 'yyyy/MM/dd');
+  const rows = ifdocoRows_(targets, plans, expiry);
+  sh.getRange(1, IFDOCO_HEADERS_.length + 1)
+    .setValue('SBI 国内株 → IFDOCO で1行ずつ入力（預り区分は各自）。※投資助言ではありません')
+    .setFontColor('#1a7f37').setFontWeight('bold');
+  if (!rows.length) {
+    sh.getRange(2, 1).setValue('本日の買い推奨はありません');
+    styleSheet_(sh, IFDOCO_HEADERS_.length, '#14331f', '#eaf6ee');
+    return 0;
+  }
+  const n = rows.length;
+  sh.getRange(2, 1, n, IFDOCO_HEADERS_.length).setValues(rows);
+  sh.getRange(2, 2, n, 1).setNumberFormat('@')
+    .setRichTextValues(rows.map(r => [codeLinkRichText_(r[1])]));
+  styleSheet_(sh, IFDOCO_HEADERS_.length, '#14331f', '#eaf6ee');
+  autoFit_(sh, 12);
+  [8, 9].forEach(col => sh.getRange(2, col, n, 1).setNumberFormat('#,##0.##'));
+  [5, 11, 12].forEach(col => sh.getRange(2, col, n, 1).setNumberFormat('#,##0'));
+  sh.getRange(2, 11, n, 1).setFontColor('#c0392b');
+  sh.setColumnWidth(13, 360); sh.getRange(2, 13, n, 1).setWrap(true).setVerticalAlignment('top');
+  sh.setFrozenRows(1);
+  sh.setFrozenColumns(3);
+  return n;
 }
 
 // メニュー「売買プランだけ作り直す」。走査をやり直さずにプランだけ引き直せるようにしておく

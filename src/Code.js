@@ -485,6 +485,7 @@ function installDailyScanTrigger() {
 function scheduledScan() { return runLogged_('定時スキャン', () => scheduledScanRun_()); }
 function scheduledScanRun_() {
   const now = new Date();
+  ensureBloombergTrigger_();
   if (!isBusinessDay_(now)) { Logger.log('休場日のため走査をスキップ: ' + now); return; }
   scanSignals();
 }
@@ -492,7 +493,11 @@ function scheduledScanRun_() {
 // 旧: 毎時、シグナルシートの保有ハイライトを更新していた。保有株は売買プランに走査時点で載るようになり
 // 不要になった。既存のトリガーが残っていても害がないよう、入口だけ残して何もしない。
 // 「自動実行を設定」をやり直すとトリガー自体も消える。
-function scheduledHeldCheck() { Logger.log('保有チェックは廃止しました（保有株は走査時に売買プランへ載ります）'); }
+function scheduledHeldCheck() {
+  Logger.log('保有チェックは廃止しました（保有株は走査時に売買プランへ載ります）');
+  // 旧トリガーが毎時ここへ来る。朝7時半のBloomberg取り込みトリガーが無ければ足し、今回ぶんをすぐ取り込む
+  if (ensureBloombergTrigger_()) { try { updateBloombergNews(); } catch (e) { Logger.log('Bloomberg取り込み失敗: ' + e.message); } }
+}
 
 /**
  * 走査が終わったら作業用・旧形式のシートを非表示にする（削除はしない＝いつでも再表示できる）。
@@ -1948,6 +1953,10 @@ function writePlanSheet_(targets) {
   const ss = SpreadsheetApp.getActive();
   let sh = ss.getSheetByName(SK.SHEETS.PLAN);
   if (!sh) sh = ss.insertSheet(SK.SHEETS.PLAN);
+  // 売買プランは1枚にまとめる（ユーザー指示）。一時期だけ作っていた別シートが残っていれば消す。
+  // 中身は売買プランと同じ数字の写しなので、消しても失うものはない。
+  const leftover = ss.getSheetByName('IFDOCO入力');
+  if (leftover) ss.deleteSheet(leftover);
   const oldFilter = sh.getFilter(); if (oldFilter) oldFilter.remove();
   sh.clear();
   sh.getRange(1, 1, 1, PLAN_HEADERS_.length).setValues([PLAN_HEADERS_]);

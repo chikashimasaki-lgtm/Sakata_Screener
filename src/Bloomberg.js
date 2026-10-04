@@ -41,8 +41,15 @@ function bloombergParse_(body) {
       .replace(/<https?:[^>]*>/g, '').trim());
   const items = [], others = [];
   let i = blocks.findIndex(b => b.indexOf('ウォッチリスト') >= 0);
-  if (i < 0) return { items, others };
-  let pendingHead = blocks[i].split('ウォッチリスト').pop().trim();
+  let pendingHead = '';
+  if (i >= 0) {
+    pendingHead = blocks[i].split('ウォッチリスト').pop().trim();
+  } else {
+    // マーケットスナップショットが無い号（月曜朝の「週末に話題になったニュース」・土曜の週末版。2026-10-05 受信分で確認）:
+    // 先頭の見出し・リンクのあと、「。」を含む最初の段落＝導入文。その次から 見出し→本文 が続く。
+    i = blocks.findIndex(b => b.indexOf('。') >= 0);
+    if (i < 0) return { items, others };
+  }
   let inOthers = false;
   for (i = i + 1; i < blocks.length; i++) {
     const b = blocks[i];
@@ -55,6 +62,17 @@ function bloombergParse_(body) {
     pendingHead = '';
   }
   return { items, others };
+}
+
+// 7時半の取り込みトリガーを、無ければ足す（既存のトリガーは触らない）。足したら true。
+// 「自動実行を設定」（メニュー・確認ダイアログあり）を押さなくても、すでに動いている別のトリガー
+// （旧・保有チェック／走査）の頭から自動で追加するための入口（2026-10-05。7時半のトリガーが無く、朝の取り込みが一度も動いていなかった）。
+function ensureBloombergTrigger_() {
+  try {
+    if (ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'updateBloombergNews')) return false;
+    ScriptApp.newTrigger('updateBloombergNews').timeBased().everyDays(1).atHour(7).nearMinute(30).create();
+    return true;
+  } catch (e) { Logger.log('Bloombergトリガーの確認に失敗: ' + e.message); return false; }
 }
 
 // 社名の照合用の正規化（全角英数→半角、空白除去、よくある接尾辞を落とす）。純関数。

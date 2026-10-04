@@ -13,6 +13,7 @@ const path = require('path');
 /* ── GAS モック ───────────────────────────────────────────────────────────── */
 
 const logs = [];
+const sandboxTriggers = [];   // ScriptApp スタブが持つ登録済みトリガー
 const sandbox = {
   Logger: { log: m => logs.push(String(m)) },
   PropertiesService: {
@@ -33,7 +34,14 @@ const sandbox = {
   },
   UrlFetchApp: { fetch: () => { throw new Error('通信は使わない'); } },
   Utilities: { formatDate: (d) => d.toISOString().slice(0, 10), sleep: () => {} },
-  ScriptApp: { getProjectTriggers: () => [], newTrigger: () => {}, deleteTrigger: () => {} },
+  ScriptApp: {
+    getProjectTriggers: () => sandboxTriggers.slice(),
+    newTrigger: (fn) => { const t = { getHandlerFunction: () => fn, fn, cfg: {} };
+      const b = { timeBased: () => b, everyDays: (n) => { t.cfg.everyDays = n; return b; }, atHour: (h) => { t.cfg.atHour = h; return b; },
+        nearMinute: (m) => { t.cfg.nearMinute = m; return b; }, after: () => b, everyHours: () => b, create: () => { sandboxTriggers.push(t); return t; } };
+      return b; },
+    deleteTrigger: () => {},
+  },
   Session: { getEffectiveUser: () => ({ getEmail: () => 'test@example.com' }) },
   DriveApp: {}, MailApp: { sendEmail: () => {} },
   GmailApp: {
@@ -58,7 +66,7 @@ const EXPORTS = [
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
   'planMailLine_', 'webPlanRows_', 'ifdocoExpiry_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
-  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_',
+  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_', 'ensureBloombergTrigger_',
   // ダウ理論×フィボナッチの買い推奨（DowFib.js）
   'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
   // SIGNAL_WEIGHT_ 算出の統計コア（MLWeights.js）。tools/calc_weights.js から呼ばれる純粋関数。
@@ -935,6 +943,39 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     eq(M.bloombergMention_(t, 'トヨタ自動車'), '', '社名が完全一致しなければ拾わない（トヨタ自動車≠トヨタ）');
     eq(M.bloombergRows_(t[0]).length, 3, 'シートには5本（ここでは2本）＋その他を1行ずつ');
     eq(M.bloombergParse_('本文に構造がないメール'), { items: [], others: [] }, '構造が違うメールでも例外にならない');
+
+    // 実物（2026-10-05 受信「今朝の5本」＝月曜朝の週末ニュース号）と同じ構造: マーケットスナップショット/「ウォッチリスト」が無い。
+    // 見出し・URLのあとに導入文（「。」を含む段落）があり、その次から 見出し→本文。これを解析できず、シートが空になっていた。
+    const U = (n) => '<https://www.bloomberg.com/jp/news/articles/' + n + '?cmpid=X&utm_term=261004>';
+    const monday = [
+      '【今朝の5本】仕事を始める前に読んでおきたい厳選ニュース', '1日を始める前に読んでおきたいニュース5本', '', 'Read in browser', U('r'), '',
+      '<https://www.bloomberg.com/jp?cmpid=X>', '', '<https://sli.bloomberg.com/click?s=1>', '',
+      '週末に話題になったニュースをお届けします。一日を始めるにあたって押さえておきたい5本はこちら。最新ニュースはブルームバーグ日本語サイト（https://www.bloomberg.com/jp）でもご覧いただけます。', '',
+      '熱烈な推進者も懸念', '',
+      'ソフトバンクグループの孫正義', U('a'), '会長兼社長は、AIの安全性のリスクを懸念していると認めた。前日には米', 'OpenAI', U('b'), 'の安全対策を担当していた人物が寄稿した。', '',
+      '利回りもAIも', '',
+      'ベッセント', U('c'), '米財務長官は米国債利回りの上昇について懸念する必要はないとの見解を示した。', '',
+      '40兆円', '',
+      '片山さつき', U('d'), '財務相は3日、新規国債発行額を可能な限り抑制する方針を示した。', '',
+      'その他の注目ニュース', '',
+      '高市首相「極めて遺憾」と米側に抗議－沖縄強盗殺人事件で米兵逮捕', U('e'), '',
+      'FRB中枢2人の発言で動いた市場、「フォワードガイダンス」なお健在', U('f'), '',
+      'ニュースレターに関するお知らせ', '', '「Japan’s Economy Decoded」日本経済の今を分析します。',
+    ].join('\n');
+    const pm = M.bloombergParse_(monday);
+    eq(pm.items.map(x => x.head), ['熱烈な推進者も懸念', '利回りもAIも', '40兆円'], 'ウォッチリストが無い号でも、導入文の次から見出しを拾う');
+    eq(pm.items[0].body, 'ソフトバンクグループの孫正義会長兼社長は、AIの安全性のリスクを懸念していると認めた。前日には米OpenAIの安全対策を担当していた人物が寄稿した。', 'リンクで切れた本文を元に戻す');
+    eq(pm.others, ['高市首相「極めて遺憾」と米側に抗議－沖縄強盗殺人事件で米兵逮捕', 'FRB中枢2人の発言で動いた市場、「フォワードガイダンス」なお健在'], 'その他の注目ニュース');
+    eq(M.bloombergRows_(Object.assign({ body: monday }, pm)).length, 5, 'シートに 3本＋その他2件 の行が出る');
+    eq(M.bloombergParse_('見出しだけ\n\nURLだけ\n<https://x.test/a>').items, [], '導入文（「。」を含む段落）が無い本文は空（例外にしない）');
+
+    // 7時半トリガーの自動追加（無ければ1本足し、あれば増やさない・他のトリガーは触らない）
+    sandboxTriggers.length = 0; sandboxTriggers.push({ getHandlerFunction: () => 'scheduledScan' });
+    eq(M.ensureBloombergTrigger_(), true, '無ければ足す');
+    eq(M.ensureBloombergTrigger_(), false, 'あれば足さない（冪等）');
+    const bt = sandboxTriggers.filter(x => x.getHandlerFunction() === 'updateBloombergNews');
+    eq([bt.length, bt[0].cfg.atHour, bt[0].cfg.nearMinute, sandboxTriggers.length], [1, 7, 30, 2], '毎日7時台・30分・既存は残る');
+    sandboxTriggers.length = 0;
   }
 
   console.log('\n【24】保有数量の読み取り');

@@ -66,7 +66,7 @@ const EXPORTS = [
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
   'planMailLine_', 'webPlanRows_', 'ifdocoExpiry_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
-  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_', 'ensureBloombergTrigger_',
+  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_', 'ensureBloombergTrigger_', 'applyCandidateFormats_', 'readCandidates_', 'planLooksBroken_', 'CAND_FORMATS_', 'CAND_HEADERS_',
   // ダウ理論×フィボナッチの買い推奨（DowFib.js）
   'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
   // SIGNAL_WEIGHT_ 算出の統計コア（MLWeights.js）。tools/calc_weights.js から呼ばれる純粋関数。
@@ -976,6 +976,33 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     const bt = sandboxTriggers.filter(x => x.getHandlerFunction() === 'updateBloombergNews');
     eq([bt.length, bt[0].cfg.atHour, bt[0].cfg.nearMinute, sandboxTriggers.length], [1, 7, 30, 2], '毎日7時台・30分・既存は残る');
     sandboxTriggers.length = 0;
+  }
+
+  console.log('\n【23c】候補シートの書式（終値が日付として読まれた不具合）');
+  {
+    // 2026-10-05: 「終値」列が日付書式のままで、終値 5,230 が Date(1914/04/26) として読まれ、現在値が -1,757,322,000,000 になった。
+    const fmts = {};
+    const sigStub = (rows) => ({
+      getMaxRows: () => 1000, getLastRow: () => rows.length + 1,
+      getRange: (r, c, nr, nc) => ({
+        setNumberFormat(f) { fmts[c] = f; return this; },
+        getValues: () => rows.map(x => x.slice()),
+      }),
+    });
+    eq(M.CAND_FORMATS_.length, M.CAND_HEADERS_.length, '列の数と書式の数が一致する');
+    const st = sigStub([]);
+    M.applyCandidateFormats_(st);
+    eq([fmts[1], fmts[3], fmts[6], fmts[7]], ['@', '#,##0.##', '#,##0.##', '#,##0.##'], 'コードはテキスト、終値・損切り・利確は数値書式（日付書式ではない）');
+    eq(M.CAND_FORMATS_.every(f => !/y|d/i.test(f.replace('@', ''))), true, 'どの列も日付書式にしない');
+    const good = ['5302', '日本カーボン', 5230, 'B', 1.35, 4900.36, 5968.39, 0.62, 1.35, '押し62%', '2026/10/05'];
+    const bad = ['9999', '壊れた', new Date(-1757322000000), 'B', 1, 4900, 5968, 0.6, 1.3, '', '2026/10/05'];   // 日付として読まれた終値
+    const got = M.readCandidates_(sigStub([good, bad]));
+    eq(got.map(c => c.code), ['5302'], '終値が数値でない候補は読み捨てる（壊れた価格で売買プランを作らない）');
+    eq(got[0].setup.close, 5230, '正常な候補はそのまま読める');
+    eq(M.planLooksBroken_([['買い推奨B', '5302', '日本カーボン', -1757322000000], ['保有', '1329', '', 7283]]), true, '現在値が負の行があれば壊れている');
+    eq(M.planLooksBroken_([['買い推奨B', '5302', '日本カーボン', 5230], ['保有', '1329', '', 7283], ['', '', '', '']]), false, '正常な売買プランは壊れていない（空行は見ない）');
+    eq(M.planLooksBroken_([['保有', '1329', '', '']]), true, '現在値が空でも壊れている');
+    eq(M.planLooksBroken_([]), false, '空は壊れていない');
   }
 
   console.log('\n【23b】メニュー・トリガー・スマホ用Webメニューが呼ぶ関数が全て定義されている');

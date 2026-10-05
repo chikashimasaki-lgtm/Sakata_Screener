@@ -206,6 +206,18 @@ function fetchPrimeUniverse() {
 // 候補シートの列（作業用。人が見る前提ではないので数値のまま持つ）
 const CAND_HEADERS_ = ['コード', '銘柄名', '終値', '確度', 'スコア', '損切り', '利確', '押し率', '出来高倍率', '根拠', '日付'];
 
+// 「シグナル」（候補）シートの列ごとの表示形式。必ず明示する。
+// 2026-10-05: 「終値」列が日付書式（yyyy/mm/dd）のままで、終値 5,230 が日付「1914/04/26」として読まれ、売買プランの現在値・買値が
+// −1,757,322,000,000 になった（旧・酒田五法時代の列書式が sheet.clear() のあとも残っていた。3列目が日付だった）。
+// 書式はシート側に残るので、走査の頭と、候補を読む前（readCandidates_）の両方で当て直す。
+const CAND_FORMATS_ = ['@', '@', '#,##0.##', '@', '0.00', '#,##0.##', '#,##0.##', '0.000', '0.00', '@', '@'];
+function applyCandidateFormats_(sig) {
+  try {
+    const rows = Math.max(sig.getMaxRows() - 1, 1);
+    CAND_FORMATS_.forEach((f, i) => sig.getRange(2, i + 1, rows, 1).setNumberFormat(f));
+  } catch (e) { Logger.log('候補シートの書式設定に失敗: ' + e.message); }
+}
+
 // 実行記録（効率化KPI、共通モジュール RunLog.js）で包んだ入口。本体は scanSignalsRun_
 function scanSignals() { return runLogged_('買い推奨走査', () => scanSignalsRun_()); }
 function scanSignalsRun_() {
@@ -243,8 +255,8 @@ function scanSignalsRun_() {
     sig.clear();
     sig.setConditionalFormatRules([]);
     sig.getRange(1, 1, 1, CAND_HEADERS_.length).setValues([CAND_HEADERS_]);
-    // コード列はテキスト書式（"5602" が 5,602 と表示されたり、先頭0が落ちたりしないように）
-    sig.getRange(2, 1, sig.getMaxRows() - 1, 1).setNumberFormat('@');
+    // 列ごとの書式を明示する（コード列はテキスト＝"5602" が 5,602 と表示されたり先頭0が落ちたりしない。終値などは数値＝日付書式の取り違え防止）
+    applyCandidateFormats_(sig);
     failed = 0;
   }
 
@@ -330,8 +342,15 @@ function yahooChartRequest_(code, range) {
 // 候補シートの行を読み、スコア順に並べる（純関数部分は topPicks_）
 function readCandidates_(sig) {
   if (!sig || sig.getLastRow() < 2) return [];
+  applyCandidateFormats_(sig);   // 日付書式のままだと終値が Date として読まれる（上の CAND_FORMATS_ 参照）
   return sig.getRange(2, 1, sig.getLastRow() - 1, CAND_HEADERS_.length).getValues()
     .filter(r => r[0])
+    .filter(r => {
+      // 終値・損切り・利確は正の有限な数値でなければ読み捨てる（壊れた値で売買プラン・メールを作らない）
+      const ok = [r[2], r[5], r[6]].every(v => typeof v === 'number' && isFinite(v) && v > 0);
+      if (!ok) Logger.log('候補を読み捨て（価格が数値でない）: ' + r[0] + ' / 終値=' + r[2]);
+      return ok;
+    })
     .map(r => ({
       code: to4_(String(r[0]).trim()).toUpperCase(), name: r[1] || '',
       setup: { close: Number(r[2]), grade: String(r[3]), score: Number(r[4]), stop: Number(r[5]),
@@ -2066,6 +2085,25 @@ function buildPlansFromSignals_(sig) {
   return { targets: targets, plans: writePlanSheet_(targets) };
 }
 
+// 売買プランの現在値（D列）が正の数値でない行があるか。純関数。rows は [[区分, コード, 銘柄名, 現在値, …], …]。
+// 2026-10-05 の「終値が日付として読まれ −1,757,322,000,000 になった」不具合の検出用（区分が空の行は見ない）。
+function planLooksBroken_(rows) {
+  return (rows || []).some(r => String(r[0] || '').trim() && !(typeof r[3] === 'number' && isFinite(r[3]) && r[3] > 0));
+}
+
+// 売買プランが壊れていれば作り直す（毎朝7時半のBloomberg取り込みの後から呼ぶ。直したら true）。
+// 不具合を直した直後は、すでに書き出されたプランが壊れたままなので、メニューを押さなくても翌朝に自動で直す。
+function healBrokenPlan_() {
+  try {
+    const plan = SpreadsheetApp.getActive().getSheetByName(SK.SHEETS.PLAN);
+    if (!plan || plan.getLastRow() < 2) return false;
+    if (!planLooksBroken_(plan.getRange(2, 1, plan.getLastRow() - 1, 4).getValues())) return false;
+    buildPlans();
+    Logger.log('売買プランの現在値が不正だったので作り直しました');
+    return true;
+  } catch (e) { Logger.log('売買プランの自動修復に失敗: ' + e.message); return false; }
+}
+
 // メニュー「売買プランだけ作り直す」・スマホ用Webメニュー（WebMenu.js）の本体。走査をやり直さずにプランだけ引き直す
 // （許容損失額を変えて株数を見直したいときや、保有銘柄を入れ替えたとき）。
 // 2026-10-04 の IFDOCO 統合の変更（8b0987f）でこの関数だけ消えてしまい、メニューが「スクリプト関数が見つかりません: buildPlans」になった（2026-10-05 に復元）。
@@ -2076,6 +2114,7 @@ function buildPlans() {
   const r = buildPlansFromSignals_(sig);
   const ok = Object.keys(r.plans).filter(k => r.plans[k].ok).length;
   const picks = r.targets.filter(t => t.pick).length;
+  try { writeBriefingPicks_(r.targets, r.plans); } catch (e) { Logger.log('投資デイリー分析への書き込みに失敗（売買プランは正常）: ' + e.message); }   // 価格を直したときに「日本株_買い推奨」も合わせる
   try { ss.toast('売買プランを更新しました（買い推奨 ' + picks + '件 / 算出できた銘柄 ' + ok + '件 / 対象 ' + r.targets.length + '件）', APP_NAME_, 6); } catch (e) { /* UIが無い実行（スマホ用Webメニューのトリガー）では出さない */ }
   hideWorkSheets_();
   return { picks: picks, ok: ok, targets: r.targets.length };

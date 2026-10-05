@@ -122,6 +122,7 @@ function updateBloombergNews() {
   return runLogged_('Bloomberg取り込み', () => {
     const texts = bloombergTexts_();
     const id = briefingSpreadsheetId_();
+    healBrokenPlan_();   // 売買プランの価格が壊れていれば作り直す（毎朝の保険）。投資デイリー分析の有無に関係なく
     if (!id) return;
     writeBloombergSheet_(SpreadsheetApp.openById(id), texts[0] || null);
   });

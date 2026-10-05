@@ -978,6 +978,25 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     sandboxTriggers.length = 0;
   }
 
+  console.log('\n【23b】メニュー・トリガー・スマホ用Webメニューが呼ぶ関数が全て定義されている');
+  {
+    // 2026-10-05: IFDOCO統合の変更で buildPlans だけ消え、メニューが「スクリプト関数が見つかりません」になった。同じ消し忘れを検出する。
+    const fsx = require('fs'), pathx = require('path');
+    const dir = pathx.join(__dirname, '..', 'src');
+    const all = fsx.readdirSync(dir).filter(f => f.endsWith('.js')).map(f => fsx.readFileSync(pathx.join(dir, f), 'utf8')).join('\n');
+    const defined = new Set();
+    (all.match(/^\s*(?:async\s+)?function\s+([A-Za-z0-9_$]+)\s*\(/gm) || []).forEach(m => defined.add(m.replace(/^\s*(?:async\s+)?function\s+/, '').replace(/\s*\($/, '')));
+    (all.match(/^(?:const|let|var)\s+([A-Za-z0-9_$]+)\s*=/gm) || []).forEach(m => defined.add(m.replace(/^(?:const|let|var)\s+/, '').replace(/\s*=$/, '')));
+    const called = new Set();
+    for (const m of all.matchAll(/\.addItem\(\s*'[^']*'\s*,\s*'([A-Za-z0-9_$]+)'\s*\)/g)) called.add(m[1]);
+    for (const m of all.matchAll(/newTrigger\(\s*'([A-Za-z0-9_$]+)'\s*\)/g)) called.add(m[1]);
+    for (const m of all.matchAll(/clearTriggersFor_\(\s*\[?([^\])]*)\]?\s*\)/g)) (m[1].match(/'([A-Za-z0-9_$]+)'/g) || []).forEach(x => called.add(x.replace(/'/g, '')));
+    const missing = [...called].filter(n => !defined.has(n));
+    eq(missing, [], 'addItem / newTrigger / clearTriggersFor_ の関数名が全て定義されている');
+    eq(called.size >= 10, true, 'menu/trigger の関数名を10個以上拾えている（検査が空振りしていない）: ' + called.size);
+    eq(defined.has('buildPlans'), true, 'buildPlans が定義されている');
+  }
+
   console.log('\n【24】保有数量の読み取り');
   eq(M.toNum_('1,234'), 1234, '桁区切りを外して数値化する');
   eq(M.toNum_('1,234 円'), 1234, '単位付きでも読む');

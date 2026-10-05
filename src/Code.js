@@ -2066,6 +2066,21 @@ function buildPlansFromSignals_(sig) {
   return { targets: targets, plans: writePlanSheet_(targets) };
 }
 
+// メニュー「売買プランだけ作り直す」・スマホ用Webメニュー（WebMenu.js）の本体。走査をやり直さずにプランだけ引き直す
+// （許容損失額を変えて株数を見直したいときや、保有銘柄を入れ替えたとき）。
+// 2026-10-04 の IFDOCO 統合の変更（8b0987f）でこの関数だけ消えてしまい、メニューが「スクリプト関数が見つかりません: buildPlans」になった（2026-10-05 に復元）。
+function buildPlans() {
+  const ss = SpreadsheetApp.getActive();
+  const sig = ss.getSheetByName(SK.SHEETS.SIGNALS);
+  if (!sig) throw new Error('先に「走査/続行」を実行してください（候補のシートがありません）');
+  const r = buildPlansFromSignals_(sig);
+  const ok = Object.keys(r.plans).filter(k => r.plans[k].ok).length;
+  const picks = r.targets.filter(t => t.pick).length;
+  try { ss.toast('売買プランを更新しました（買い推奨 ' + picks + '件 / 算出できた銘柄 ' + ok + '件 / 対象 ' + r.targets.length + '件）', APP_NAME_, 6); } catch (e) { /* UIが無い実行（スマホ用Webメニューのトリガー）では出さない */ }
+  hideWorkSheets_();
+  return { picks: picks, ok: ok, targets: r.targets.length };
+}
+
 // ---------------------------------------------------------------------------
 //  SBI証券の IFDOCO 注文（売買プランのメモに入力の仕方を添える）
 //  SBI証券には個人向けの発注APIが無いので、発注は人が注文画面で行う。

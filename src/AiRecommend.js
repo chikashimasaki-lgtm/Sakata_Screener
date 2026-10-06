@@ -23,6 +23,10 @@
  */
 
 const AI_MEMO_COL_ = 11;   // 「売買プラン」シートのメモ列（PLAN_HEADERS_ の11番目）
+// AIに渡す銘柄数の上限（買い推奨を優先し、シートの並び順で上位N件）。
+// 残りの銘柄は数値から確定できる注意書きをコードでテンプレート文にする（トークン節約）。
+// 増やしたいときはこの値だけ変えればよい。
+const AI_TOP_N_ = 3;
 
 // メニューから呼ぶ入口。「売買プラン」シートを読み、Geminiでコメントを生成してメモ欄へ書く。
 // メニューの入口なので末尾「_」を付けない（「_」は内部ヘルパの目印として使い分ける）。
@@ -39,20 +43,57 @@ function generateAiSummary() {
     return;
   }
   const ctx = readMacroContextForAi_(ss);
-  const prompt = buildAiPrompt_(planRows, ctx);
 
-  const text = callAiWithFallback_(apiKey, prompt);
-  if (!text) {
-    ss.toast('AIコメントの生成に失敗しました（実行ログを確認してください）', APP_NAME_, 8);
-    return;
-  }
-  const comments = parseAiComments_(text);
-  if (!comments) {
-    ss.toast('AIの応答を解析できませんでした（実行ログを確認してください）', APP_NAME_, 8);
-    return;
+  // 定型の注意書きは全行ぶんコードで先に作る。AIは上位N件だけ。AIが失敗してもテンプレ分は書く。
+  const templates = buildTemplateComments_(planRows, ctx);
+  const aiRows = pickAiRows_(planRows, AI_TOP_N_);
+  let comments = Object.assign({}, templates);
+  let aiMsg = '';
+  if (aiRows.length) {
+    const text = callAiWithFallback_(apiKey, buildAiPrompt_(aiRows, ctx));
+    const parsed = text ? parseAiComments_(text) : null;
+    if (parsed) {
+      aiRows.forEach(r => { if (parsed[r.code] != null && parsed[r.code] !== '') comments[r.code] = parsed[r.code]; });
+    } else {
+      aiMsg = text ? '（AIの応答を解析できずテンプレート文のみ）' : '（AI生成に失敗しテンプレート文のみ）';
+    }
   }
   writeAiCommentsIntoPlan_(sh, planRows, comments);
-  ss.toast('メモ欄をAIコメントに更新しました（参考・投資助言ではありません）', APP_NAME_, 6);
+  ss.toast('メモ欄を更新しました（AI ' + aiRows.length + '件＋テンプレート。参考・投資助言ではありません）' + aiMsg, APP_NAME_, 8);
+}
+
+// 見送り・算出不可の行はメモを書き換えない（理由がそのまま重要な事実のため）。
+function isSkippedPlanRow_(r) {
+  return /^(見送り|算出不可)/.test(String(r.note || ''));
+}
+
+// AIに渡す行: 見送り行を除き、買い推奨を先に・保有を後に、各々シート順で上位n件。
+function pickAiRows_(planRows, n) {
+  const live = planRows.filter(r => !isSkippedPlanRow_(r));
+  const buys = live.filter(r => String(r.kind).indexOf('買い推奨') === 0);
+  const rest = live.filter(r => String(r.kind).indexOf('買い推奨') !== 0);
+  return buys.concat(rest).slice(0, n);
+}
+
+// 数値・既存メモから確定できる注意書きだけでテンプレート文を作る（コード→文）。
+// 口調はAIコメント（1〜2文・です/ます調でなく簡潔な体言止め混じり）に合わせ、解釈は足さない。
+function buildTemplateComments_(planRows, ctx) {
+  const out = {};
+  planRows.forEach(r => {
+    if (isSkippedPlanRow_(r)) return;
+    const items = String(r.note || '').split('／').map(x => x.trim()).filter(Boolean);
+    const head = items[0] || '';
+    const warns = [];
+    if (items.some(x => x.indexOf('トレンド崩れ') === 0)) warns.push('トレンドが崩れており、押し安値割れを待たず早期手仕舞いも検討');
+    const earn = (ctx && ctx.earningsByCode && ctx.earningsByCode[String(r.code)])
+      || (items.find(x => x.indexOf('決算 ') === 0) || '').replace(/^決算 /, '');
+    if (earn) warns.push('決算発表が近く（' + earn + '）、発表前後の値動きに注意');
+    const s1 = head && items[0].indexOf('トレンド崩れ') !== 0 ? head + '。' : '';
+    const s2 = warns.length ? warns.join('。') + '。' : '';
+    const text = s1 + s2;
+    if (text) out[r.code] = text;
+  });
+  return out;
 }
 
 // 「売買プラン」シートから、AI要約の材料になる行を読む（PLAN_HEADERS_ の並びに合わせる）。
@@ -175,6 +216,7 @@ function parseAiComments_(text) {
 function writeAiCommentsIntoPlan_(sh, planRows, comments) {
   let updated = 0;
   planRows.forEach(r => {
+    if (isSkippedPlanRow_(r)) return;
     const c = comments[r.code];
     if (c == null || c === '') return;
     // Geminiの生成文はプロンプト経由で外部データ（決算カレンダー等）の影響を受けるため、

@@ -1197,6 +1197,35 @@ console.log('\n【31】スマホ用Webメニューの表示行');
   eq(M.webPlanRows_([]), [], 'シートが空なら空');
 }
 
+
+// ── 【AI】定型注意書きはテンプレート文、AIは上位N件のみ ──
+{
+  const code = read('AiRecommend.js') + '\n;({ buildTemplateComments_, pickAiRows_, writeAiCommentsIntoPlan_, AI_TOP_N_ })';
+  const A = new Function('Logger', 'sanitizeForSheetCell_', 'Utilities', 'return eval(' + JSON.stringify(code) + ')')(
+    sandbox.Logger, s => s, sandbox.Utilities);
+  const rows = [
+    { row: 2, kind: '買い推奨A', code: '1', note: '翌朝の寄付で買い・最長40営業日／決算 2026-10-28(予測)' },
+    { row: 3, kind: '買い推奨B', code: '2', note: '見送り：リスク過大' },
+    { row: 4, kind: '保有', code: '3', note: 'トレンド崩れ（レンジ）: 押し安値を待たず早期手仕舞いも検討／押し安値6,740割れで手仕舞い' },
+    { row: 5, kind: '買い推奨B', code: '4', note: '翌朝の寄付で買い・最長40営業日' },
+  ];
+  const ctx = { earningsByCode: { '4': '2026-10-20（確定）' } };
+  const t = A.buildTemplateComments_(rows, ctx);
+  eq(t['2'], undefined, '見送り行はテンプレートも作らない');
+  eq(!!(t['1'].includes('翌朝の寄付で買い') && t['1'].includes('決算発表が近く（2026-10-28(予測)）')), true, '決算はメモから拾う');
+  eq(!!(t['3'].includes('早期手仕舞いも検討') && !t['3'].includes('決算')), true, 'トレンド崩れの注意書き');
+  eq(!!(t['4'].includes('2026-10-20（確定）')), true, '決算カレンダーを優先');
+  eq(A.pickAiRows_(rows, 2).map(r => r.code), ['1', '4'], '見送り除外・買い推奨優先で上位N件');
+  eq(A.pickAiRows_(rows, 10).map(r => r.code), ['1', '4', '3'], 'Nが大きくても見送りは入らない');
+  eq(!!(A.AI_TOP_N_ >= 1 && A.AI_TOP_N_ <= 5), true, 'AI対象数の既定は小さめ');
+  // AI失敗相当（テンプレのみ）でも書き込まれ、見送り行は触らない
+  const written = {};
+  const sh = { getRange: (r, c) => ({ setValue(v) { written[r + ',' + c] = v; return this; }, setFontColor() { return this; }, setFontWeight() { return this; } }) };
+  A.writeAiCommentsIntoPlan_(sh, rows, t);
+  eq(!!(written['2,11'] && written['4,11'] && written['5,11']), true, 'テンプレ分が書き込まれる');
+  eq(written['3,11'], undefined, '見送り行のメモは保持');
+}
+
 console.log('\n' + '─'.repeat(62));
 console.log(fail === 0 ? `全 ${pass} 項目 合格` : `${pass} 合格 / ${fail} 失敗`);
 process.exit(fail === 0 ? 0 : 1);

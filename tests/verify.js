@@ -79,6 +79,7 @@ const M = new Function(...Object.keys(sandbox), `
 ${read('FetchRetry.js')}
 ${read('ConfirmUi.js')}
 ${read('StockCode.js')}
+${read('SheetUtils.js')}
 ${read('Code.js')}
 ${read('DowFib.js')}
 ${read('Bloomberg.js')}
@@ -943,6 +944,16 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     eq(M.bloombergMention_(t, 'トヨタ自動車'), '', '社名が完全一致しなければ拾わない（トヨタ自動車≠トヨタ）');
     eq(M.bloombergRows_(t[0]).length, 3, 'シートには5本（ここでは2本）＋その他を1行ずつ');
     eq(M.bloombergParse_('本文に構造がないメール'), { items: [], others: [] }, '構造が違うメールでも例外にならない');
+
+    // ニュースレター本文は外部入力。見出し・本文が「=」「-」等で始まると数式化される事故を防ぐ
+    // （market見出しは "-2.3%" のように - 始まりが普通にある）。
+    const evilRows = M.bloombergRows_({
+      items: [{ head: '-2.3%の急落', body: '=HYPERLINK("https://evil.example")' }],
+      others: ['+1%の反発'],
+    });
+    eq(evilRows[0][1], "'-2.3%の急落", '見出しの - 始まりは\'で無害化する');
+    eq(evilRows[0][2], '\'=HYPERLINK("https://evil.example")', '本文の = 始まりも無害化する');
+    eq(evilRows[1][1], "'+1%の反発", 'その他の注目ニュースも同様');
 
     // 実物（2026-10-05 受信「今朝の5本」＝月曜朝の週末ニュース号）と同じ構造: マーケットスナップショット/「ウォッチリスト」が無い。
     // 見出し・URLのあとに導入文（「。」を含む段落）があり、その次から 見出し→本文。これを解析できず、シートが空になっていた。

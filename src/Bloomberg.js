@@ -107,10 +107,13 @@ function bloombergMention_(texts, name) {
 }
 
 // 「ニュース_Bloomberg」シートの行（純関数）。最新号の5本＋その他の注目ニュース。
+// head/body/others はニュースレター本文からそのまま抜き出した外部入力（市況見出しは
+// "-2.3%" 等 -/+ 始まりが普通にある）。数式として評価されないよう書き込み前に無害化する
+// （sanitizeForSheetCell_ はAbitus-Automation/PdfAutoRename等と同じ共通モジュール SheetUtils.js）。
 function bloombergRows_(t) {
   if (!t) return [];
-  const rows = (t.items || []).map((x, i) => [i + 1, x.head || '（見出しなし）', x.body]);
-  (t.others || []).forEach(o => rows.push(['他', o, '']));
+  const rows = (t.items || []).map((x, i) => [i + 1, sanitizeForSheetCell_(x.head || '（見出しなし）'), sanitizeForSheetCell_(x.body)]);
+  (t.others || []).forEach(o => rows.push(['他', sanitizeForSheetCell_(o), '']));
   return rows;
 }
 

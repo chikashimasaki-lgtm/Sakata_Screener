@@ -107,13 +107,11 @@ function onOpen() {
     .addSubMenu(ui.createMenu('個別に更新')
       .addItem('相場マクロ/急落サインを更新',   'updateMarketMacro')
       .addItem('決算カレンダーを更新',          'updateEarningsCalendar')
-      .addItem('Bloombergニュースを取り込む（投資デイリー分析へ）', 'updateBloombergNews')
-      .addItem('ロイター速報を取り込む（投資デイリー分析へ）', 'updateReutersNews')
       .addItem('AI推奨コメントを生成（参考・投資助言ではありません）', 'generateAiSummary'))
     .addSubMenu(ui.createMenu('設定とメンテナンス')
       .addItem('セットアップ',                  'setup')
       .addItem('プライム銘柄を取得（J-Quants）', 'fetchPrimeUniverse')
-      .addItem('自動実行を設定（Bloomberg:7時半/相場マクロ:17時/走査:平日18時）', 'installDailyScanTrigger')
+      .addItem('自動実行を設定（プラン点検:7時半/相場マクロ:17時/走査:平日18時）', 'installDailyScanTrigger')
       .addSeparator()
       .addItem('使い方シートを作成/更新', 'createUsageSheet')
       .addItem('シート順序を整える',      'ensureSheetOrder')
@@ -319,8 +317,6 @@ function scanSignalsRun_() {
   sendHeldWarningEmail_(result.targets, result.plans);
   try {
     writeBriefingPicks_(result.targets, result.plans);
-    const id = briefingSpreadsheetId_();
-    if (id) writeBloombergSheet_(SpreadsheetApp.openById(id), (bloombergTexts_() || [])[0] || null);
   } catch (e) { Logger.log('投資デイリー分析への書き込みに失敗（売買プランは正常）: ' + e.message); }
   hideWorkSheets_();
 
@@ -491,11 +487,10 @@ function installDailyScanTrigger() {
   ScriptApp.newTrigger('updateEarningsCalendar').timeBased().everyDays(1).atHour(17).create(); // 決算カレンダー更新（EDINETDB_API_KEY未設定なら早期return）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
   ScriptApp.newTrigger('updateBloombergNews').timeBased().everyDays(1).atHour(7).nearMinute(30).create(); // Bloomberg朝刊（6時着）を投資デイリー分析へ
-  ensureReutersTriggers_();   // ロイター速報（SBI証券メール）を10分おきに投資デイリー分析へ
   // 旧「保有チェック（毎時）」は廃止。保有株は走査時に売買プランへ載る（上の clearTriggersFor_ で消える）。
   // 月次の自動学習トリガーは設定しない。集計結果を順位付けに使わなくなったため、
   // 全銘柄分のYahoo取得を毎月自動で走らせる必要がない（必要ならメニューから手動実行する）。
-  SpreadsheetApp.getActive().toast('自動実行を設定しました（Bloomberg:7時半 / ロイター:10分おき / 相場マクロ:17時 / 走査:平日18時）', APP_NAME_, 6);
+  SpreadsheetApp.getActive().toast('自動実行を設定しました（プラン点検:7時半 / 相場マクロ:17時 / 走査:平日18時）', APP_NAME_, 6);
   Logger.log('トリガー設定: scheduledScan(平日18時) / updateMarketMacro(17時) / updateEarningsCalendar(17時)');
 }
 
@@ -1310,7 +1305,7 @@ function createUsageSheet() {
     ['   （書き込み先はドライブ上の「投資デイリー分析」を自動で探します。名前が重複するときは', 'p'],
     ['    スクリプトプロパティ MARKET_BRIEFING_SS_ID にスプレッドシートIDを入れてください）', 'p'],
     ['・Bloomberg … Gmailに届く朝のニュースレター（直近3日）に推奨・保有銘柄の社名があれば、メモに見出しを添えます', 'p'],
-    ['   最新号の5本は投資デイリー分析の「ニュース_Bloomberg」シートにも書き出します（毎朝7時半・走査完了時）', 'p'],
+    ['   ニュースのシート（ロイター・Bloomberg）は MarketBriefing（投資デイリー分析）が書き出します', 'p'],
     ['   推奨の判定そのものには使っていません（ニュースは過去に遡って検証できないため）', 'p'],
     ['・相場マクロ … 地合いの参考表示（手入力＋自動取得）。推奨の判定には使っていません', 'p'],
     ['   （日経平均のトレンドで絞っても成績が変わらなかったため）', 'p'],

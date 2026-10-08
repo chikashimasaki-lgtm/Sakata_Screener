@@ -44,6 +44,7 @@ const sandbox = {
   },
   Session: { getEffectiveUser: () => ({ getEmail: () => 'test@example.com' }) },
   DriveApp: {}, MailApp: { sendEmail: () => {} },
+  clearTriggersFor_: (names) => { let n = 0; for (let i = sandboxTriggers.length - 1; i >= 0; i--) { if (names.indexOf(sandboxTriggers[i].getHandlerFunction()) >= 0) { sandboxTriggers.splice(i, 1); n++; } } return n; },
   GmailApp: {
     getUserLabelByName: () => null,
     createLabel: () => ({ addLabel: () => {} }),
@@ -66,7 +67,7 @@ const EXPORTS = [
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
   'planMailLine_', 'webPlanRows_', 'ifdocoExpiry_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
-  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_', 'ensureBloombergTrigger_', 'reutersHeadline_', 'reutersRows_', 'reutersItems_', 'ensureReutersTriggers_', 'REUTERS_HOURS_', 'applyCandidateFormats_', 'readCandidates_', 'planLooksBroken_', 'CAND_FORMATS_', 'CAND_HEADERS_',
+  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'ensureBloombergTrigger_', 'updateReutersNews', 'updateBloombergNews', 'applyCandidateFormats_', 'readCandidates_', 'planLooksBroken_', 'CAND_FORMATS_', 'CAND_HEADERS_',
   // ダウ理論×フィボナッチの買い推奨（DowFib.js）
   'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
   // SIGNAL_WEIGHT_ 算出の統計コア（MLWeights.js）。tools/calc_weights.js から呼ばれる純粋関数。
@@ -83,7 +84,6 @@ ${read('SheetUtils.js')}
 ${read('Code.js')}
 ${read('DowFib.js')}
 ${read('Bloomberg.js')}
-${read('Reuters.js')}
 ${read('MarketMacro.js')}
 ${read('MLWeights.js')}
 ${read('WebMenu.js')}
@@ -943,18 +943,7 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     eq(M.bloombergMention_(t, 'マイクロン・テクノロジー'), 'AI需要堅調：米マイクロン・テクノロジーの売上高見通しが市場予想を上回った。',
       '社名が出た記事は「見出し：本文」で返す');
     eq(M.bloombergMention_(t, 'トヨタ自動車'), '', '社名が完全一致しなければ拾わない（トヨタ自動車≠トヨタ）');
-    eq(M.bloombergRows_(t[0]).length, 3, 'シートには5本（ここでは2本）＋その他を1行ずつ');
     eq(M.bloombergParse_('本文に構造がないメール'), { items: [], others: [] }, '構造が違うメールでも例外にならない');
-
-    // ニュースレター本文は外部入力。見出し・本文が「=」「-」等で始まると数式化される事故を防ぐ
-    // （market見出しは "-2.3%" のように - 始まりが普通にある）。
-    const evilRows = M.bloombergRows_({
-      items: [{ head: '-2.3%の急落', body: '=HYPERLINK("https://evil.example")' }],
-      others: ['+1%の反発'],
-    });
-    eq(evilRows[0][1], "'-2.3%の急落", '見出しの - 始まりは\'で無害化する');
-    eq(evilRows[0][2], '\'=HYPERLINK("https://evil.example")', '本文の = 始まりも無害化する');
-    eq(evilRows[1][1], "'+1%の反発", 'その他の注目ニュースも同様');
 
     // 実物（2026-10-05 受信「今朝の5本」＝月曜朝の週末ニュース号）と同じ構造: マーケットスナップショット/「ウォッチリスト」が無い。
     // 見出し・URLのあとに導入文（「。」を含む段落）があり、その次から 見出し→本文。これを解析できず、シートが空になっていた。
@@ -978,7 +967,6 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     eq(pm.items.map(x => x.head), ['熱烈な推進者も懸念', '利回りもAIも', '40兆円'], 'ウォッチリストが無い号でも、導入文の次から見出しを拾う');
     eq(pm.items[0].body, 'ソフトバンクグループの孫正義会長兼社長は、AIの安全性のリスクを懸念していると認めた。前日には米OpenAIの安全対策を担当していた人物が寄稿した。', 'リンクで切れた本文を元に戻す');
     eq(pm.others, ['高市首相「極めて遺憾」と米側に抗議－沖縄強盗殺人事件で米兵逮捕', 'FRB中枢2人の発言で動いた市場、「フォワードガイダンス」なお健在'], 'その他の注目ニュース');
-    eq(M.bloombergRows_(Object.assign({ body: monday }, pm)).length, 5, 'シートに 3本＋その他2件 の行が出る');
     eq(M.bloombergParse_('見出しだけ\n\nURLだけ\n<https://x.test/a>').items, [], '導入文（「。」を含む段落）が無い本文は空（例外にしない）');
 
     // 7時半トリガーの自動追加（無ければ1本足し、あれば増やさない・他のトリガーは触らない）
@@ -990,55 +978,27 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     sandboxTriggers.length = 0;
   }
 
-  console.log('\n【23e】ロイター速報メール（SBI証券経由）の取り込み');
+console.log('\n【23e】旧ロイター取り込み（MarketBriefing へ移した）の後始末');
   {
-    const real = '2026/10/08 BRIEF-藤田日銀大阪支店長： コスト上昇分の価格転嫁、消費者により近いところでは広がりや幅にばらつき\n\nニュース本文は、SBI証券WEBサイトの「マーケット」＞「ニュース」よりご確認いただけます。\n';
-    eq(M.reutersHeadline_(real), 'BRIEF-藤田日銀大阪支店長： コスト上昇分の価格転嫁、消費者により近いところでは広がりや幅にばらつき', '本文1行目から日付を落として見出しにする（実物の形）');
-    eq(M.reutersHeadline_('2026/10/08 ＷＴＯ、26年モノの貿易量3.9％増に上方修正\u3000　ＡＩ需要が押し上げ\r\n本文'), 'ＷＴＯ、26年モノの貿易量3.9％増に上方修正 ＡＩ需要が押し上げ', '全角スペースの連続は半角1つにまとめる');
-    eq(M.reutersHeadline_('\n\n2026/10/08 UPDATE 1-ＡＩ需要拡大'), 'UPDATE 1-ＡＩ需要拡大', '先頭の空行は読み飛ばす');
-    eq([M.reutersHeadline_(''), M.reutersHeadline_(null), M.reutersHeadline_('ニュース本文は、SBI証券WEBサイトの…')], ['', '', ''], '見出しが無い・定型文だけのメールは拾わない');
-
-    const d = (h, m) => new Date(2026, 9, 8, h, m);
-    const rows = M.reutersRows_([
-      { date: d(9, 0), when: '10/08 09:00', headline: 'A' },
-      { date: d(14, 9), when: '10/08 14:09', headline: 'B' },
-      { date: d(10, 0), when: '10/08 10:00', headline: 'A' },   // 同じ見出しは新しい方だけ
-      { date: d(11, 0), when: '10/08 11:00', headline: '' },    // 見出し無しは捨てる
-    ]);
-    eq(rows, [['10/08 14:09', 'B'], ['10/08 10:00', 'A']], '新しい順・同じ見出しは1件・空は捨てる');
-    eq(M.reutersRows_([{ date: d(9, 0), when: 'x', headline: '-2.3% 急落' }, { date: d(8, 0), when: 'y', headline: '=SUM(A1)' }]).map(r => r[1]),
-      ["'-2.3% 急落", "'=SUM(A1)"], '"-" や "=" で始まる見出しも数式にならないよう無害化する');
-    eq(M.reutersRows_(null), [], '入力が無くても例外にならない');
-    eq(M.reutersRows_(Array.from({ length: 150 }, (_, i) => ({ date: new Date(2026, 9, 8, 0, i), when: 'w', headline: 'h' + i }))).length, 100, 'シートに載せる見出しは100件まで');
-
-    // Gmail から読む: 古いスレッド・古いメール・送信元違いは除外、スレッド内は新しい順に並べ直す
-    const now = new Date(2026, 9, 8, 14, 50);
-    const msg = (date, from, body) => ({ getDate: () => date, getFrom: () => from, getPlainBody: () => body });
-    const FROM = 'sbi_news_alert@trkd-hs.com';
-    const thread = { getLastMessageDate: () => d(14, 40), getMessages: () => [
-      msg(new Date(2026, 9, 6, 9, 0), FROM, '2026/10/06 古い見出し'),            // 1時間より前
-      msg(d(13, 40), FROM, '2026/10/08 1時間より前の見出し'),
-      msg(d(14, 9), FROM, '2026/10/08 昼の見出し'),
-      msg(d(14, 40), FROM, '2026/10/08 新しい見出し'),
-      msg(d(14, 30), 'someone@example.com', '2026/10/08 無関係'),             // 送信元違い
-    ] };
-    const staleThread = { getLastMessageDate: () => new Date(2026, 9, 5, 9, 0), getMessages: () => { throw new Error('古いスレッドは開かない'); } };
-    const saved = sandbox.GmailApp.search; sandbox.GmailApp.search = () => [thread, staleThread];
-    const got = M.reutersItems_(now);
-    sandbox.GmailApp.search = saved;
-    eq(got.map(x => x.headline), ['新しい見出し', '昼の見出し'], '直近1時間・ロイター配信元だけ、新しい順');
-
-    eq(M.REUTERS_HOURS_, 1, 'メールの保持期間に合わせ、載せるのは直近1時間');
-
-    // 取り込みトリガー（10分おき）の自動追加
-    sandboxTriggers.length = 0; sandboxTriggers.push({ getHandlerFunction: () => 'scheduledScan' });
-    eq(M.ensureReutersTriggers_(), true, '無ければ足す');
-    eq(M.ensureReutersTriggers_(), false, 'あれば足さない（冪等）');
-    const rt = sandboxTriggers.filter(x => x.getHandlerFunction() === 'updateReutersNews');
-    eq([rt.length, rt[0].cfg.everyMinutes, sandboxTriggers.length], [1, 10, 2], '10分おきに1本・既存は残る');
+    // 移す前に張られた updateReutersNews のトリガーが残っていると、毎回「関数が無い」で失敗し続ける。
+    // 入口だけ残したスタブが、自分のトリガーだけを消す（他のトリガーは触らない）。
+    sandboxTriggers.length = 0;
+    sandboxTriggers.push({ getHandlerFunction: () => 'scheduledScan' }, { getHandlerFunction: () => 'updateReutersNews' });
+    M.updateReutersNews();
+    eq(sandboxTriggers.map(x => x.getHandlerFunction()), ['scheduledScan'], 'updateReutersNews は自分のトリガーだけ消す（他は残す）');
+    M.updateReutersNews();
+    eq(sandboxTriggers.length, 1, '2回目以降は何もしない（例外にならない）');
     sandboxTriggers.length = 0;
   }
 
+  // 朝7時半のジョブは売買プランの点検だけ（ニュースのシート書き出しは MarketBriefing）
+  {
+    // healBrokenPlan_ / runLogged_ はテストでは差し替えられないので、関数の中身を見て確かめる
+    const src = String(M.updateBloombergNews);
+    eq([/healBrokenPlan_\(\)/.test(src), /writeBloombergSheet_|openById|insertSheet/.test(src)], [true, false], 'updateBloombergNews は売買プランの点検だけ行い、ニュースのシートは書かない');
+  }
+
+  
   console.log('\n【23c】候補シートの書式（終値が日付として読まれた不具合）');
   {
     // 2026-10-05: 「終値」列が日付書式のままで、終値 5,230 が Date(1914/04/26) として読まれ、現在値が -1,757,322,000,000 になった。

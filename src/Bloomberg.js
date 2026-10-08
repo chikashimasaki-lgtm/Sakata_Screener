@@ -3,16 +3,15 @@
 //  ---------------------------------------------------------------------------
 //  毎朝6時ごろ届く「1日を始める前に読んでおきたいニュース5本」と土曜の「週末版ニュース5選」を読み、
 //   1) 推奨銘柄・保有株の社名が記事に出ていれば、売買プランのメモに見出しを添える
-//   2) 「投資デイリー分析」スプレッドシートに「ニュース_Bloomberg」シートとして書き出す
+//  （「ニュース_Bloomberg」シートへの書き出しは、権限を分離して MarketBriefing へ移した＝2026-10-09）
 //  推奨の判定そのものには使わない（ニュースは過去に遡って検証できないため）。
 //
 //  MailCleanup が「ニュース」ラベルのメールをすぐゴミ箱へ移すため in:anywhere で探す
 //  （ゴミ箱でも30日は残る）。Gmail の権限はこのスクリプトが元から持っている
-//  （通知メールのラベル付けで使用）。MarketBriefing 側に足すと全トリガーの再承認が要るので、こちらで行う。
+//  （通知メールのラベル付けで使用）。
 // ============================================================================
 
 const BLOOMBERG_QUERY_ = 'from:noreply@news.bloomberg.com in:anywhere newer_than:3d';
-const BLOOMBERG_SHEET_ = 'ニュース_Bloomberg';
 
 // 直近の Bloomberg ニュースレター（新しい順）。{date, subject, body, items, others}
 function bloombergTexts_() {
@@ -106,54 +105,23 @@ function bloombergMention_(texts, name) {
   return '';
 }
 
-// 「ニュース_Bloomberg」シートの行（純関数）。最新号の5本＋その他の注目ニュース。
-// head/body/others はニュースレター本文からそのまま抜き出した外部入力（市況見出しは
-// "-2.3%" 等 -/+ 始まりが普通にある）。数式として評価されないよう書き込み前に無害化する
-// （sanitizeForSheetCell_ はAbitus-Automation/PdfAutoRename等と同じ共通モジュール SheetUtils.js）。
-function bloombergRows_(t) {
-  if (!t) return [];
-  const rows = (t.items || []).map((x, i) => [i + 1, sanitizeForSheetCell_(x.head || '（見出しなし）'), sanitizeForSheetCell_(x.body)]);
-  (t.others || []).forEach(o => rows.push(['他', sanitizeForSheetCell_(o), '']));
-  return rows;
-}
-
 /**
- * 最新のニュースレターを「投資デイリー分析」の「ニュース_Bloomberg」シートへ書き出す。
- * 走査完了時（平日18時）と、朝のトリガー（7時台）の両方から呼ぶ。
+ * 毎朝7時半の Sakata 用ジョブ。売買プランの価格が壊れていれば作り直す（毎朝の保険）。
+ * 関数名とトリガーは従来のまま（名前を変えると張り直しが要るため）。
+ * 「ニュース_Bloomberg」シートへの書き出しは MarketBriefing へ移した（2026-10-09、権限の分離）。
  */
 function updateBloombergNews() {
-  return runLogged_('Bloomberg取り込み', () => {
-    const texts = bloombergTexts_();
-    const id = briefingSpreadsheetId_();
-    healBrokenPlan_();   // 売買プランの価格が壊れていれば作り直す（毎朝の保険）。投資デイリー分析の有無に関係なく
-    if (!id) return;
-    writeBloombergSheet_(SpreadsheetApp.openById(id), texts[0] || null);
-    // ロイター速報の取り込みトリガー（Reuters.js）が無ければ、ここで足して今回ぶんをすぐ取り込む
-    if (ensureReutersTriggers_()) { try { updateReutersNews(); } catch (e) { Logger.log('ロイター取り込み失敗: ' + e.message); } }
+  return runLogged_('プラン点検', () => {
+    healBrokenPlan_();   // 売買プランの価格が壊れていれば作り直す。投資デイリー分析の有無に関係なく
   });
 }
 
-function writeBloombergSheet_(ss, latest) {
-  const sh = ss.getSheetByName(BLOOMBERG_SHEET_) || ss.insertSheet(BLOOMBERG_SHEET_);
-  sh.clear();
-  const stamp = latest
-    ? '受信: ' + Utilities.formatDate(latest.date, 'JST', 'yyyy/MM/dd HH:mm') + ' JST｜' + latest.subject
-    : '直近3日に Bloomberg のニュースレターが見つかりませんでした';
-  sh.getRange(1, 1).setValue(stamp).setFontWeight('bold');
-  const header = ['#', '見出し', '内容'];
-  sh.getRange(2, 1, 1, header.length).setValues([header])
-    .setFontWeight('bold').setBackground('#1f2a44').setFontColor('#ffffff');
-  const rows = bloombergRows_(latest);
-  if (rows.length) {
-    sh.getRange(3, 1, rows.length, header.length).setValues(rows).setVerticalAlignment('top');
-    sh.getRange(3, 3, rows.length, 1).setWrap(true);
-    sh.getRange(3, 2, rows.length, 1).setWrap(true).setFontWeight('bold');
-  }
-  sh.getRange(3 + Math.max(rows.length, 1) + 1, 1).setValue('出典: Bloomberg ニュースレター（Gmail）。【免責】投資助言ではありません。')
-    .setFontColor('#666666');
-  sh.setColumnWidth(1, 36);
-  sh.setColumnWidth(2, 260);
-  sh.setColumnWidth(3, 640);
-  sh.setFrozenRows(2);
-  sh.setTabColor('#1f2a44');
+/**
+ * 旧: ロイター速報の10分おき取り込み。2026-10-09 に MarketBriefing の pollNewsMail へ移した。
+ * 移す前に張られた updateReutersNews のトリガーが残っていると、毎回「関数が見つからない」で失敗し続ける。
+ * それを防ぐため、入口だけ残して自分のトリガーを消す（次の実行で自動的に片付く）。
+ */
+function updateReutersNews() {
+  const removed = clearTriggersFor_(['updateReutersNews']);
+  Logger.log('ロイター速報の取り込みは MarketBriefing へ移しました。旧トリガーを' + removed + '件削除しました。');
 }

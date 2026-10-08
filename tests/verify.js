@@ -38,7 +38,7 @@ const sandbox = {
     getProjectTriggers: () => sandboxTriggers.slice(),
     newTrigger: (fn) => { const t = { getHandlerFunction: () => fn, fn, cfg: {} };
       const b = { timeBased: () => b, everyDays: (n) => { t.cfg.everyDays = n; return b; }, atHour: (h) => { t.cfg.atHour = h; return b; },
-        nearMinute: (m) => { t.cfg.nearMinute = m; return b; }, after: () => b, everyHours: () => b, create: () => { sandboxTriggers.push(t); return t; } };
+        nearMinute: (m) => { t.cfg.nearMinute = m; return b; }, everyMinutes: (n) => { t.cfg.everyMinutes = n; return b; }, after: () => b, everyHours: () => b, create: () => { sandboxTriggers.push(t); return t; } };
       return b; },
     deleteTrigger: () => {},
   },
@@ -66,7 +66,7 @@ const EXPORTS = [
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
   'planMailLine_', 'webPlanRows_', 'ifdocoExpiry_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
-  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_', 'ensureBloombergTrigger_', 'reutersHeadline_', 'reutersRows_', 'reutersItems_', 'ensureReutersTriggers_', 'REUTERS_TRIGGER_HOURS_', 'applyCandidateFormats_', 'readCandidates_', 'planLooksBroken_', 'CAND_FORMATS_', 'CAND_HEADERS_',
+  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_', 'ensureBloombergTrigger_', 'reutersHeadline_', 'reutersRows_', 'reutersItems_', 'ensureReutersTriggers_', 'REUTERS_HOURS_', 'applyCandidateFormats_', 'readCandidates_', 'planLooksBroken_', 'CAND_FORMATS_', 'CAND_HEADERS_',
   // ダウ理論×フィボナッチの買い推奨（DowFib.js）
   'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
   // SIGNAL_WEIGHT_ 算出の統計コア（MLWeights.js）。tools/calc_weights.js から呼ばれる純粋関数。
@@ -1012,27 +1012,30 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     eq(M.reutersRows_(Array.from({ length: 150 }, (_, i) => ({ date: new Date(2026, 9, 8, 0, i), when: 'w', headline: 'h' + i }))).length, 100, 'シートに載せる見出しは100件まで');
 
     // Gmail から読む: 古いスレッド・古いメール・送信元違いは除外、スレッド内は新しい順に並べ直す
-    const now = new Date(2026, 9, 8, 15, 0);
+    const now = new Date(2026, 9, 8, 14, 50);
     const msg = (date, from, body) => ({ getDate: () => date, getFrom: () => from, getPlainBody: () => body });
     const FROM = 'sbi_news_alert@trkd-hs.com';
-    const thread = { getLastMessageDate: () => d(14, 9), getMessages: () => [
-      msg(new Date(2026, 9, 6, 9, 0), FROM, '2026/10/06 古い見出し'),            // 24時間より前
-      msg(d(7, 14), FROM, '2026/10/08 朝の見出し'),
+    const thread = { getLastMessageDate: () => d(14, 40), getMessages: () => [
+      msg(new Date(2026, 9, 6, 9, 0), FROM, '2026/10/06 古い見出し'),            // 1時間より前
+      msg(d(13, 40), FROM, '2026/10/08 1時間より前の見出し'),
       msg(d(14, 9), FROM, '2026/10/08 昼の見出し'),
+      msg(d(14, 40), FROM, '2026/10/08 新しい見出し'),
       msg(d(14, 30), 'someone@example.com', '2026/10/08 無関係'),             // 送信元違い
     ] };
     const staleThread = { getLastMessageDate: () => new Date(2026, 9, 5, 9, 0), getMessages: () => { throw new Error('古いスレッドは開かない'); } };
     const saved = sandbox.GmailApp.search; sandbox.GmailApp.search = () => [thread, staleThread];
     const got = M.reutersItems_(now);
     sandbox.GmailApp.search = saved;
-    eq(got.map(x => x.headline), ['昼の見出し', '朝の見出し'], '直近24時間・ロイター配信元だけ、新しい順');
+    eq(got.map(x => x.headline), ['新しい見出し', '昼の見出し'], '直近1時間・ロイター配信元だけ、新しい順');
 
-    // 取り込みトリガー（6/14/22時台）の自動追加
+    eq(M.REUTERS_HOURS_, 1, 'メールの保持期間に合わせ、載せるのは直近1時間');
+
+    // 取り込みトリガー（10分おき）の自動追加
     sandboxTriggers.length = 0; sandboxTriggers.push({ getHandlerFunction: () => 'scheduledScan' });
-    eq(M.ensureReutersTriggers_(), 3, '無ければ3本足す');
-    eq(M.ensureReutersTriggers_(), 0, 'あれば足さない（冪等）');
+    eq(M.ensureReutersTriggers_(), true, '無ければ足す');
+    eq(M.ensureReutersTriggers_(), false, 'あれば足さない（冪等）');
     const rt = sandboxTriggers.filter(x => x.getHandlerFunction() === 'updateReutersNews');
-    eq([rt.map(x => x.cfg.atHour), rt.every(x => x.cfg.nearMinute === 45), sandboxTriggers.length], [[6, 14, 22], true, 4], '6/14/22時台の45分・既存は残る');
+    eq([rt.length, rt[0].cfg.everyMinutes, sandboxTriggers.length], [1, 10, 2], '10分おきに1本・既存は残る');
     sandboxTriggers.length = 0;
   }
 

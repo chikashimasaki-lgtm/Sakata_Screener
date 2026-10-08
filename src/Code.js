@@ -491,11 +491,11 @@ function installDailyScanTrigger() {
   ScriptApp.newTrigger('updateEarningsCalendar').timeBased().everyDays(1).atHour(17).create(); // 決算カレンダー更新（EDINETDB_API_KEY未設定なら早期return）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
   ScriptApp.newTrigger('updateBloombergNews').timeBased().everyDays(1).atHour(7).nearMinute(30).create(); // Bloomberg朝刊（6時着）を投資デイリー分析へ
-  ensureReutersTriggers_();   // ロイター速報（SBI証券メール）を6/14/22時台に投資デイリー分析へ
+  ensureReutersTriggers_();   // ロイター速報（SBI証券メール）を10分おきに投資デイリー分析へ
   // 旧「保有チェック（毎時）」は廃止。保有株は走査時に売買プランへ載る（上の clearTriggersFor_ で消える）。
   // 月次の自動学習トリガーは設定しない。集計結果を順位付けに使わなくなったため、
   // 全銘柄分のYahoo取得を毎月自動で走らせる必要がない（必要ならメニューから手動実行する）。
-  SpreadsheetApp.getActive().toast('自動実行を設定しました（Bloomberg:7時半 / ロイター:6・14・22時台 / 相場マクロ:17時 / 走査:平日18時）', APP_NAME_, 6);
+  SpreadsheetApp.getActive().toast('自動実行を設定しました（Bloomberg:7時半 / ロイター:10分おき / 相場マクロ:17時 / 走査:平日18時）', APP_NAME_, 6);
   Logger.log('トリガー設定: scheduledScan(平日18時) / updateMarketMacro(17時) / updateEarningsCalendar(17時)');
 }
 

@@ -4,21 +4,20 @@
 //  SBI証券の「ロイターニュース配信サービス」から、見出し1本ごとに1通届く
 //  （送信元 sbi_news_alert@trkd-hs.com、件名は毎回「【SBI証券】 トムソン・ロイターニュース速報メール」、
 //   本文1行目が「YYYY/MM/DD 見出し」、あとは定型の注意書き）。
-//  直近24時間の見出しを、「投資デイリー分析」スプレッドシートの「ニュース_ロイター」シートへ書き出す。
+//  直近1時間の見出しを、「投資デイリー分析」スプレッドシートの「ニュース_ロイター」シートへ書き出す。
 //  （MarketBriefing の「ニュース」は Gemini の Web検索で、Bloomberg と同じく別シートとして並べる）
 //
 //  件名が同じなので Gmail は全部を1スレッドにまとめる（1スレッド最大100通）。MailCleanup が
-//  「ニュース」ラベルのメールを動かすことがあるため in:anywhere で探す。
+//  「ニュース」「トムソン・ロイター」ラベルのメールをゴミ箱へ移すため in:anywhere で探す。
 //  Gmail の権限はこのスクリプトが元から持っている。MarketBriefing 側に足すと全トリガーの再承認が要るので、こちらで行う
 //  （[[GAS-スコープ追加で既存トリガーが止まる]]）。
 // ============================================================================
 
 const REUTERS_QUERY_ = 'from:sbi_news_alert@trkd-hs.com in:anywhere newer_than:2d';
 const REUTERS_SHEET_ = 'ニュース_ロイター';
-const REUTERS_HOURS_ = 24;      // 何時間ぶんの見出しを載せるか
+const REUTERS_HOURS_ = 1;       // 何時間ぶんの見出しを載せるか（メールの保持期間に合わせる。MailCleanup の「トムソン・ロイター」ラベルも1時間）
 const REUTERS_MAX_ROWS_ = 100;  // シートに載せる見出しの上限
-// MarketBriefing のニュース更新（7/15/23時台）の直前に取り込む。nearMinute(45) は 45〜59分に発火する
-const REUTERS_TRIGGER_HOURS_ = [6, 14, 22];
+const REUTERS_TRIGGER_MINUTES_ = 10;   // 10分おきに取り込む（GASの everyMinutes は 1/5/10/15/30 のみ）
 
 /**
  * メール本文（プレーンテキスト）から見出しを取り出す。純関数。
@@ -65,24 +64,25 @@ function reutersItems_(now) {
   return out.sort((a, b) => b.date - a.date);
 }
 
-// 取り込みトリガー（毎日 6/14/22時台の45分）を、無ければ足す（既存のトリガーは触らない）。足した本数を返す。
+// 取り込みトリガー（10分おき）を、無ければ足す（既存のトリガーは触らない）。足したら true。
 // 「自動実行を設定」（確認ダイアログあり）を押さなくても、すでに動いている朝のトリガー
 // （updateBloombergNews）の頭から自動で足すための入口。
 function ensureReutersTriggers_() {
   try {
-    if (ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'updateReutersNews')) return 0;
-    REUTERS_TRIGGER_HOURS_.forEach(h => ScriptApp.newTrigger('updateReutersNews').timeBased().everyDays(1).atHour(h).nearMinute(45).create());
-    return REUTERS_TRIGGER_HOURS_.length;
-  } catch (e) { Logger.log('Reutersトリガーの確認に失敗: ' + e.message); return 0; }
+    if (ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'updateReutersNews')) return false;
+    ScriptApp.newTrigger('updateReutersNews').timeBased().everyMinutes(REUTERS_TRIGGER_MINUTES_).create();
+    return true;
+  } catch (e) { Logger.log('Reutersトリガーの確認に失敗: ' + e.message); return false; }
 }
 
-/** 直近24時間のロイター速報を「投資デイリー分析」の「ニュース_ロイター」シートへ書き出す。 */
+/** 直近1時間のロイター速報を「投資デイリー分析」の「ニュース_ロイター」シートへ書き出す。 */
 function updateReutersNews() {
+  // 10分おきに動くので、短い実行（新着なし）は実行記録に残さない（minSec）
   return runLogged_('ロイター取り込み', () => {
     const id = briefingSpreadsheetId_();
     if (!id) return;
     writeReutersSheet_(SpreadsheetApp.openById(id), reutersItems_(new Date()));
-  });
+  }, { minSec: 5 });
 }
 
 function writeReutersSheet_(ss, items) {

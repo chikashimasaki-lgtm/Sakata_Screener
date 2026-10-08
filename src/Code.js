@@ -303,7 +303,7 @@ function scanSignalsRun_() {
   const nCand = Math.max(sig.getLastRow() - 1, 0);
   Logger.log('走査完了: 候補 ' + nCand + '件 / 取得失敗 ' + failed + '件');
 
-  // 売買プラン（買い推奨＋保有株）→ 通知メール → 投資デイリー分析への連動、の順。
+  // 売買プラン（買い推奨＋保有株）→ 通知メール → MarketBriefingへの連動、の順。
   // メールは発注に使うので先に出し、連動と後片付けは失敗しても走査結果を壊さない。
   let result = { plans: {}, targets: [] };
   try {
@@ -317,7 +317,7 @@ function scanSignalsRun_() {
   sendHeldWarningEmail_(result.targets, result.plans);
   try {
     writeBriefingPicks_(result.targets, result.plans);
-  } catch (e) { Logger.log('投資デイリー分析への書き込みに失敗（売買プランは正常）: ' + e.message); }
+  } catch (e) { Logger.log('MarketBriefingへの書き込みに失敗（売買プランは正常）: ' + e.message); }
   hideWorkSheets_();
 
   const picks = result.targets.filter(t => t.pick);
@@ -486,7 +486,7 @@ function installDailyScanTrigger() {
   ScriptApp.newTrigger('updateMarketMacro').timeBased().everyDays(1).atHour(17).create();    // 相場マクロ/急落サイン・地合い更新（走査の前）
   ScriptApp.newTrigger('updateEarningsCalendar').timeBased().everyDays(1).atHour(17).create(); // 決算カレンダー更新（EDINETDB_API_KEY未設定なら早期return）
   ScriptApp.newTrigger('scheduledScan').timeBased().everyDays(1).atHour(18).create();       // 全銘柄 株価取得＋走査（1日1回）
-  ScriptApp.newTrigger('updateBloombergNews').timeBased().everyDays(1).atHour(7).nearMinute(30).create(); // Bloomberg朝刊（6時着）を投資デイリー分析へ
+  ScriptApp.newTrigger('updateBloombergNews').timeBased().everyDays(1).atHour(7).nearMinute(30).create(); // Bloomberg朝刊（6時着）をMarketBriefingへ
   // 旧「保有チェック（毎時）」は廃止。保有株は走査時に売買プランへ載る（上の clearTriggersFor_ で消える）。
   // 月次の自動学習トリガーは設定しない。集計結果を順位付けに使わなくなったため、
   // 全銘柄分のYahoo取得を毎月自動で走らせる必要がない（必要ならメニューから手動実行する）。
@@ -1301,11 +1301,11 @@ function createUsageSheet() {
     ['送信後は「利益累計」ラベルを付けて受信トレイからアーカイブします。', 'p'],
     ['', 'p'],
     ['■ ほかのシート・連動', 'h'],
-    ['・投資デイリー分析 … 同じ買い推奨を「日本株_買い推奨」シートに書き込みます', 'p'],
-    ['   （書き込み先はドライブ上の「投資デイリー分析」を自動で探します。名前が重複するときは', 'p'],
+    ['・MarketBriefing … 同じ買い推奨を「日本株_買い推奨」シートに書き込みます', 'p'],
+    ['   （書き込み先はドライブ上の「MarketBriefing」を自動で探します。名前が重複するときは', 'p'],
     ['    スクリプトプロパティ MARKET_BRIEFING_SS_ID にスプレッドシートIDを入れてください）', 'p'],
     ['・Bloomberg … Gmailに届く朝のニュースレター（直近3日）に推奨・保有銘柄の社名があれば、メモに見出しを添えます', 'p'],
-    ['   ニュースのシート（ロイター・Bloomberg）は MarketBriefing（投資デイリー分析）が書き出します', 'p'],
+    ['   ニュースのシート（ロイター・Bloomberg）は MarketBriefingが書き出します', 'p'],
     ['   推奨の判定そのものには使っていません（ニュースは過去に遡って検証できないため）', 'p'],
     ['・相場マクロ … 地合いの参考表示（手入力＋自動取得）。推奨の判定には使っていません', 'p'],
     ['   （日経平均のトレンドで絞っても成績が変わらなかったため）', 'p'],
@@ -1314,7 +1314,7 @@ function createUsageSheet() {
     ['', 'p'],
     ['■ 自動実行', 'h'],
     ['メニュー「設定とメンテナンス」→「自動実行を設定」で設定します（休場日はスキップ）。', 'p'],
-    ['・Bloombergニュース … 毎日7時半（朝6時ごろ届くニュースレターを投資デイリー分析へ）', 'p'],
+    ['・Bloombergニュース … 毎日7時半（朝6時ごろ届くニュースレターをMarketBriefingへ）', 'p'],
     ['・相場マクロ・決算カレンダー … 毎日17時', 'p'],
     ['・全銘柄の走査 … 平日18時（引け後の確定値で判定。6分制限のため自動で分割・再開します）', 'p'],
     ['', 'p'],
@@ -2065,7 +2065,7 @@ function planSummary_(targets) {
 }
 
 // 候補シートと保有銘柄から売買プランを作り直す（走査完了時とメニューの両方から呼ぶ）。
-// 戻り値 { targets, plans }（メールと投資デイリー分析への連動が同じ内容を使う）。
+// 戻り値 { targets, plans }（メールとMarketBriefingへの連動が同じ内容を使う）。
 function buildPlansFromSignals_(sig) {
   const cands = readCandidates_(sig);
   let held = { codes: new Set(), positions: {}, reason: null };
@@ -2111,7 +2111,7 @@ function buildPlans() {
   const r = buildPlansFromSignals_(sig);
   const ok = Object.keys(r.plans).filter(k => r.plans[k].ok).length;
   const picks = r.targets.filter(t => t.pick).length;
-  try { writeBriefingPicks_(r.targets, r.plans); } catch (e) { Logger.log('投資デイリー分析への書き込みに失敗（売買プランは正常）: ' + e.message); }   // 価格を直したときに「日本株_買い推奨」も合わせる
+  try { writeBriefingPicks_(r.targets, r.plans); } catch (e) { Logger.log('MarketBriefingへの書き込みに失敗（売買プランは正常）: ' + e.message); }   // 価格を直したときに「日本株_買い推奨」も合わせる
   try { ss.toast('売買プランを更新しました（買い推奨 ' + picks + '件 / 算出できた銘柄 ' + ok + '件 / 対象 ' + r.targets.length + '件）', APP_NAME_, 6); } catch (e) { /* UIが無い実行（スマホ用Webメニューのトリガー）では出さない */ }
   hideWorkSheets_();
   return { picks: picks, ok: ok, targets: r.targets.length };
@@ -2143,14 +2143,14 @@ function ifdocoExpiry_(from, n, isBiz) {
 }
 
 // ---------------------------------------------------------------------------
-//  投資デイリー分析（MarketBriefing）への連動
+//  MarketBriefingへの連動
 // ---------------------------------------------------------------------------
 const BRIEFING_SHEET_ = '日本株_買い推奨';
 
-const BRIEFING_FILE_NAME_ = '投資デイリー分析';
+const BRIEFING_FILE_NAME_ = 'MarketBriefing';   // 2026-10-09 ユーザーが「MarketBriefing」から改名
 
 /**
- * 投資デイリー分析のスプレッドシートID。スクリプトプロパティ MARKET_BRIEFING_SS_ID を優先し、
+ * MarketBriefingのスプレッドシートID。スクリプトプロパティ MARKET_BRIEFING_SS_ID を優先し、
  * 無ければドライブをファイル名で探して見つかったIDを保存する（個人のシートIDをソースに書かないため）。
  */
 function briefingSpreadsheetId_() {
@@ -2171,7 +2171,7 @@ function briefingSpreadsheetId_() {
 }
 
 /**
- * 買い推奨を「投資デイリー分析」スプレッドシートの専用シートへ書き出す。
+ * 買い推奨を「MarketBriefing」スプレッドシートの専用シートへ書き出す。
  * このシートは本スクリプトだけが書く（MarketBriefing 側は触らない）。
  */
 function writeBriefingPicks_(targets, plans) {
@@ -2192,7 +2192,7 @@ function writeBriefingPicks_(targets, plans) {
   sh.setTabColor('#1b7a3d');
 }
 
-// 投資デイリー分析に出す行（純関数）。発注できる推奨だけを載せる。
+// MarketBriefingに出す行（純関数）。発注できる推奨だけを載せる。
 function briefingRows_(targets, plans) {
   return (targets || []).filter(t => t.pick && plans[t.code] && plans[t.code].ok).map(t => {
     const p = plans[t.code];

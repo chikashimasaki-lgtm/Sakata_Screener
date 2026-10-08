@@ -112,7 +112,7 @@ function bloombergMention_(texts, name) {
  */
 function updateBloombergNews() {
   return runLogged_('プラン点検', () => {
-    healBrokenPlan_();   // 売買プランの価格が壊れていれば作り直す。投資デイリー分析の有無に関係なく
+    healBrokenPlan_();   // 売買プランの価格が壊れていれば作り直す。MarketBriefingの有無に関係なく
   });
 }
 

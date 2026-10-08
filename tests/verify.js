@@ -66,7 +66,7 @@ const EXPORTS = [
   'tickSize_', 'roundToTick_', 'priceLimit_', 'dowSwings_', 'pullbackLow_', 'buildOrderPlan_',
   'planRow_', 'PLAN_HEADERS_', 'planTargets_', 'toNum_', 'topPicks_', 'briefingRows_', 'planSummary_',
   'planMailLine_', 'webPlanRows_', 'ifdocoExpiry_', 'IFDOCO_MAX_DAYS_', 'SAKATA_PROFIT_LABEL_', 'codeLinkRichText_', 'tvChartUrl_',
-  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_', 'ensureBloombergTrigger_', 'applyCandidateFormats_', 'readCandidates_', 'planLooksBroken_', 'CAND_FORMATS_', 'CAND_HEADERS_',
+  'companyKey_', 'bloombergMention_', 'bloombergParse_', 'bloombergRows_', 'ensureBloombergTrigger_', 'reutersHeadline_', 'reutersRows_', 'reutersItems_', 'ensureReutersTriggers_', 'REUTERS_TRIGGER_HOURS_', 'applyCandidateFormats_', 'readCandidates_', 'planLooksBroken_', 'CAND_FORMATS_', 'CAND_HEADERS_',
   // ダウ理論×フィボナッチの買い推奨（DowFib.js）
   'DF', 'dfSetup_', 'dfSwings_', 'dfRawSwings_', 'dfOrderPlan_', 'dfReason_',
   // SIGNAL_WEIGHT_ 算出の統計コア（MLWeights.js）。tools/calc_weights.js から呼ばれる純粋関数。
@@ -83,6 +83,7 @@ ${read('SheetUtils.js')}
 ${read('Code.js')}
 ${read('DowFib.js')}
 ${read('Bloomberg.js')}
+${read('Reuters.js')}
 ${read('MarketMacro.js')}
 ${read('MLWeights.js')}
 ${read('WebMenu.js')}
@@ -986,6 +987,52 @@ console.log('\n【17】ダウ理論のスイングとトレンド判定');
     eq(M.ensureBloombergTrigger_(), false, 'あれば足さない（冪等）');
     const bt = sandboxTriggers.filter(x => x.getHandlerFunction() === 'updateBloombergNews');
     eq([bt.length, bt[0].cfg.atHour, bt[0].cfg.nearMinute, sandboxTriggers.length], [1, 7, 30, 2], '毎日7時台・30分・既存は残る');
+    sandboxTriggers.length = 0;
+  }
+
+  console.log('\n【23e】ロイター速報メール（SBI証券経由）の取り込み');
+  {
+    const real = '2026/10/08 BRIEF-藤田日銀大阪支店長： コスト上昇分の価格転嫁、消費者により近いところでは広がりや幅にばらつき\n\nニュース本文は、SBI証券WEBサイトの「マーケット」＞「ニュース」よりご確認いただけます。\n';
+    eq(M.reutersHeadline_(real), 'BRIEF-藤田日銀大阪支店長： コスト上昇分の価格転嫁、消費者により近いところでは広がりや幅にばらつき', '本文1行目から日付を落として見出しにする（実物の形）');
+    eq(M.reutersHeadline_('2026/10/08 ＷＴＯ、26年モノの貿易量3.9％増に上方修正\u3000　ＡＩ需要が押し上げ\r\n本文'), 'ＷＴＯ、26年モノの貿易量3.9％増に上方修正 ＡＩ需要が押し上げ', '全角スペースの連続は半角1つにまとめる');
+    eq(M.reutersHeadline_('\n\n2026/10/08 UPDATE 1-ＡＩ需要拡大'), 'UPDATE 1-ＡＩ需要拡大', '先頭の空行は読み飛ばす');
+    eq([M.reutersHeadline_(''), M.reutersHeadline_(null), M.reutersHeadline_('ニュース本文は、SBI証券WEBサイトの…')], ['', '', ''], '見出しが無い・定型文だけのメールは拾わない');
+
+    const d = (h, m) => new Date(2026, 9, 8, h, m);
+    const rows = M.reutersRows_([
+      { date: d(9, 0), when: '10/08 09:00', headline: 'A' },
+      { date: d(14, 9), when: '10/08 14:09', headline: 'B' },
+      { date: d(10, 0), when: '10/08 10:00', headline: 'A' },   // 同じ見出しは新しい方だけ
+      { date: d(11, 0), when: '10/08 11:00', headline: '' },    // 見出し無しは捨てる
+    ]);
+    eq(rows, [['10/08 14:09', 'B'], ['10/08 10:00', 'A']], '新しい順・同じ見出しは1件・空は捨てる');
+    eq(M.reutersRows_([{ date: d(9, 0), when: 'x', headline: '-2.3% 急落' }, { date: d(8, 0), when: 'y', headline: '=SUM(A1)' }]).map(r => r[1]),
+      ["'-2.3% 急落", "'=SUM(A1)"], '"-" や "=" で始まる見出しも数式にならないよう無害化する');
+    eq(M.reutersRows_(null), [], '入力が無くても例外にならない');
+    eq(M.reutersRows_(Array.from({ length: 150 }, (_, i) => ({ date: new Date(2026, 9, 8, 0, i), when: 'w', headline: 'h' + i }))).length, 100, 'シートに載せる見出しは100件まで');
+
+    // Gmail から読む: 古いスレッド・古いメール・送信元違いは除外、スレッド内は新しい順に並べ直す
+    const now = new Date(2026, 9, 8, 15, 0);
+    const msg = (date, from, body) => ({ getDate: () => date, getFrom: () => from, getPlainBody: () => body });
+    const FROM = 'sbi_news_alert@trkd-hs.com';
+    const thread = { getLastMessageDate: () => d(14, 9), getMessages: () => [
+      msg(new Date(2026, 9, 6, 9, 0), FROM, '2026/10/06 古い見出し'),            // 24時間より前
+      msg(d(7, 14), FROM, '2026/10/08 朝の見出し'),
+      msg(d(14, 9), FROM, '2026/10/08 昼の見出し'),
+      msg(d(14, 30), 'someone@example.com', '2026/10/08 無関係'),             // 送信元違い
+    ] };
+    const staleThread = { getLastMessageDate: () => new Date(2026, 9, 5, 9, 0), getMessages: () => { throw new Error('古いスレッドは開かない'); } };
+    const saved = sandbox.GmailApp.search; sandbox.GmailApp.search = () => [thread, staleThread];
+    const got = M.reutersItems_(now);
+    sandbox.GmailApp.search = saved;
+    eq(got.map(x => x.headline), ['昼の見出し', '朝の見出し'], '直近24時間・ロイター配信元だけ、新しい順');
+
+    // 取り込みトリガー（6/14/22時台）の自動追加
+    sandboxTriggers.length = 0; sandboxTriggers.push({ getHandlerFunction: () => 'scheduledScan' });
+    eq(M.ensureReutersTriggers_(), 3, '無ければ3本足す');
+    eq(M.ensureReutersTriggers_(), 0, 'あれば足さない（冪等）');
+    const rt = sandboxTriggers.filter(x => x.getHandlerFunction() === 'updateReutersNews');
+    eq([rt.map(x => x.cfg.atHour), rt.every(x => x.cfg.nearMinute === 45), sandboxTriggers.length], [[6, 14, 22], true, 4], '6/14/22時台の45分・既存は残る');
     sandboxTriggers.length = 0;
   }
 

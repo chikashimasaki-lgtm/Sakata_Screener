@@ -128,6 +128,8 @@ function updateBloombergNews() {
     healBrokenPlan_();   // 売買プランの価格が壊れていれば作り直す（毎朝の保険）。投資デイリー分析の有無に関係なく
     if (!id) return;
     writeBloombergSheet_(SpreadsheetApp.openById(id), texts[0] || null);
+    // ロイター速報の取り込みトリガー（Reuters.js）が無ければ、ここで足して今回ぶんをすぐ取り込む
+    if (ensureReutersTriggers_()) { try { updateReutersNews(); } catch (e) { Logger.log('ロイター取り込み失敗: ' + e.message); } }
   });
 }
 

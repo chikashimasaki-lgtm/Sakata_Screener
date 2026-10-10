@@ -34,6 +34,13 @@ const DF = {
   MIN_BARS: 120,         // これより短い履歴では主要トレンドを判定しない
   TOP_N: 5,              // 1日に出す推奨数の上限
   BREAK_WINDOW: 1,       // 戻り高値を上抜けたのが直近何日以内なら成立とするか（1=当日のみ）
+  // ── だまし上抜けの除外（2026-10-11 楽天銀行 5838 の外れを受けて追加。0 なら無効）──
+  // 5838 は 10/06 に確度Bで成立（出来高0.89倍・上抜け幅46円=0.23ATR）→翌日から反落し3日で−6%。
+  // 10年・1,219銘柄のバックテスト（上位5・損切/利確）: 2016-21 平均 −0.03%→+0.48%（PF 0.99→1.11）、
+  // 2022- 平均 1.49%→1.65%（PF 1.39→1.41、20日保有のベンチ差 +0.77%→+1.15%）。件数は 1日 約2.3件→約1件。
+  MIN_VOL_RATIO: 1.0,    // 当日出来高 / 直近20日平均 がこれ未満なら不成立（出来高の裏付けなしの上抜け）
+  BREAK_MIN_ATR: 0.25,   // 終値が戻り高値を ATR14×これ 以上上抜けていなければ不成立（ぎりぎりの上抜け）
+  DESC_HIGHS: 0,         // 戻り高値の連続切り下げで除外（1・2とも両期間で成績が悪化したため無効のまま）
 };
 
 /**
@@ -143,6 +150,11 @@ function dfSetup_(bars, e, rawP, rawM) {
   const mh = minorHs[minorHs.length - 1];
   // 上抜けた日 = 終値が mh を初めて超えた日。それが直近 BREAK_WINDOW 日以内で、今日も上にあること。
   if (!(T.c > mh.p)) return null;
+  // 戻り高値の連続切り下げ（例 6,635 → 6,564 → 6,505）は、上昇トレンドの押しではなく勢いが落ちた持ち合い
+  if (c.DESC_HIGHS > 0 && minorHs.length >= c.DESC_HIGHS + 1) {
+    const last = minorHs.slice(-(c.DESC_HIGHS + 1));
+    if (last.every((s, k) => k === 0 || s.p < last[k - 1].p)) return null;
+  }
   let brk = -1;
   for (let i = mh.i + 1; i <= e; i++) if (bars[i].c > mh.p && bars[i - 1].c <= mh.p) brk = i;
   if (brk < 0 || e - brk >= c.BREAK_WINDOW) return null;
@@ -154,6 +166,8 @@ function dfSetup_(bars, e, rawP, rawM) {
 
   const avg20 = dfAvgVol_(bars, e - 20, e - 1);
   const volRatio = (avg20 && T.v > 0) ? T.v / avg20 : 0;
+  if (c.MIN_VOL_RATIO > 0 && volRatio < c.MIN_VOL_RATIO) return null;
+  if (c.BREAK_MIN_ATR > 0 && T.c - mh.p < atr * c.BREAK_MIN_ATR) return null;
   const grade = (retr >= c.A_RETR_MIN && volRatio >= c.A_VOL_RATIO) ? 'A' : 'B';
   return {
     grade: grade, close: T.c, stop: stop, target: target,
@@ -200,4 +214,16 @@ function dfOrderPlan_(s, cfg) {
   if (out.target > lim.high) out.notes.push('利確は値幅制限の外（翌日は発注不可・後日置く）');
   out.ok = true;
   return out;
+}
+
+// clasp run 用（読み取り専用・書き込みなし）。銘柄の日足を取り、指定日（YYYY-MM-DD）の判定を返す。
+// 例: claspDowFibCheck('5838', '2026-10-06') → 本番のロジック・閾値で推奨が出るかを確かめる。
+function claspDowFibCheck(code, date) {
+  const bars = fetchIndexBars_(code + '.T', SK.SCAN_RANGE);
+  const day = t => Utilities.formatDate(new Date(t < 1e11 ? t * 1000 : t), 'Asia/Tokyo', 'yyyy-MM-dd');
+  const e = bars.findIndex(b => day(b.t) === date);
+  if (e < 0) return { error: '日付が見つかりません', keys: bars.length ? Object.keys(bars[0]) : [] };
+  const s = dfSetup_(bars, e);
+  return { date, close: bars[e].c, signal: s ? { grade: s.grade, retr: s.retr, volRatio: s.volRatio, breakLevel: s.breakLevel, atr: s.atr } : null,
+    filters: { MIN_VOL_RATIO: DF.MIN_VOL_RATIO, BREAK_MIN_ATR: DF.BREAK_MIN_ATR } };
 }
